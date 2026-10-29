@@ -1,0 +1,46 @@
+services:
+  node-a:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    container_name: lkmp-node-a
+    hostname: node-a
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - CHECKPOINT_RESTORE
+      - NET_ADMIN
+      - SYS_PTRACE
+    volumes:
+      - shared-workload-fs:/shared
+    networks:
+      lkmp-l2-net:
+        ipv4_address: 172.28.0.10
+
+  node-b:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    container_name: lkmp-node-b
+    hostname: node-b
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - CHECKPOINT_RESTORE
+      - NET_ADMIN
+      - SYS_PTRACE
+    volumes:
+      - shared-workload-fs:/shared
+    networks:
+      lkmp-l2-net:
+        ipv4_address: 172.28.0.11
+
+volumes:
+  shared-workload-fs:
+
+networks:
+  lkmp-l2-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
