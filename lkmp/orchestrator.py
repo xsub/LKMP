@@ -18,7 +18,9 @@ from lkmp.models import (
     PreflightReport,
     ProcessSnapshotInfo,
 )
+from lkmp.pagemap import select_optimal_strategy
 from lkmp.preflight import evaluate_compatibility
+from lkmp.telemetry import PrometheusMetricsCollector
 
 
 class MigrationOrchestrator:
@@ -30,11 +32,13 @@ class MigrationOrchestrator:
         source_client: AgentClient,
         dest_client: AgentClient,
         migration_id: Optional[str] = None,
+        metrics: Optional[PrometheusMetricsCollector] = None,
     ) -> None:
         self.config = config
         self.source = source_client
         self.dest = dest_client
         self.migration_id = migration_id or f"mig-{uuid.uuid4().hex[:8]}"
+        self.metrics = metrics
         self.state = MigrationState.INIT
         self.state_history: List[MigrationState] = [MigrationState.INIT]
 
@@ -63,6 +67,15 @@ class MigrationOrchestrator:
         dst_files: Dict[str, FileArtifact] = {
             path: FileArtifact.from_dict(meta) for path, meta in dst_files_raw.items()
         }
+
+        if self.config.strategy == MigrationStrategy.AUTO:
+            chosen_strategy, _reason = select_optimal_strategy(
+                rss_bytes=snapshot.rss_bytes,
+                dirty_rate_bytes_per_sec=snapshot.dirty_rate_bytes_per_sec,
+                bandwidth_mbps=self.config.estimated_bandwidth_mbps,
+                has_userfaultfd=dst_caps.has_userfaultfd,
+            )
+            self.config.strategy = chosen_strategy
 
         report = evaluate_compatibility(
             config=self.config,
@@ -255,7 +268,7 @@ class MigrationOrchestrator:
                     wipe_images=self.config.wipe_images_on_commit,
                 )
 
-            return MigrationResult(
+            result = MigrationResult(
                 migration_id=self.migration_id,
                 success=True,
                 final_state=self.state,
@@ -266,6 +279,9 @@ class MigrationOrchestrator:
                 rolled_back=False,
                 state_history=list(self.state_history),
             )
+            if self.metrics is not None:
+                self.metrics.record_migration(self.config.strategy.value, result)
+            return result
 
         except Exception as exc:
             # Deterministic rollback: kill partial restore on B, restore IP & resume frozen process on A
@@ -292,7 +308,7 @@ class MigrationOrchestrator:
             if freeze_start is not None and freeze_downtime_ms == 0.0:
                 freeze_downtime_ms = (time.monotonic() - freeze_start) * 1000.0
 
-            return MigrationResult(
+            result = MigrationResult(
                 migration_id=self.migration_id,
                 success=False,
                 final_state=self.state,
@@ -304,3 +320,6 @@ class MigrationOrchestrator:
                 error_message=str(exc),
                 state_history=list(self.state_history),
             )
+            if self.metrics is not None:
+                self.metrics.record_migration(self.config.strategy.value, result)
+            return result

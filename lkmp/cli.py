@@ -1,4 +1,4 @@
-"""Command-line interface for `lkmp` (run, agent, preflight, migrate)."""
+"""Command-line interface for `lkmp` (run, agent, preflight, migrate, demo)."""
 
 from __future__ import annotations
 
@@ -18,8 +18,10 @@ from lkmp.config import (
     MigrationStrategy,
     TlsConfig,
 )
+from lkmp.demo import run_live_demo
 from lkmp.envelope import EnvelopeManager
 from lkmp.orchestrator import MigrationOrchestrator
+from lkmp.telemetry import render_migration_report, render_preflight_scorecard
 
 
 def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
@@ -31,7 +33,7 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
         "--strategy",
         choices=[s.value for s in MigrationStrategy],
         default=MigrationStrategy.PRE_COPY.value,
-        help="Memory migration strategy (default: pre-copy)",
+        help="Memory migration strategy: auto, cold, pre-copy, lazy, hybrid (default: pre-copy)",
     )
     parser.add_argument(
         "--fs-mode",
@@ -166,6 +168,33 @@ def build_parser() -> argparse.ArgumentParser:
     mig_p = sub.add_parser("migrate", help="Execute live or cold process migration from A to B")
     _add_common_migration_args(mig_p)
 
+    # 5. `lkmp demo`
+    demo_p = sub.add_parser(
+        "demo",
+        help="Run a self-contained two-node live migration simulation over loopback TCP RPC",
+    )
+    demo_p.add_argument(
+        "--strategy",
+        choices=[s.value for s in MigrationStrategy],
+        default=MigrationStrategy.AUTO.value,
+        help="Migration strategy (default: auto)",
+    )
+    demo_p.add_argument("--rss-mb", type=int, default=256, help="Simulated process RSS in MiB (default: 256)")
+    demo_p.add_argument(
+        "--dirty-mbps",
+        type=int,
+        default=40,
+        help="Simulated memory write rate in MiB/s (default: 40)",
+    )
+    demo_p.add_argument(
+        "--inject-fault",
+        choices=["none", "restore", "verify"],
+        default="none",
+        help="Inject a destination failure to demonstrate transactional rollback (default: none)",
+    )
+    demo_p.add_argument("--prometheus", action="store_true", help="Print Prometheus OpenMetrics output")
+    demo_p.add_argument("--json", action="store_true", help="Emit JSON output")
+
     return parser
 
 
@@ -220,6 +249,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.json:
             payload = {
                 "compatible": report.compatible,
+                "selected_strategy": orch.config.strategy.value,
                 "estimated_cold_downtime_ms": report.estimated_cold_downtime_ms,
                 "estimated_live_downtime_ms": report.estimated_live_downtime_ms,
                 "required_criu_flags": report.required_criu_flags,
@@ -227,14 +257,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             print(json.dumps(payload, indent=2))
         else:
-            status = "COMPATIBLE" if report.compatible else "INCOMPATIBLE"
-            print(f"Preflight Status: {status}")
-            print(f"Estimated Cold Downtime: {report.estimated_cold_downtime_ms:.1f} ms")
-            print(f"Estimated Live Downtime: {report.estimated_live_downtime_ms:.1f} ms")
-            if report.required_criu_flags:
-                print(f"Required CRIU Flags: {', '.join(report.required_criu_flags)}")
-            for f in report.findings:
-                print(f"  [{f.classification.value.upper()}] {f.resource_type} ({f.identifier}): {f.reason}")
+            print(render_preflight_scorecard(report, orch.config.strategy.value))
         return 0 if report.compatible else 2
 
     if args.subcommand == "migrate":
@@ -249,19 +272,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             payload["state_history"] = [s.value for s in result.state_history]
             print(json.dumps(payload, indent=2))
         else:
-            print(f"Migration ID:     {result.migration_id}")
-            print(f"Success:          {result.success}")
-            print(f"Final State:      {result.final_state.value}")
-            if result.restored_pid is not None:
-                print(f"Restored PID (B): {result.restored_pid}")
-            print(f"Pre-copy Rounds:  {len(result.precopy_iterations)}")
-            print(f"Freeze Downtime:  {result.freeze_downtime_ms:.2f} ms")
-            print(f"Total Duration:   {result.total_duration_ms:.2f} ms")
-            if result.rolled_back:
-                print(f"Rolled Back:      True (Source A resumed safely)")
-            if result.error_message:
-                print(f"Error:            {result.error_message}")
+            print(render_migration_report(result, orch.config.strategy.value))
         return 0 if result.success else 1
+
+    if args.subcommand == "demo":
+        result, resolved_strategy, metrics = run_live_demo(
+            strategy=MigrationStrategy(args.strategy),
+            rss_mb=args.rss_mb,
+            dirty_mbps=args.dirty_mbps,
+            inject_fault=args.inject_fault,
+        )
+        if args.json:
+            payload = asdict(result)
+            payload["selected_strategy"] = resolved_strategy
+            payload["final_state"] = result.final_state.value
+            payload["state_history"] = [s.value for s in result.state_history]
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_migration_report(result, resolved_strategy))
+            if args.prometheus:
+                print("\nPrometheus Metrics (/metrics):")
+                print(metrics.export_prometheus_text().rstrip())
+        return 0 if result.success or args.inject_fault != "none" else 1
 
     return 1
 

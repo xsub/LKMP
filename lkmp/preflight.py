@@ -18,6 +18,7 @@ from lkmp.models import (
     ResourceClassification,
     ResourceFinding,
 )
+from lkmp.pagemap import sample_process_dirty_rate
 
 # Critical instruction-set flags selected by glibc IFUNC / runtime dispatchers.
 CRITICAL_ISA_FLAGS: Set[str] = {
@@ -354,11 +355,21 @@ def inspect_process_tree(
                         if cpid not in child_pids:
                             child_pids.append(cpid)
 
+    dirty_rate_bps = 0
+    if (proc_dir / "pagemap").exists() and maps_file.exists():
+        try:
+            heat = sample_process_dirty_rate(pid, proc_root=proc_root, sample_ms=0)
+            dirty_rate_bps = heat.dirty_rate_bytes_per_sec
+            if rss_bytes == 0 and heat.rss_bytes > 0:
+                rss_bytes = heat.rss_bytes
+        except Exception:
+            dirty_rate_bps = 0
+
     return ProcessSnapshotInfo(
         root_pid=pid,
         child_pids=child_pids,
         rss_bytes=rss_bytes,
-        dirty_rate_bytes_per_sec=0,
+        dirty_rate_bytes_per_sec=dirty_rate_bps,
         files=list(files_by_path.values()),
         findings=findings,
         in_envelope=in_envelope,

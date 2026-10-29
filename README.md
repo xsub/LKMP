@@ -1,8 +1,9 @@
 # LKMP (`lkmp`) — Linux Process Live Migration Orchestrator
 
 <p align="center">
+  <a href="https://github.com/xsub/LKMP/actions/workflows/ci.yml"><img src="https://github.com/xsub/LKMP/actions/workflows/ci.yml/badge.svg" alt="CI Status"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-2ea44f.svg" alt="License: Apache-2.0"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10%2B-3776ab.svg" alt="Python 3.10+"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776ab.svg" alt="Python 3.10+"></a>
   <a href="https://criu.org/"><img src="https://img.shields.io/badge/Engine-CRIU%204.x-008080.svg" alt="CRIU 4.x"></a>
   <img src="https://img.shields.io/badge/Platform-Linux%20(x86__64%20%7C%20ARM64)-f05032.svg" alt="Platform: Linux">
 </p>
@@ -15,18 +16,17 @@
 
 ---
 
-## Why LKMP?
+## Key Capabilities
 
-CRIU provides the low-level checkpoint/restore engine, while the legacy `P.Haul` project that once orchestrated multi-host migrations on top of CRIU is unmaintained. `lkmp` fills that gap as a modern, zero-dependency orchestrator:
-
+- **Adaptive Strategy Auto-Pilot (`--strategy auto`)**: Profiles live memory write rates via kernel `/proc/<pid>/clear_refs` and binary 64-bit `/proc/<pid>/pagemap` (`PTE_SOFT_DIRTY`, bit 55) and automatically selects `cold`, `pre-copy`, or `hybrid` (`pre-dump` + `userfaultfd` `--lazy-pages`).
 - **Migration Envelope (`lkmp run`)**: Launches workloads inside isolated `pid`, `net`, `mnt`, `ipc`, `uts`, and `time` (`CLOCK_MONOTONIC` / `CLOCK_BOOTTIME` offset) namespaces attached to a dedicated `cgroup v2` hierarchy for atomic freezing.
 - **Non-Destructive Preflight Analysis (`lkmp preflight`)**:
   - **CPU ISA Superset Check**: Verifies that Destination B supports every critical instruction flag (`avx2`, `avx512f`, `xsave`, `sve`, etc.) present on Source A so `glibc` IFUNC-dispatched routines never fault with `SIGILL` after migration.
   - **ELF & File Identity Check**: Parses ELF64/ELF32 `.note.gnu.build-id` notes and SHA-256 digests across `/proc/<pid>/maps` and `/proc/<pid>/fd` to verify binary identity on Destination B.
-  - **Blocker & Flag Classification**: Detects non-migratable kernel resources (`io_uring`, active `ptrace`, unconfigured hardware devices) and auto-configures required CRIU flags (`--ext-unix-sk`, `--ghost-limit`).
-- **Iterative Pre-Copy & Lazy Post-Copy**: Streams dirty memory pages over TLS (`criu page-server`) while the workload runs, or demand-pages memory after restore via `userfaultfd` (`criu lazy-pages`).
+  - **Blocker & Flag Classification**: Detects non-migratable kernel resources (`io_uring`, active `TracerPid`, unconfigured hardware devices) and auto-configures required CRIU flags (`--ext-unix-sk`, `--ghost-limit`).
 - **TCP Preservation & IP Mobility**: Locks workload network traffic with `nftables` (preventing kernel TCP `RST` packets during switchover) and moves the workload IP via L2 Gratuitous ARP (`garp`), L3 BGP `/32` routes (`bgp`), or cloud API webhooks (`cloud`).
 - **Transactional Rollback & Secret Wiping**: Keeps the source process intact (`--leave-stopped`) until the restored process passes health checks on Destination B. On commit, memory dump files (`pages-*.img`, `core-*.img`) are overwritten with zeros before deletion.
+- **Built-in Prometheus Telemetry & Zero-Setup Simulator (`lkmp demo`)**: Exports OpenMetrics / Prometheus counters and gauges (`lkmp_migrations_total`, `lkmp_last_freeze_downtime_milliseconds`, `lkmp_rollbacks_total`) and includes a self-contained two-node loopback TCP RPC simulator.
 
 ---
 
@@ -48,9 +48,9 @@ sequenceDiagram
 
     rect rgb(18, 45, 31)
     Note over CLI,B: PHASE 1–3: ONLINE PREFLIGHT & ITERATIVE PRE-COPY (0 ms Downtime — App Running on A)
-    CLI->>A: get_capabilities() & inspect_process(pid)
+    CLI->>A: get_capabilities() & inspect_process(pid) (/proc/pid/pagemap soft-dirty)
     CLI->>B: get_capabilities() & stat_files(paths)
-    Note over CLI: Verify CPU ISA Superset, ELF build-id & /proc blockers
+    Note over CLI: Verify CPU ISA Superset, ELF build-id & auto-select strategy
     CLI->>A: pre_sync_fs() (initial rsync pass)
     loop Iterative Pre-Copy (Round 1..N until converged)
         CLI->>B: start_page_server(round=N, --tls)
@@ -122,10 +122,11 @@ flowchart LR
 
 | Strategy (`--strategy`) | Downtime | Risk | Best For |
 | :--- | :--- | :--- | :--- |
-| **`cold`** | `RSS / bandwidth` (seconds) | Lowest | Small processes, batch jobs, simple stop-and-copy |
-| **`pre-copy`** *(default)* | `final_dirty / bandwidth + restore` (tens to hundreds of ms) | Low (full rollback on A) | General stateful services, databases, network servers |
+| **`auto`** *(recommended)* | Dynamic | Low | Profiles `/proc/<pid>/pagemap` dirty rate and picks `cold`, `pre-copy`, or `hybrid` |
+| **`cold`** | `RSS / bandwidth` (seconds) | Lowest | Small processes (`<= 8 MiB`), batch jobs, simple stop-and-copy |
+| **`pre-copy`** | `final_dirty / bandwidth + restore` (tens to hundreds of ms) | Low (full rollback on A) | General stateful services, databases, network servers |
 | **`lazy`** | Minimal (metadata transfer only) | Higher (page faults over network via `userfaultfd`) | Huge memory footprints with high write rates where pre-copy does not converge |
-| **`hybrid`** | Minimal | Medium | Large memory with a hot working set (`pre-dump` rounds followed by `--lazy-pages`) |
+| **`hybrid`** | Minimal | Medium | Write-intensive workloads (`>= 70%` of link bandwidth): `pre-dump` rounds + `--lazy-pages` |
 
 ### Pre-Copy Convergence Rules
 
@@ -139,47 +140,51 @@ Iterative `pre-dump` rounds stop automatically when **any** of the following con
 
 ---
 
-## Project Structure
+## Try It in 5 Seconds (`lkmp demo`)
 
-```text
-.
-├── bin/lkmp                      # Executable CLI entrypoint
-├── docs/assets/                  # High-resolution architecture & pipeline SVG diagrams
-├── lkmp/
-│   ├── config.py                 # MigrationConfig, EnvelopeConfig, strategy/mode enums
-│   ├── models.py                 # State machine states, preflight & telemetry models
-│   ├── envelope.py               # Namespace unshare & cgroup v2 freeze manager
-│   ├── preflight.py              # /proc inspector, ELF build-id parser, ISA superset checker
-│   ├── convergence.py            # Pre-copy convergence math & dirty-page tracker
-│   ├── criu_driver.py            # CRIU command builder & GPU plugin hooks (cuda-checkpoint, amdgpu)
-│   ├── network.py                # nftables packet lock & GARP/BGP/Cloud IP mobility
-│   ├── fs_sync.py                # rsync pre-sync, frozen delta sync & zero-wipe
-│   ├── agent.py                  # Privileged host daemon (lkmp-agent) & TLS JSON-RPC
-│   ├── orchestrator.py           # 10-state migration controller & rollback engine
-│   └── cli.py                    # CLI parser and command handlers
-├── deploy/
-│   ├── Dockerfile.node           # Ubuntu 24.04 node image with CRIU, nftables, iproute2
-│   └── docker-compose.test.yml   # Two-node privileged test cluster on shared L2 bridge
-└── tests/                        # Unit & end-to-end two-agent TCP RPC test suite
-```
-
----
-
-## Quick Start
-
-### 1. Installation & Tests
-
-`lkmp` uses the Python 3.10+ standard library with zero external Python package dependencies.
+`lkmp` includes a built-in two-node cluster simulator (`Source Host A` and `Destination Host B` communicating over real loopback TCP JSON-RPC sockets) so you can test pre-copy convergence, Prometheus telemetry, and transactional rollback on any machine:
 
 ```bash
 git clone https://github.com/xsub/LKMP.git
 cd LKMP
 
-# Run the unit and two-agent RPC integration test suite
-python3 -m unittest discover -s tests -p "test_*.py" -v
+# 1. Run a live pre-copy migration demo with Prometheus metrics
+./bin/lkmp demo --strategy auto --rss-mb 256 --dirty-mbps 40 --prometheus
 ```
 
-### 2. Start `lkmp-agent` on Source A and Destination B
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│ LKMP LIVE MIGRATION EXECUTION SUMMARY                                    │
+├──────────────────────────────┬───────────────────────────────────────────┤
+│ Migration ID                 │ mig-c698365a                              │
+│ Strategy                     │ pre-copy                                  │
+│ Outcome                      │ COMMITTED ON DESTINATION B                │
+│ Final FSM State              │ COMMIT                                    │
+│ Restored PID on Host B       │ 8484                                      │
+│ Freeze Window Downtime       │ 1.85 ms                                   │
+│ Total Migration Duration     │ 139.68 ms                                 │
+└──────────────────────────────┴───────────────────────────────────────────┘
+
+Iterative Pre-Copy Convergence (Online Phase — 0 ms Downtime):
+  Round 1: [████████████████████████]  115.2 MiB in    0.1 ms  (STREAMED)
+  Round 2: [█████░░░░░░░░░░░░░░░░░░░]   24.0 MiB in    0.1 ms  (STREAMED)
+  Round 3: [██░░░░░░░░░░░░░░░░░░░░░░]   10.0 MiB in    0.1 ms  (CONVERGED)
+           └─ Dirty set (10485760 B) is within target downtime budget (25000000 B)
+
+FSM Trajectory:
+  INIT -> PREFLIGHT -> PREPARE -> PRE_COPY -> PRE_COPY -> PRE_COPY -> FREEZE -> FINAL_DUMP -> TRANSFER -> RESTORE -> SWITCHOVER -> VERIFY -> COMMIT
+```
+
+```bash
+# 2. Inject a post-switchover health check failure to see Transactional Rollback in action
+./bin/lkmp demo --strategy pre-copy --inject-fault verify
+```
+
+---
+
+## Production Usage on Two Linux Hosts
+
+### 1. Start `lkmp-agent` on Source A and Destination B
 
 On both Linux hosts (requires `root` or `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`):
 
@@ -201,7 +206,7 @@ sudo ./bin/lkmp agent \
   --tls-key /etc/lkmp/node-b.key
 ```
 
-### 3. Launch a Workload inside a Migration Envelope on Host A
+### 2. Launch a Workload inside a Migration Envelope on Host A
 
 ```bash
 sudo ./bin/lkmp run \
@@ -211,17 +216,17 @@ sudo ./bin/lkmp run \
   -- /usr/local/bin/my-stateful-server
 ```
 
-### 4. Run Non-Destructive Preflight Check
+### 3. Run Non-Destructive Preflight Check
 
 ```bash
 ./bin/lkmp preflight \
   --pid 4242 \
   --source 10.0.0.1:9700 \
   --dest 10.0.0.2:9700 \
-  --strategy pre-copy
+  --strategy auto
 ```
 
-### 5. Live-Migrate the Process Tree from Host A to Host B
+### 4. Live-Migrate the Process Tree from Host A to Host B
 
 ```bash
 ./bin/lkmp migrate \
@@ -229,12 +234,42 @@ sudo ./bin/lkmp run \
   --workload-id srv-1 \
   --source 10.0.0.1:9700 \
   --dest 10.0.0.2:9700 \
-  --strategy pre-copy \
+  --strategy auto \
   --fs-mode rsync \
   --writable-path /var/lib/my-stateful-server \
   --ip-mobility garp \
   --workload-ip 10.0.0.99/24 \
   --health-cmd "curl -sf http://10.0.0.99:8080/healthz"
+```
+
+---
+
+## Project Structure
+
+```text
+.
+├── .github/workflows/ci.yml      # GitHub Actions CI matrix (Python 3.10 - 3.13)
+├── bin/lkmp                      # Executable CLI entrypoint
+├── docs/assets/                  # High-resolution architecture & pipeline SVG diagrams
+├── lkmp/
+│   ├── config.py                 # MigrationConfig, EnvelopeConfig, strategy/mode enums
+│   ├── models.py                 # State machine states, preflight & telemetry models
+│   ├── envelope.py               # Namespace unshare & cgroup v2 freeze manager
+│   ├── pagemap.py                # Kernel /proc/<pid>/pagemap soft-dirty profiler & auto-strategy
+│   ├── preflight.py              # /proc inspector, ELF build-id parser, ISA superset checker
+│   ├── convergence.py            # Pre-copy convergence math & dirty-page tracker
+│   ├── criu_driver.py            # CRIU command builder & GPU plugin hooks (cuda-checkpoint, amdgpu)
+│   ├── network.py                # nftables packet lock & GARP/BGP/Cloud IP mobility
+│   ├── fs_sync.py                # rsync pre-sync, frozen delta sync & zero-wipe
+│   ├── telemetry.py              # Prometheus OpenMetrics collector & terminal TUI renderer
+│   ├── demo.py                   # Self-contained two-node loopback TCP migration simulator
+│   ├── agent.py                  # Privileged host daemon (lkmp-agent) & TLS JSON-RPC
+│   ├── orchestrator.py           # 10-state migration controller & rollback engine
+│   └── cli.py                    # CLI parser and command handlers
+├── deploy/
+│   ├── Dockerfile.node           # Ubuntu 24.04 node image with CRIU, nftables, iproute2
+│   └── docker-compose.test.yml   # Two-node privileged test cluster on shared L2 bridge
+└── tests/                        # 21 unit & end-to-end two-agent TCP RPC tests
 ```
 
 ---
@@ -255,17 +290,9 @@ docker compose -f deploy/docker-compose.test.yml up -d --build
 | :--- | :--- |
 | `lkmp run` | Start a process tree inside an isolated PID/net/mnt/ipc/uts/time namespace and `cgroup v2` envelope |
 | `lkmp agent` | Start the privileged `lkmp-agent` JSON-RPC daemon on a host |
-| `lkmp preflight` | Inspect `/proc/<pid>`, verify CPU ISA superset & ELF build-ids on Destination B, and estimate downtime |
+| `lkmp preflight` | Inspect `/proc/<pid>`, profile `pagemap` dirty rate, verify CPU ISA superset & ELF build-ids on B |
 | `lkmp migrate` | Run the full migration state machine (`Preflight` → `PreCopy` → `Freeze` → `Restore` → `Switchover` → `Verify` → `Commit`/`Rollback`) |
-
-### Key `lkmp migrate` Flags
-
-- `--strategy {cold,pre-copy,lazy,hybrid}`: Memory transfer mode (default: `pre-copy`)
-- `--fs-mode {shared,rsync}`: Shared storage verification or `rsync` pre-sync + frozen delta sync
-- `--ip-mobility {none,garp,bgp,cloud}`: How the workload IP moves during switchover
-- `--gpu-plugin {none,amdgpu,cuda-checkpoint}`: Coordinate AMD or NVIDIA GPU state serialization alongside CRIU
-- `--unsafe-bare`: Allow migrating a bare host process not started inside `lkmp run`
-- `--health-cmd <cmd>`: Command executed on Destination B before committing; non-zero exit triggers automatic rollback to Source A
+| `lkmp demo` | Spin up a two-node loopback TCP cluster and run a live migration benchmark with fault injection & Prometheus metrics |
 
 ---
 

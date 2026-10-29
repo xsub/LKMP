@@ -10,6 +10,7 @@ from typing import List, Optional
 class MigrationStrategy(str, Enum):
     """Memory transfer strategy during process migration."""
 
+    AUTO = "auto"            # Auto-select based on RSS & /proc/<pid>/pagemap soft-dirty rate
     COLD = "cold"            # Stop -> dump -> transfer -> restore
     PRE_COPY = "pre-copy"    # Iterative pre-dump + final dump
     LAZY = "lazy"            # Post-copy demand paging via userfaultfd
