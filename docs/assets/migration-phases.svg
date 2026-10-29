@@ -1,142 +1,183 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 420" width="100%" height="100%" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" width="100%" height="100%" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <defs>
     <linearGradient id="bgGrad2" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#0d1117"/>
       <stop offset="100%" stop-color="#161b22"/>
     </linearGradient>
-    <marker id="arrRight" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+    <marker id="arrGray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
       <path d="M 0 1 L 10 5 L 0 9 z" fill="#8b949e"/>
     </marker>
-    <marker id="arrRed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#f85149"/>
+    <marker id="arrAmber2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#e3b341"/>
     </marker>
-    <marker id="arrGreen2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#3fb950"/>
+    <marker id="arrBlue2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrRed2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#f85149"/>
     </marker>
   </defs>
 
-  <!-- Background -->
-  <rect width="1100" height="420" rx="14" fill="url(#bgGrad2)" stroke="#30363d" stroke-width="2"/>
+  <!-- Canvas Background -->
+  <rect width="1200" height="520" rx="14" fill="url(#bgGrad2)" stroke="#30363d" stroke-width="2"/>
 
-  <!-- Title -->
-  <text x="550" y="34" fill="#e6edf3" font-size="15" font-weight="700" text-anchor="middle" letter-spacing="0.5">LKMP LIVE MIGRATION PIPELINE, FREEZE WINDOW &amp; TRANSACTIONAL ROLLBACK</text>
-
-  <!-- Phase Group 1: Online Preparation & Iterative Pre-Copy (Zero Downtime) -->
-  <rect x="26" y="54" width="385" height="205" rx="10" fill="#121d17" stroke="#238636" stroke-width="1.5"/>
-  <rect x="26" y="54" width="385" height="26" rx="10" fill="#238636"/>
-  <text x="218" y="71" fill="#ffffff" font-size="11" font-weight="700" text-anchor="middle">ONLINE PHASE — WORKLOAD RUNNING ON SOURCE A (0 ms DOWNTIME)</text>
-
-  <!-- Step 1: PREFLIGHT -->
-  <rect x="40" y="96" width="108" height="76" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
-  <text x="94" y="116" fill="#3fb950" font-size="11" font-weight="700" text-anchor="middle">1. PREFLIGHT</text>
-  <text x="94" y="133" fill="#8b949e" font-size="10" text-anchor="middle">CPU ISA Superset</text>
-  <text x="94" y="147" fill="#8b949e" font-size="10" text-anchor="middle">ELF build-id</text>
-  <text x="94" y="161" fill="#8b949e" font-size="10" text-anchor="middle">/proc Blockers</text>
-
-  <path d="M 148 134 L 164 134" stroke="#8b949e" stroke-width="2" marker-end="url(#arrRight)"/>
-
-  <!-- Step 2: PREPARE -->
-  <rect x="166" y="96" width="104" height="76" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
-  <text x="218" y="116" fill="#3fb950" font-size="11" font-weight="700" text-anchor="middle">2. PREPARE</text>
-  <text x="218" y="133" fill="#8b949e" font-size="10" text-anchor="middle">rsync pre-sync</text>
-  <text x="218" y="147" fill="#8b949e" font-size="10" text-anchor="middle">Start TLS</text>
-  <text x="218" y="161" fill="#8b949e" font-size="10" text-anchor="middle">page-server (B)</text>
-
-  <path d="M 270 134 L 286 134" stroke="#8b949e" stroke-width="2" marker-end="url(#arrRight)"/>
-
-  <!-- Step 3: PRE_COPY -->
-  <rect x="288" y="96" width="110" height="76" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
-  <text x="343" y="116" fill="#3fb950" font-size="11" font-weight="700" text-anchor="middle">3. PRE_COPY (1..N)</text>
-  <text x="343" y="133" fill="#8b949e" font-size="10" text-anchor="middle">Iterative pre-dump</text>
-  <text x="343" y="147" fill="#8b949e" font-size="10" text-anchor="middle">Soft-dirty tracking</text>
-  <text x="343" y="161" fill="#3fb950" font-size="10" font-weight="600" text-anchor="middle">Until converged</text>
-
-  <!-- Convergence caption -->
-  <rect x="40" y="186" width="358" height="58" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-  <text x="219" y="204" fill="#e6edf3" font-size="11" font-weight="600" text-anchor="middle">Pre-Copy Convergence Stopping Criteria:</text>
-  <text x="219" y="220" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">dirty_bytes &lt;= bandwidth * target_downtime</text>
-  <text x="219" y="235" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">OR shrink_ratio &lt; 10% OR round &gt;= max_iter (8)</text>
+  <!-- Main Header -->
+  <text x="600" y="34" fill="#e6edf3" font-size="15" font-weight="700" text-anchor="middle" letter-spacing="0.5">LKMP 10-STATE LIVE MIGRATION PIPELINE &amp; TRANSACTIONAL ROLLBACK</text>
 
 
-  <!-- Phase Group 2: Freeze & Switchover Window (Brief Downtime) -->
-  <rect x="427" y="54" width="445" height="205" rx="10" fill="#241c11" stroke="#d29922" stroke-width="1.5"/>
-  <rect x="427" y="54" width="445" height="26" rx="10" fill="#d29922"/>
-  <text x="649" y="71" fill="#0d1117" font-size="11" font-weight="800" text-anchor="middle">FREEZE &amp; SWITCHOVER WINDOW — SUB-200ms TARGET DOWNTIME</text>
+  <!-- ==================== QUADRANT 1 (TOP-LEFT): ONLINE PHASE (x=28..582, width=554) ==================== -->
+  <rect x="28" y="54" width="554" height="208" rx="10" fill="#121d17" stroke="#238636" stroke-width="1.5"/>
+  <rect x="28" y="54" width="554" height="28" rx="10" fill="#238636"/>
+  <text x="305" y="73" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.4">PHASE I — ONLINE PREFLIGHT &amp; PRE-COPY (0 ms DOWNTIME)</text>
 
-  <path d="M 398 134 L 439 134" stroke="#d29922" stroke-width="2" marker-end="url(#arrRight)"/>
+  <!-- Step 1: PREFLIGHT (x=44..202, width=158) -->
+  <rect x="44" y="98" width="158" height="82" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="123" y="119" fill="#3fb950" font-size="12" font-weight="700" text-anchor="middle">1. PREFLIGHT</text>
+  <text x="123" y="138" fill="#e6edf3" font-size="11" text-anchor="middle">CPU ISA Superset</text>
+  <text x="123" y="154" fill="#8b949e" font-size="10" text-anchor="middle">ELF build-id &amp; SHA256</text>
+  <text x="123" y="170" fill="#8b949e" font-size="10" text-anchor="middle">Scan /proc Blockers</text>
 
-  <!-- Step 4: FREEZE & DUMP -->
-  <rect x="441" y="96" width="102" height="76" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
-  <text x="492" y="116" fill="#e3b341" font-size="11" font-weight="700" text-anchor="middle">4. FINAL_DUMP</text>
-  <text x="492" y="133" fill="#8b949e" font-size="10" text-anchor="middle">nftables drop lock</text>
-  <text x="492" y="147" fill="#8b949e" font-size="10" text-anchor="middle">cgroup.freeze = 1</text>
-  <text x="492" y="161" fill="#8b949e" font-size="10" text-anchor="middle">--leave-stopped</text>
+  <path d="M 202 139 L 222 139" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
 
-  <path d="M 543 134 L 555 134" stroke="#8b949e" stroke-width="2" marker-end="url(#arrRight)"/>
+  <!-- Step 2: PREPARE (x=226..384, width=158) -->
+  <rect x="226" y="98" width="158" height="82" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="305" y="119" fill="#3fb950" font-size="12" font-weight="700" text-anchor="middle">2. PREPARE</text>
+  <text x="305" y="138" fill="#e6edf3" font-size="11" text-anchor="middle">Pre-sync Writable FS</text>
+  <text x="305" y="154" fill="#8b949e" font-size="10" text-anchor="middle">Create Image Dirs</text>
+  <text x="305" y="170" fill="#8b949e" font-size="10" text-anchor="middle">Start TLS Page-Server</text>
 
-  <!-- Step 5: TRANSFER -->
-  <rect x="557" y="96" width="96" height="76" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
-  <text x="605" y="116" fill="#e3b341" font-size="11" font-weight="700" text-anchor="middle">5. TRANSFER</text>
-  <text x="605" y="133" fill="#8b949e" font-size="10" text-anchor="middle">Final RAM delta</text>
-  <text x="605" y="147" fill="#8b949e" font-size="10" text-anchor="middle">core/fd .img</text>
-  <text x="605" y="161" fill="#8b949e" font-size="10" text-anchor="middle">rsync final diff</text>
+  <path d="M 384 139 L 404 139" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
 
-  <path d="M 653 134 L 665 134" stroke="#8b949e" stroke-width="2" marker-end="url(#arrRight)"/>
+  <!-- Step 3: PRE_COPY (x=408..566, width=158) -->
+  <rect x="408" y="98" width="158" height="82" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="487" y="119" fill="#3fb950" font-size="12" font-weight="700" text-anchor="middle">3. PRE_COPY (1..N)</text>
+  <text x="487" y="138" fill="#e6edf3" font-size="11" text-anchor="middle">Iterative pre-dump</text>
+  <text x="487" y="154" fill="#8b949e" font-size="10" text-anchor="middle">MEM_SOFT_DIRTY</text>
+  <text x="487" y="170" fill="#3fb950" font-size="10" font-weight="600" text-anchor="middle">App Keeps Running</text>
 
-  <!-- Step 6: RESTORE -->
-  <rect x="667" y="96" width="94" height="76" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
-  <text x="714" y="116" fill="#e3b341" font-size="11" font-weight="700" text-anchor="middle">6. RESTORE</text>
-  <text x="714" y="133" fill="#8b949e" font-size="10" text-anchor="middle">criu restore (B)</text>
-  <text x="714" y="147" fill="#8b949e" font-size="10" text-anchor="middle">--tcp-established</text>
-  <text x="714" y="161" fill="#8b949e" font-size="10" text-anchor="middle">GPU post-hook</text>
-
-  <path d="M 761 134 L 773 134" stroke="#8b949e" stroke-width="2" marker-end="url(#arrRight)"/>
-
-  <!-- Step 7: SWITCHOVER -->
-  <rect x="775" y="96" width="86" height="76" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
-  <text x="818" y="116" fill="#e3b341" font-size="10" font-weight="700" text-anchor="middle">7. SWITCHOVER</text>
-  <text x="818" y="133" fill="#8b949e" font-size="10" text-anchor="middle">Move IP to B</text>
-  <text x="818" y="147" fill="#8b949e" font-size="10" text-anchor="middle">GARP / BGP</text>
-  <text x="818" y="161" fill="#3fb950" font-size="10" font-weight="600" text-anchor="middle">SIGCONT on B</text>
-
-  <!-- Freeze details -->
-  <rect x="441" y="186" width="420" height="58" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-  <text x="651" y="205" fill="#e3b341" font-size="11" font-weight="600" text-anchor="middle">Zero-RST TCP Switchover &amp; Intact Source Preservation:</text>
-  <text x="651" y="222" fill="#8b949e" font-size="10" text-anchor="middle">Source A stays frozen (--leave-stopped) while nftables drops packets so TCP peers</text>
-  <text x="651" y="236" fill="#8b949e" font-size="10" text-anchor="middle">never receive RST. Once IP moves and B resumes, TCP streams continue seamlessly.</text>
+  <!-- Footer Note inside Quadrant 1 (x=44..566, width=522) -->
+  <rect x="44" y="192" width="522" height="56" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="305" y="212" fill="#e6edf3" font-size="11" font-weight="600" text-anchor="middle">Pre-Copy Convergence Stopping Rules:</text>
+  <text x="305" y="232" fill="#8b949e" font-size="10.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">dirty &lt;= bw * target_downtime  |  shrink &lt; 10%  |  round &gt;= 8</text>
 
 
-  <!-- Phase Group 3: Verification & Commit on Destination B -->
-  <rect x="888" y="54" width="186" height="205" rx="10" fill="#121d24" stroke="#388bfd" stroke-width="1.5"/>
-  <rect x="888" y="54" width="186" height="26" rx="10" fill="#1f6feb"/>
-  <text x="981" y="71" fill="#ffffff" font-size="11" font-weight="700" text-anchor="middle">VERIFY &amp; COMMIT (B)</text>
-
-  <path d="M 861 134 L 900 134" stroke="#3fb950" stroke-width="2" marker-end="url(#arrGreen2)"/>
-
-  <!-- Step 8: VERIFY -->
-  <rect x="902" y="96" width="158" height="66" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
-  <text x="981" y="115" fill="#58a6ff" font-size="11" font-weight="700" text-anchor="middle">8. VERIFY HEALTH</text>
-  <text x="981" y="132" fill="#8b949e" font-size="10" text-anchor="middle">Check PID alive on B</text>
-  <text x="981" y="147" fill="#8b949e" font-size="10" text-anchor="middle">Run --health-cmd</text>
-
-  <!-- Step 9: COMMIT -->
-  <rect x="902" y="176" width="158" height="68" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
-  <text x="981" y="195" fill="#3fb950" font-size="11" font-weight="700" text-anchor="middle">9. COMMIT</text>
-  <text x="981" y="212" fill="#8b949e" font-size="10" text-anchor="middle">SIGKILL frozen Source A</text>
-  <text x="981" y="227" fill="#8b949e" font-size="10" text-anchor="middle">Zero-wipe *.img secrets</text>
+  <!-- Connector from Quadrant 1 to Quadrant 2 -->
+  <path d="M 582 139 L 614 139" stroke="#e3b341" stroke-width="2.5" marker-end="url(#arrAmber2)"/>
 
 
-  <!-- ==================== TRANSACTIONAL ROLLBACK TRACK (BOTTOM) ==================== -->
-  <rect x="140" y="294" width="840" height="98" rx="10" fill="#251316" stroke="#f85149" stroke-width="2"/>
-  <text x="560" y="318" fill="#ff7b72" font-size="13" font-weight="700" text-anchor="middle">10. DETERMINISTIC ROLLBACK SAFETY NET (IF RESTORE, SWITCHOVER, OR VERIFY FAILS)</text>
-  <text x="560" y="340" fill="#e6edf3" font-size="12" text-anchor="middle">1. Kill partial process on Destination B (SIGKILL) &amp; release IP on B   →   2. Re-claim IP &amp; unlock nftables on Source A</text>
-  <text x="560" y="360" fill="#3fb950" font-size="12" font-weight="600" text-anchor="middle">3. Unfreeze cgroup &amp; send SIGCONT to frozen Source A — Original workload continues on Host A with zero data loss!</text>
-  <text x="560" y="380" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">Possible because Source A is paused with --leave-stopped and never destroyed until Step 8 (VERIFY) succeeds</text>
+  <!-- ==================== QUADRANT 2 (TOP-RIGHT): FREEZE & RESTORE (x=618..1172, width=554) ==================== -->
+  <rect x="618" y="54" width="554" height="208" rx="10" fill="#241c11" stroke="#d29922" stroke-width="1.5"/>
+  <rect x="618" y="54" width="554" height="28" rx="10" fill="#d29922"/>
+  <text x="895" y="73" fill="#0d1117" font-size="12" font-weight="800" text-anchor="middle" letter-spacing="0.4">PHASE II — FREEZE, FINAL DUMP &amp; RESTORE (&lt; 200 ms WINDOW)</text>
 
-  <!-- Failure Arrows dropping into Rollback Track -->
-  <path d="M 714 172 L 714 292" fill="none" stroke="#f85149" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrRed)"/>
-  <text x="706" y="278" fill="#ff7b72" font-size="10" font-weight="600" text-anchor="end">Restore Error</text>
+  <!-- Step 4: FREEZE & DUMP (x=634..792, width=158) -->
+  <rect x="634" y="98" width="158" height="82" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
+  <text x="713" y="119" fill="#e3b341" font-size="12" font-weight="700" text-anchor="middle">4. FINAL_DUMP</text>
+  <text x="713" y="138" fill="#e6edf3" font-size="11" text-anchor="middle">nftables DROP Lock</text>
+  <text x="713" y="154" fill="#8b949e" font-size="10" text-anchor="middle">cgroup.freeze = 1</text>
+  <text x="713" y="170" fill="#8b949e" font-size="10" text-anchor="middle">dump --leave-stopped</text>
 
-  <path d="M 902 129 L 855 129 L 855 292" fill="none" stroke="#f85149" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrRed)"/>
-  <text x="848" y="278" fill="#ff7b72" font-size="10" font-weight="600" text-anchor="end">Health Check Failed</text>
+  <path d="M 792 139 L 812 139" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
+
+  <!-- Step 5: TRANSFER (x=816..974, width=158) -->
+  <rect x="816" y="98" width="158" height="82" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
+  <text x="895" y="119" fill="#e3b341" font-size="12" font-weight="700" text-anchor="middle">5. TRANSFER</text>
+  <text x="895" y="138" fill="#e6edf3" font-size="11" text-anchor="middle">Final Dirty Pages</text>
+  <text x="895" y="154" fill="#8b949e" font-size="10" text-anchor="middle">Metadata core/fd .img</text>
+  <text x="895" y="170" fill="#8b949e" font-size="10" text-anchor="middle">rsync Final FS Delta</text>
+
+  <path d="M 974 139 L 994 139" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
+
+  <!-- Step 6: RESTORE (x=998..1156, width=158) -->
+  <rect x="998" y="98" width="158" height="82" rx="8" fill="#161b22" stroke="#e3b341" stroke-width="1.5"/>
+  <text x="1077" y="119" fill="#e3b341" font-size="12" font-weight="700" text-anchor="middle">6. RESTORE (B)</text>
+  <text x="1077" y="138" fill="#e6edf3" font-size="11" text-anchor="middle">criu restore on B</text>
+  <text x="1077" y="154" fill="#8b949e" font-size="10" text-anchor="middle">--tcp-established</text>
+  <text x="1077" y="170" fill="#8b949e" font-size="10" text-anchor="middle">GPU Context Restore</text>
+
+  <!-- Footer Note inside Quadrant 2 (x=634..1156, width=522) -->
+  <rect x="634" y="192" width="522" height="56" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="895" y="212" fill="#e3b341" font-size="11" font-weight="600" text-anchor="middle">Zero-RST TCP Protection &amp; Non-Destructive Freeze:</text>
+  <text x="895" y="232" fill="#8b949e" font-size="10.5" text-anchor="middle">Source A stays frozen (--leave-stopped); nftables blocks TCP RST.</text>
+
+
+  <!-- ==================== QUADRANT 3 (BOTTOM-LEFT): SWITCHOVER, VERIFY & COMMIT (x=28..582, width=554) ==================== -->
+  <rect x="28" y="288" width="554" height="208" rx="10" fill="#121d24" stroke="#388bfd" stroke-width="1.5"/>
+  <rect x="28" y="288" width="554" height="28" rx="10" fill="#1f6feb"/>
+  <text x="305" y="307" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.4">PHASE III — SWITCHOVER, HEALTH VERIFY &amp; COMMIT (HAPPY PATH)</text>
+
+  <!-- Step 7: SWITCHOVER (x=44..202, width=158) -->
+  <rect x="44" y="332" width="158" height="82" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="123" y="353" fill="#58a6ff" font-size="12" font-weight="700" text-anchor="middle">7. SWITCHOVER</text>
+  <text x="123" y="372" fill="#e6edf3" font-size="11" text-anchor="middle">Move IP to Host B</text>
+  <text x="123" y="388" fill="#8b949e" font-size="10" text-anchor="middle">GARP / BGP /32 Route</text>
+  <text x="123" y="404" fill="#3fb950" font-size="10" font-weight="600" text-anchor="middle">SIGCONT on Host B</text>
+
+  <path d="M 202 373 L 222 373" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
+
+  <!-- Step 8: VERIFY (x=226..384, width=158) -->
+  <rect x="226" y="332" width="158" height="82" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="305" y="353" fill="#58a6ff" font-size="12" font-weight="700" text-anchor="middle">8. VERIFY HEALTH</text>
+  <text x="305" y="372" fill="#e6edf3" font-size="11" text-anchor="middle">Check PID Alive on B</text>
+  <text x="305" y="388" fill="#8b949e" font-size="10" text-anchor="middle">Run --health-cmd</text>
+  <text x="305" y="404" fill="#8b949e" font-size="10" text-anchor="middle">Confirm TCP Progress</text>
+
+  <path d="M 384 373 L 404 373" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
+
+  <!-- Step 9: COMMIT (x=408..566, width=158) -->
+  <rect x="408" y="332" width="158" height="82" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="487" y="353" fill="#3fb950" font-size="12" font-weight="700" text-anchor="middle">9. COMMIT</text>
+  <text x="487" y="372" fill="#e6edf3" font-size="11" text-anchor="middle">SIGKILL Source A</text>
+  <text x="487" y="388" fill="#8b949e" font-size="10" text-anchor="middle">Unlock nftables on A</text>
+  <text x="487" y="404" fill="#3fb950" font-size="10" font-weight="600" text-anchor="middle">Zero-Wipe *.img Files</text>
+
+  <!-- Footer Note inside Quadrant 3 (x=44..566, width=522) -->
+  <rect x="44" y="426" width="522" height="56" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="305" y="446" fill="#58a6ff" font-size="11" font-weight="600" text-anchor="middle">Downtime Ends at Step 7 • Secrets Wiped at Step 9:</text>
+  <text x="305" y="466" fill="#8b949e" font-size="10.5" text-anchor="middle">Memory dumps (pages-*.img, core-*.img) are zero-wiped on commit.</text>
+
+
+  <!-- ==================== QUADRANT 4 (BOTTOM-RIGHT): TRANSACTIONAL ROLLBACK (x=618..1172, width=554) ==================== -->
+  <rect x="618" y="288" width="554" height="208" rx="10" fill="#251316" stroke="#f85149" stroke-width="1.5"/>
+  <rect x="618" y="288" width="554" height="28" rx="10" fill="#da3633"/>
+  <text x="895" y="307" fill="#ffffff" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.4">10. TRANSACTIONAL ROLLBACK (IF RESTORE OR VERIFY FAILS)</text>
+
+  <!-- Rollback Step R1 (x=634..792, width=158) -->
+  <rect x="634" y="332" width="158" height="82" rx="8" fill="#161b22" stroke="#f85149" stroke-width="1.5"/>
+  <text x="713" y="353" fill="#ff7b72" font-size="12" font-weight="700" text-anchor="middle">R1. CLEANUP DEST B</text>
+  <text x="713" y="372" fill="#e6edf3" font-size="11" text-anchor="middle">SIGKILL Partial B</text>
+  <text x="713" y="388" fill="#8b949e" font-size="10" text-anchor="middle">Release IP on Host B</text>
+  <text x="713" y="404" fill="#8b949e" font-size="10" text-anchor="middle">Wipe B Image Dirs</text>
+
+  <path d="M 792 373 L 812 373" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
+
+  <!-- Rollback Step R2 (x=816..974, width=158) -->
+  <rect x="816" y="332" width="158" height="82" rx="8" fill="#161b22" stroke="#f85149" stroke-width="1.5"/>
+  <text x="895" y="353" fill="#ff7b72" font-size="12" font-weight="700" text-anchor="middle">R2. RECLAIM NET A</text>
+  <text x="895" y="372" fill="#e6edf3" font-size="11" text-anchor="middle">Re-Claim IP on A</text>
+  <text x="895" y="388" fill="#8b949e" font-size="10" text-anchor="middle">GARP / BGP Back to A</text>
+  <text x="895" y="404" fill="#8b949e" font-size="10" text-anchor="middle">Unlock nftables on A</text>
+
+  <path d="M 974 373 L 994 373" stroke="#8b949e" stroke-width="2" marker-end="url(#arrGray)"/>
+
+  <!-- Rollback Step R3 (x=998..1156, width=158) -->
+  <rect x="998" y="332" width="158" height="82" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="1077" y="353" fill="#3fb950" font-size="12" font-weight="700" text-anchor="middle">R3. RESUME HOST A</text>
+  <text x="1077" y="372" fill="#e6edf3" font-size="11" text-anchor="middle">cgroup.freeze = 0</text>
+  <text x="1077" y="388" fill="#8b949e" font-size="10" text-anchor="middle">Send SIGCONT to A</text>
+  <text x="1077" y="404" fill="#3fb950" font-size="10" font-weight="600" text-anchor="middle">Zero Data Loss!</text>
+
+  <!-- Footer Note inside Quadrant 4 (x=634..1156, width=522) -->
+  <rect x="634" y="426" width="522" height="56" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="895" y="446" fill="#ff7b72" font-size="11" font-weight="600" text-anchor="middle">Guaranteed Safe Recovery on Any Failure:</text>
+  <text x="895" y="466" fill="#8b949e" font-size="10.5" text-anchor="middle">Source A is never killed until Step 8 succeeds; rollback thaws Host A.</text>
+
+  <!-- Inter-Row Connectors (Step 6 -> Step 7 and Failure -> Rollback) -->
+  <path d="M 750 262 L 450 286" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrBlue2)"/>
+  <text x="580" y="278" fill="#58a6ff" font-size="10" font-weight="600" text-anchor="middle">Restore OK → Switchover</text>
+
+  <path d="M 980 262 L 980 284" fill="none" stroke="#f85149" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrRed2)"/>
+  <text x="1045" y="278" fill="#ff7b72" font-size="10" font-weight="600" text-anchor="middle">Error → Rollback</text>
+
+  <path d="M 582 373 L 614 373" fill="none" stroke="#f85149" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrRed2)"/>
 </svg>
