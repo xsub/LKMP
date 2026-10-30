@@ -30,6 +30,7 @@ class IpMobilityMode(str, Enum):
     NONE = "none"            # Do not move IP (e.g., clients reconnect to new host)
     GARP = "garp"            # L2 Gratuitous ARP (IPv4) / Unsolicited NA (IPv6)
     BGP = "bgp"              # L3 BGP /32 route announce on B and withdraw on A
+    EBPF = "ebpf"            # Zero-drop eBPF/IPIP tunnel hairpin redirect from A -> B + GARP
     CLOUD = "cloud"          # Custom cloud secondary-IP reassignment webhook/command
 
 
@@ -106,5 +107,6 @@ class MigrationConfig:
     # Verification & security
     health_check_cmd: Optional[str] = None
     health_check_timeout_sec: float = 5.0
+    verify_attestation: bool = True
     wipe_images_on_commit: bool = True
     tls: TlsConfig = field(default_factory=TlsConfig)

@@ -27,7 +27,9 @@ jobs:
       - name: Run unit & two-agent TCP RPC test suite
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
 
-      - name: Run CLI live migration demo (Commit + Rollback + Prometheus)
+      - name: Run CLI live migration demo & SOTA benchmark (Commit + Rollback + Merkle Attestation)
         run: |
           ./bin/lkmp demo --strategy auto --rss-mb 256 --dirty-mbps 40 --prometheus
           ./bin/lkmp demo --strategy pre-copy --inject-fault verify --prometheus
+          ./bin/lkmp demo --strategy cold --inject-fault corrupt-image
+          ./bin/lkmp benchmark

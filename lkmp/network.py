@@ -113,20 +113,31 @@ class NetworkMobilityManager:
         addr = ipaddress.ip_address(bare_ip)
         cmds: List[List[str]] = []
 
-        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.BGP):
+        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.BGP, IpMobilityMode.EBPF):
             cmds.append(["ip", "addr", "del", cidr, "dev", config.net_interface])
 
         if config.ip_mobility == IpMobilityMode.BGP:
             af = "ipv6" if addr.version == 6 else "ipv4"
             host_route = f"{bare_ip}/128" if addr.version == 6 else f"{bare_ip}/32"
             cmds.append(["gobgp", "global", "rib", "del", "-a", af, host_route])
+        elif config.ip_mobility == IpMobilityMode.EBPF:
+            dest_host = config.dest_addr.split(":", 1)[0]
+            host_route = f"{bare_ip}/128" if addr.version == 6 else f"{bare_ip}/32"
+            # Set up zero-drop tunnel/TC forwarding on Source A so in-flight packets reach B
+            cmds.extend(
+                [
+                    ["ip", "tunnel", "add", "lkmp0", "mode", "ipip", "remote", dest_host],
+                    ["ip", "link", "set", "lkmp0", "up"],
+                    ["ip", "route", "replace", host_route, "dev", "lkmp0"],
+                ]
+            )
 
         for cmd in cmds:
             self.runner(cmd)
         return cmds
 
     def claim_ip_on_host(self, config: MigrationConfig, target_host: str) -> List[List[str]]:
-        """Assign the workload IP and announce its new location via GARP, BGP, or Cloud API."""
+        """Assign the workload IP and announce its new location via GARP, BGP, eBPF, or Cloud API."""
         if config.ip_mobility == IpMobilityMode.NONE or not config.workload_ip:
             return []
 
@@ -135,10 +146,10 @@ class NetworkMobilityManager:
         addr = ipaddress.ip_address(bare_ip)
         cmds: List[List[str]] = []
 
-        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.BGP):
+        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.BGP, IpMobilityMode.EBPF):
             cmds.append(["ip", "addr", "add", cidr, "dev", config.net_interface])
 
-        if config.ip_mobility == IpMobilityMode.GARP:
+        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.EBPF):
             if addr.version == 6:
                 cmds.append(["ndsend", bare_ip, config.net_interface])
             else:

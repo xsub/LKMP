@@ -16,6 +16,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from lkmp.attestation import CheckpointAttestor
 from lkmp.config import (
     FilesystemMode,
     GpuPlugin,
@@ -69,6 +70,7 @@ class AgentService:
         net_manager: Optional[NetworkMobilityManager] = None,
         fs_manager: Optional[FilesystemSyncManager] = None,
         envelope_manager: Optional[EnvelopeManager] = None,
+        attestor: Optional[CheckpointAttestor] = None,
         signal_sender: Optional[Callable[[int, int], None]] = None,
         pid_alive_checker: Optional[Callable[[int], bool]] = None,
     ) -> None:
@@ -78,6 +80,7 @@ class AgentService:
         self.net = net_manager or NetworkMobilityManager()
         self.fs = fs_manager or FilesystemSyncManager()
         self.envelope = envelope_manager or EnvelopeManager()
+        self.attestor = attestor or CheckpointAttestor()
         self._send_signal = signal_sender or os.kill
         self._check_pid_alive = pid_alive_checker or self._default_pid_alive
 
@@ -229,7 +232,21 @@ class AgentService:
             dest_host=dest_host if config.strategy == MigrationStrategy.PRE_COPY else None,
         )
         self.criu.runner(cmd)
-        return {"images_dir": str(img_dir), "command": cmd}
+
+        merkle_root: Optional[str] = None
+        if config.verify_attestation:
+            manifest = self.attestor.generate_manifest(
+                images_dir=img_dir,
+                migration_id=migration_id,
+                pid=config.pid,
+            )
+            merkle_root = manifest.merkle_root
+
+        return {
+            "images_dir": str(img_dir),
+            "command": cmd,
+            "merkle_root": merkle_root,
+        }
 
     def transfer_final_state(
         self,
@@ -252,6 +269,11 @@ class AgentService:
         config = config_from_dict(config_dict)
         img_dir = self._round_dir(migration_id, "final")
         img_dir.mkdir(parents=True, exist_ok=True)
+
+        # Verify cryptographic Merkle-tree checkpoint attestation if manifest is present
+        manifest_path = img_dir / CheckpointAttestor.MANIFEST_FILENAME
+        if config.verify_attestation and manifest_path.exists():
+            self.attestor.verify_directory(img_dir, expected_migration_id=migration_id)
 
         # Lock network on Destination B until IP switchover completes
         self.net.lock_network(config.workload_ip)

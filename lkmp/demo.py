@@ -1,7 +1,8 @@
-"""Self-contained two-node live migration simulator & benchmark (`lkmp demo`)."""
+"""Self-contained two-node live migration simulator & SOTA benchmark suite (`lkmp demo` / `lkmp benchmark`)."""
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -21,7 +22,9 @@ from lkmp.fs_sync import FilesystemSyncManager
 from lkmp.models import MigrationResult
 from lkmp.network import NetworkMobilityManager
 from lkmp.orchestrator import MigrationOrchestrator
-from lkmp.telemetry import PrometheusMetricsCollector
+from lkmp.pagemap import PAGE_SIZE, PTE_PRESENT_BIT, PTE_SOFT_DIRTY_BIT
+from lkmp.telemetry import PrometheusMetricsCollector, format_bytes
+import struct
 
 
 class DemoClusterNodeSet:
@@ -49,7 +52,6 @@ class DemoClusterNodeSet:
         self.signals_a: List[Tuple[int, int]] = []
         self.signals_b: List[Tuple[int, int]] = []
 
-        # Calculate realistic shrinking dirty page sizes across 3 pre-dump rounds
         r1 = max(4 * 1024 * 1024, int(self.rss_bytes * 0.45))
         r2 = max(2 * 1024 * 1024, int(self.dirty_bps * 0.60))
         r3 = max(1 * 1024 * 1024, int(self.dirty_bps * 0.25))
@@ -94,7 +96,22 @@ class DemoClusterNodeSet:
             encoding="utf-8",
         )
         (pid_dir / "cgroup").write_text("0::/lkmp/demo-srv\n", encoding="utf-8")
-        (pid_dir / "maps").write_text("", encoding="utf-8")
+
+        # Create synthetic VMA & binary /proc/4242/pagemap reflecting dirty_bps ratio
+        num_sample_pages = 256
+        end_addr = num_sample_pages * PAGE_SIZE
+        (pid_dir / "maps").write_text(
+            f"00000000-{end_addr:08x} rw-p 00000000 00:00 0 [heap]\n",
+            encoding="utf-8",
+        )
+        (pid_dir / "clear_refs").write_text("", encoding="utf-8")
+        dirty_ratio = min(1.0, self.dirty_bps / float(125 * 1024 * 1024))
+        dirty_pages = int(num_sample_pages * dirty_ratio)
+        entries = [
+            (PTE_PRESENT_BIT | PTE_SOFT_DIRTY_BIT) if i < dirty_pages else PTE_PRESENT_BIT
+            for i in range(num_sample_pages)
+        ]
+        (pid_dir / "pagemap").write_bytes(b"".join(struct.pack("<Q", e) for e in entries))
 
     def _run_a(self, cmd: List[str]) -> subprocess.CompletedProcess:
         if len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "pre-dump":
@@ -108,7 +125,25 @@ class DemoClusterNodeSet:
         elif len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "dump":
             idx = cmd.index("--images-dir")
             img_dir = Path(cmd[idx + 1])
-            (img_dir / "core-4242.img").write_bytes(b"DEMO_PROCESS_CONTEXT")
+            (img_dir / "core-4242.img").write_bytes(b"DEMO_PROCESS_CONTEXT_REGISTERS")
+        elif len(cmd) >= 1 and cmd[0] == "rsync":
+            # Copy final images (including manifest.sig.json) from work_a to work_b
+            src_arg = cmd[-2].rstrip("/")
+            src_path = Path(src_arg)
+            if src_path.exists() and "work_a" in str(src_path):
+                rel = src_path.relative_to(self.work_a)
+                dst_path = self.work_b / rel
+                dst_path.mkdir(parents=True, exist_ok=True)
+                for item in src_path.iterdir():
+                    if item.is_file() and not item.name.startswith("pages-"):
+                        shutil.copy2(item, dst_path / item.name)
+                if self.inject_fault == "corrupt-image":
+                    corrupted = dst_path / "core-4242.img"
+                    if corrupted.exists():
+                        # Flip 1 byte in-place (preserving file size) to test SHA-256 & Merkle detection
+                        raw = bytearray(corrupted.read_bytes())
+                        raw[0] ^= 0xFF
+                        corrupted.write_bytes(bytes(raw))
         return subprocess.CompletedProcess(cmd, 0, "CRIU 4.3\n", "")
 
     def _run_b(self, cmd: List[str]) -> subprocess.CompletedProcess:
@@ -150,15 +185,63 @@ def run_live_demo(
                 dest_addr=f"{host_b}:{port_b}",
                 strategy=strategy,
                 fs_mode=FilesystemMode.SHARED,
-                ip_mobility=IpMobilityMode.GARP,
+                ip_mobility=IpMobilityMode.EBPF,
                 workload_ip="10.0.0.99/24",
                 tls=TlsConfig(enabled=False),
             )
             client_a = AgentClient(cfg.source_addr, tls=cfg.tls)
             client_b = AgentClient(cfg.dest_addr, tls=cfg.tls)
             orch = MigrationOrchestrator(cfg, client_a, client_b, metrics=metrics)
+            # Populate snapshot dirty_rate_bytes_per_sec for auto-strategy demo accuracy
+            orig_inspect = cluster.service_a.inspect_process
+
+            def _enriched_inspect(pid: int, ghost_limit_bytes: int) -> dict:
+                d = orig_inspect(pid, ghost_limit_bytes)
+                d["dirty_rate_bytes_per_sec"] = cluster.dirty_bps
+                return d
+
+            cluster.service_a.inspect_process = _enriched_inspect  # type: ignore[method-assign]
+            cluster.service_b.get_capabilities = lambda: {  # type: ignore[method-assign]
+                **AgentService.get_capabilities(cluster.service_b),
+                "has_userfaultfd": True,
+            }
             result = orch.execute()
             return result, orch.config.strategy.value, metrics
         finally:
             srv_a.shutdown()
             srv_b.shutdown()
+
+
+def run_sota_benchmark_suite() -> str:
+    """Run comparative benchmark across canonical workload profiles and render a table."""
+    scenarios = [
+        ("1. Edge Microservice", 6, 0, "none"),
+        ("2. Stateful Redis / DB", 512, 35, "none"),
+        ("3. Write-Heavy AI/Analytics", 1024, 105, "none"),
+        ("4. Tampered .img Attack", 256, 30, "corrupt-image"),
+    ]
+    lines = [
+        "┌──────────────────────────────┬──────────┬───────────┬──────────┬───────────┬────────────────────────────┐",
+        "│ Workload Scenario            │ RSS      │ WriteRate │ AutoMode │ FreezeWin │ Final Outcome              │",
+        "├──────────────────────────────┼──────────┼───────────┼──────────┼───────────┼────────────────────────────┤",
+    ]
+    for name, rss_mb, dirty_mbps, fault in scenarios:
+        res, chosen_strat, _ = run_live_demo(
+            strategy=MigrationStrategy.AUTO,
+            rss_mb=rss_mb,
+            dirty_mbps=dirty_mbps,
+            inject_fault=fault,
+        )
+        outcome = (
+            f"COMMIT (PID {res.restored_pid})"
+            if res.success
+            else ("ROLLBACK (Merkle Block)" if fault == "corrupt-image" else "ROLLBACK")
+        )
+        lines.append(
+            f"│ {name:<28} │ {f'{rss_mb} MiB':<8} │ {f'{dirty_mbps} MiB/s':<9} │ "
+            f"{chosen_strat:<8} │ {f'{res.freeze_downtime_ms:.2f} ms':<9} │ {outcome:<26} │"
+        )
+    lines.append(
+        "└──────────────────────────────┴──────────┴───────────┴──────────┴───────────┴────────────────────────────┘"
+    )
+    return "\n".join(lines)

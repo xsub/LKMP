@@ -18,7 +18,7 @@ from lkmp.config import (
     MigrationStrategy,
     TlsConfig,
 )
-from lkmp.demo import run_live_demo
+from lkmp.demo import run_live_demo, run_sota_benchmark_suite
 from lkmp.envelope import EnvelopeManager
 from lkmp.orchestrator import MigrationOrchestrator
 from lkmp.telemetry import render_migration_report, render_preflight_scorecard
@@ -188,12 +188,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     demo_p.add_argument(
         "--inject-fault",
-        choices=["none", "restore", "verify"],
+        choices=["none", "restore", "verify", "corrupt-image"],
         default="none",
-        help="Inject a destination failure to demonstrate transactional rollback (default: none)",
+        help="Inject a destination failure or image bitflip to test rollback (default: none)",
     )
     demo_p.add_argument("--prometheus", action="store_true", help="Print Prometheus OpenMetrics output")
     demo_p.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # 6. `lkmp benchmark`
+    sub.add_parser(
+        "benchmark",
+        help="Run comparative SOTA benchmark across workload profiles & Merkle tamper defense",
+    )
 
     return parser
 
@@ -294,6 +300,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("\nPrometheus Metrics (/metrics):")
                 print(metrics.export_prometheus_text().rstrip())
         return 0 if result.success or args.inject_fault != "none" else 1
+
+    if args.subcommand == "benchmark":
+        print(run_sota_benchmark_suite())
+        return 0
 
     return 1
 
