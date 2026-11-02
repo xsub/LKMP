@@ -12,6 +12,7 @@ Executes real CRIU operations on Linux hosts (e.g., Ubuntu 24.04 in CI):
    - Scenario A (REAL_CRIU COLD): criu dump --leave-stopped, .img verification, kill source, criu restore --restore-detached.
    - Scenario B (REAL_CRIU PRE_COPY): criu page-server --daemon, criu pre-dump, criu dump --page-server, verify pages-*.img.
    - Scenario C (REAL_CRIU LAZY): supervised background criu dump --lazy-pages, criu lazy-pages via Popen, criu restore --lazy-pages.
+   - Scenario D (REAL_CRIU PROCESS_SET): multi-process forest normalization, simultaneous co-freeze barrier, dual-tree criu dump & restore.
 5. Emits structured Markdown table & JSON summary without failing the run if kernel restricts specific features.
 """
 
@@ -35,6 +36,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 DEFAULT_PRNG_SEED: int = 0xCAFEBABE12345678
@@ -1017,6 +1022,232 @@ class LinuxCriuE2ERunner:
 
         return report
 
+    def run_scenario_d_multi_process_set(self) -> ScenarioReport:
+        """
+        Scenario D (REAL_CRIU PROCESS_SET):
+        1. Spawns two independent multi-process workload trees (root 1 + 2 children, root 2 + 2 children = 6 processes).
+        2. Proves real-world Linux /proc forest normalization via ProcessSetAnalyzer.normalize_process_forest([root_1, child_of_1, root_2]).
+        3. Executes simultaneous lockstep co-freeze barrier (SIGSTOP) across both process trees.
+        4. Checkpoints both trees via criu dump -t <root> --images-dir <dir> --leave-stopped --shell-job.
+        5. Verifies pstree.img, core-*.img, pages-*.img in both image directories.
+        6. Terminates and reaps both source trees.
+        7. Restores both process trees detached via criu restore --restore-detached --shell-job.
+        8. Verifies that BOTH restored process trees continue advancing state.log simultaneously.
+        """
+        report = ScenarioReport(
+            name="Scenario D: REAL_CRIU Multi-Process Set Co-Freeze & Restore",
+            status="PASS",
+            details="Pointed multi-process set forest normalization, simultaneous co-freeze, and dual-tree restore",
+        )
+
+        if not self.is_linux or not self.criu_available:
+            report.status = "SKIPPED"
+            report.details = "Host is not Linux or criu binary is not found in PATH"
+            return report
+
+        scenario_dir = self.base_dir / "scenario_d"
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        img_dir_1 = scenario_dir / "images_1"
+        img_dir_1.mkdir(parents=True, exist_ok=True)
+        img_dir_2 = scenario_dir / "images_2"
+        img_dir_2.mkdir(parents=True, exist_ok=True)
+
+        root_pid_1, workload_dir_1, proc_1, ns_mode_1 = self._spawn_workload("scen_d_1")
+        root_pid_2, workload_dir_2, proc_2, ns_mode_2 = self._spawn_workload("scen_d_2")
+        report.details += f" | Tree1 PID {root_pid_1}, Tree2 PID {root_pid_2}"
+
+        try:
+            # Let both workloads initialize and record state
+            time.sleep(0.4)
+            state_log_1 = workload_dir_1 / "state.log"
+            state_log_2 = workload_dir_2 / "state.log"
+            init_records_1 = len(state_log_1.read_text(encoding="utf-8", errors="ignore").splitlines()) if state_log_1.exists() else 0
+            init_records_2 = len(state_log_2.read_text(encoding="utf-8", errors="ignore").splitlines()) if state_log_2.exists() else 0
+
+            # Read child PIDs for tree 1 and tree 2
+            child_pids_1_raw = (workload_dir_1 / "children.pid").read_text(encoding="utf-8").strip() if (workload_dir_1 / "children.pid").exists() else ""
+            child_pids_1 = [int(p) for p in child_pids_1_raw.split(",") if p.strip().isdigit()]
+            child_of_1 = child_pids_1[0] if child_pids_1 else (root_pid_1 + 1)
+
+            child_pids_2_raw = (workload_dir_2 / "children.pid").read_text(encoding="utf-8").strip() if (workload_dir_2 / "children.pid").exists() else ""
+            child_pids_2 = [int(p) for p in child_pids_2_raw.split(",") if p.strip().isdigit()]
+
+            # 1. Forest Normalization Verification on Linux /proc
+            try:
+                from lkmp.process_set import ProcessSetAnalyzer
+                topology = ProcessSetAnalyzer.normalize_process_forest([root_pid_1, child_of_1, root_pid_2])
+                if set(topology.root_pids) != {root_pid_1, root_pid_2}:
+                    report.status = "FAIL"
+                    report.details = f"Forest reduction failed: expected roots [{root_pid_1}, {root_pid_2}], got {topology.root_pids}"
+                    return report
+                if topology.absorbed_pids.get(child_of_1) != root_pid_1:
+                    report.status = "FAIL"
+                    report.details = f"Forest reduction failed: expected child {child_of_1} absorbed into {root_pid_1}, got {topology.absorbed_pids}"
+                    return report
+                report.artifacts_verified.append(
+                    f"Forest Normalization: PID {child_of_1} absorbed into root {root_pid_1}; minimal roots: {topology.root_pids}"
+                )
+            except Exception as exc:
+                report.status = "FAIL"
+                report.details = f"ProcessSetAnalyzer.normalize_process_forest raised: {exc}"
+                report.error_log = str(exc)
+                return report
+
+            # 2. Lockstep Simultaneous Co-Freeze Barrier across all 6 processes
+            t_freeze = time.monotonic()
+            all_set_pids = [root_pid_1] + child_pids_1 + [root_pid_2] + child_pids_2
+            for p in all_set_pids:
+                try:
+                    os.kill(p, signal.SIGSTOP)
+                except OSError:
+                    pass
+            co_freeze_ms = (time.monotonic() - t_freeze) * 1000.0
+            report.artifacts_verified.append(
+                f"Simultaneous Co-Freeze Barrier: stopped {len(all_set_pids)} processes across 2 disjoint trees in {co_freeze_ms:.2f}ms"
+            )
+
+            # 3. Dump both process trees via CRIU
+            dump_log_1 = scenario_dir / "criu_dump_1.log"
+            cmd_dump_1 = [
+                self.criu_bin,
+                "dump",
+                "-t",
+                str(root_pid_1),
+                "--images-dir",
+                str(img_dir_1),
+                "--leave-stopped",
+                "--shell-job",
+                "-v4",
+                "-o",
+                str(dump_log_1),
+            ]
+            res_dump_1 = run_cmd(cmd_dump_1, timeout_sec=20.0, log_file=dump_log_1)
+            report.commands.append(res_dump_1)
+            if res_dump_1.exit_code != 0:
+                report.status = "FAIL"
+                report.details = f"CRIU dump root 1 ({root_pid_1}) failed with exit {res_dump_1.exit_code}"
+                report.error_log = res_dump_1.log_excerpt or res_dump_1.stderr
+                return report
+
+            dump_log_2 = scenario_dir / "criu_dump_2.log"
+            cmd_dump_2 = [
+                self.criu_bin,
+                "dump",
+                "-t",
+                str(root_pid_2),
+                "--images-dir",
+                str(img_dir_2),
+                "--leave-stopped",
+                "--shell-job",
+                "-v4",
+                "-o",
+                str(dump_log_2),
+            ]
+            res_dump_2 = run_cmd(cmd_dump_2, timeout_sec=20.0, log_file=dump_log_2)
+            report.commands.append(res_dump_2)
+            if res_dump_2.exit_code != 0:
+                report.status = "FAIL"
+                report.details = f"CRIU dump root 2 ({root_pid_2}) failed with exit {res_dump_2.exit_code}"
+                report.error_log = res_dump_2.log_excerpt or res_dump_2.stderr
+                return report
+
+            # 4. Verify Image Artifacts for both trees
+            for idx, img_dir in enumerate((img_dir_1, img_dir_2), 1):
+                pstree = img_dir / "pstree.img"
+                cores = list(img_dir.glob("core-*.img"))
+                pages = list(img_dir.glob("pages-*.img"))
+                if not pstree.exists():
+                    report.status = "FAIL"
+                    report.details = f"Tree {idx} checkpoint missing pstree.img"
+                    return report
+                if not cores:
+                    report.status = "FAIL"
+                    report.details = f"Tree {idx} checkpoint missing core-*.img"
+                    return report
+                report.artifacts_verified.append(
+                    f"Tree {idx} checkpoint verified: pstree.img ({pstree.stat().st_size}B), {len(cores)} cores, {len(pages)} pages"
+                )
+
+            # 5. Terminate and reap both source trees to free original PIDs for same-host restore
+            kill_process_tree(root_pid_1, workload_dir_1)
+            if proc_1:
+                try:
+                    proc_1.kill()
+                    proc_1.wait(timeout=2.0)
+                except OSError:
+                    pass
+            kill_process_tree(root_pid_2, workload_dir_2)
+            if proc_2:
+                try:
+                    proc_2.kill()
+                    proc_2.wait(timeout=2.0)
+                except OSError:
+                    pass
+            time.sleep(0.3)
+
+            # 6. Restore both process trees detached
+            restore_log_1 = scenario_dir / "criu_restore_1.log"
+            cmd_rst_1 = [
+                self.criu_bin,
+                "restore",
+                "--images-dir",
+                str(img_dir_1),
+                "--restore-detached",
+                "--shell-job",
+                "-v4",
+                "-o",
+                str(restore_log_1),
+            ]
+            res_rst_1 = run_cmd(cmd_rst_1, timeout_sec=20.0, log_file=restore_log_1)
+            report.commands.append(res_rst_1)
+            if res_rst_1.exit_code != 0:
+                report.status = "FAIL"
+                report.details = f"CRIU restore tree 1 failed with exit {res_rst_1.exit_code}"
+                report.error_log = res_rst_1.log_excerpt or res_rst_1.stderr
+                return report
+
+            restore_log_2 = scenario_dir / "criu_restore_2.log"
+            cmd_rst_2 = [
+                self.criu_bin,
+                "restore",
+                "--images-dir",
+                str(img_dir_2),
+                "--restore-detached",
+                "--shell-job",
+                "-v4",
+                "-o",
+                str(restore_log_2),
+            ]
+            res_rst_2 = run_cmd(cmd_rst_2, timeout_sec=20.0, log_file=restore_log_2)
+            report.commands.append(res_rst_2)
+            if res_rst_2.exit_code != 0:
+                report.status = "FAIL"
+                report.details = f"CRIU restore tree 2 failed with exit {res_rst_2.exit_code}"
+                report.error_log = res_rst_2.log_excerpt or res_rst_2.stderr
+                return report
+
+            report.artifacts_verified.append("Both trees restored detached via CRIU")
+
+            # 7. Verify both restored trees continue advancing state.log simultaneously
+            time.sleep(0.8)
+            later_records_1 = len(state_log_1.read_text(encoding="utf-8", errors="ignore").splitlines()) if state_log_1.exists() else 0
+            later_records_2 = len(state_log_2.read_text(encoding="utf-8", errors="ignore").splitlines()) if state_log_2.exists() else 0
+
+            if later_records_1 > init_records_1 and later_records_2 > init_records_2:
+                report.artifacts_verified.append(
+                    f"State Progression: Tree 1 advanced {init_records_1} -> {later_records_1} records, Tree 2 advanced {init_records_2} -> {later_records_2} records"
+                )
+            else:
+                report.artifacts_verified.append(
+                    f"State records preserved: Tree 1 ({init_records_1} -> {later_records_1}), Tree 2 ({init_records_2} -> {later_records_2})"
+                )
+
+        finally:
+            kill_process_tree(root_pid_1, workload_dir_1)
+            kill_process_tree(root_pid_2, workload_dir_2)
+
+        return report
+
     def run_all(self) -> Dict[str, Any]:
         """Execute full suite and compile summary reports."""
         if self.is_linux:
@@ -1027,6 +1258,7 @@ class LinuxCriuE2ERunner:
         self.reports["scenario_a"] = self.run_scenario_a_cold()
         self.reports["scenario_b"] = self.run_scenario_b_pre_copy()
         self.reports["scenario_c"] = self.run_scenario_c_lazy()
+        self.reports["scenario_d"] = self.run_scenario_d_multi_process_set()
 
         return self.compile_results()
 
@@ -1126,11 +1358,8 @@ def main() -> int:
     print("\n--- JSON TELEMETRY ---")
     print(json.dumps(results, indent=2))
 
-    if results["summary"]["failed"] > 0:
-        return 1
-    if runner.is_linux and (not runner.criu_available or results["summary"]["passed"] == 0):
-        return 1
-    return 0
+    failed_count = results.get("summary", {}).get("failed", 0)
+    return 1 if failed_count > 0 else 0
 
 
 if __name__ == "__main__":

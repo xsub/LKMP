@@ -23,7 +23,12 @@ from lkmp.demo import run_live_demo, run_sota_benchmark_suite
 from lkmp.envelope import EnvelopeManager
 from lkmp.journal import MigrationJournal
 from lkmp.orchestrator import MigrationOrchestrator, PortabilityReport, PortabilityStatus
-from lkmp.telemetry import render_migration_report, render_preflight_scorecard
+from lkmp.telemetry import (
+    render_migration_report,
+    render_preflight_scorecard,
+    render_process_set_migration_summary,
+    render_process_set_portability_report,
+)
 
 try:
     from lkmp.telemetry import render_portability_report
@@ -57,8 +62,35 @@ def _fallback_render_portability_report(report: Any) -> str:
     return "\n".join(lines)
 
 
+def _parse_pids_arg(pids_str: Optional[str]) -> List[int]:
+    """Parse comma-separated PID string (e.g. '101,205,309') into a list of integers."""
+    if not pids_str:
+        return []
+    pids: List[int] = []
+    for part in str(pids_str).split(","):
+        part = part.strip()
+        if part:
+            pids.append(int(part))
+    return pids
+
+
 def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--pid", type=int, required=True, help="Root PID of process tree on Source A")
+    parser.add_argument(
+        "--pid",
+        type=int,
+        required=False,
+        default=0,
+        help="Root PID of process tree on Source A",
+    )
+    parser.add_argument(
+        "--pids",
+        help="Comma-separated list of pointed PIDs to inspect/migrate together (v2.0 Process Set)",
+    )
+    parser.add_argument(
+        "--auto-include-coupled",
+        action="store_true",
+        help="Automatically include external processes coupled via pipes or UNIX sockets",
+    )
     parser.add_argument("--source", required=True, help="Source A agent address (host:port)")
     parser.add_argument("--dest", required=True, help="Destination B agent address (host:port)")
     parser.add_argument("--workload-id", help="Envelope workload ID (for cgroup v2 freeze)")
@@ -136,6 +168,18 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
         help="Volume snapshot restore hook run on Destination B before process resume",
     )
     parser.add_argument(
+        "--same-host-cow",
+        action="store_true",
+        default=True,
+        help="Enable same-host CoW fast path",
+    )
+    parser.add_argument(
+        "--no-same-host-cow",
+        action="store_false",
+        dest="same_host_cow",
+        help="Disable same-host CoW fast path",
+    )
+    parser.add_argument(
         "--active-sample-ms",
         type=int,
         default=0,
@@ -169,40 +213,51 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
 
 def _build_migration_config(args: argparse.Namespace) -> MigrationConfig:
     tls = TlsConfig(
-        enabled=not args.no_tls,
-        ca_cert=args.tls_ca,
-        cert_file=args.tls_cert,
-        key_file=args.tls_key,
+        enabled=not getattr(args, "no_tls", False),
+        ca_cert=getattr(args, "tls_ca", None),
+        cert_file=getattr(args, "tls_cert", None),
+        key_file=getattr(args, "tls_key", None),
     )
+    pids_arg = getattr(args, "pids", None)
+    target_pids = _parse_pids_arg(pids_arg) if pids_arg else []
+    pid_val = getattr(args, "pid", 0) or 0
+    if not target_pids and pid_val > 0:
+        target_pids = [pid_val]
+    elif target_pids and pid_val == 0:
+        pid_val = target_pids[0]
+
     return MigrationConfig(
-        pid=args.pid,
+        pid=pid_val,
         source_addr=args.source,
         dest_addr=args.dest,
-        workload_id=args.workload_id,
+        workload_id=getattr(args, "workload_id", None),
         strategy=MigrationStrategy(args.strategy),
         fs_mode=FilesystemMode(args.fs_mode),
-        writable_paths=list(args.writable_paths),
-        ip_mobility=IpMobilityMode(args.ip_mobility),
-        workload_ip=args.workload_ip,
-        net_interface=args.iface,
-        cloud_move_cmd=args.cloud_move_cmd,
-        tcp_established=not args.no_tcp_established,
-        unsafe_bare=args.unsafe_bare,
-        gpu_plugin=GpuPlugin(args.gpu_plugin),
-        max_precopy_iterations=args.max_iter,
-        target_downtime_ms=args.target_downtime_ms,
-        estimated_bandwidth_mbps=args.bandwidth_mbps,
-        health_check_cmd=args.health_cmd,
+        writable_paths=list(getattr(args, "writable_paths", []) or []),
+        ip_mobility=IpMobilityMode(getattr(args, "ip_mobility", "arp")),
+        workload_ip=getattr(args, "workload_ip", None),
+        net_interface=getattr(args, "iface", "eth0"),
+        cloud_move_cmd=getattr(args, "cloud_move_cmd", None),
+        tcp_established=not getattr(args, "no_tcp_established", False),
+        unsafe_bare=getattr(args, "unsafe_bare", False),
+        gpu_plugin=GpuPlugin(getattr(args, "gpu_plugin", GpuPlugin.NONE.value)),
+        max_precopy_iterations=getattr(args, "max_iter", 8),
+        target_downtime_ms=getattr(args, "target_downtime_ms", 200),
+        estimated_bandwidth_mbps=getattr(args, "bandwidth_mbps", 1000.0),
+        health_check_cmd=getattr(args, "health_cmd", None),
         quiesce_cmd=getattr(args, "quiesce_cmd", None),
         resume_cmd=getattr(args, "resume_cmd", None),
         volume_snapshot_cmd=getattr(args, "volume_snapshot_cmd", None),
         volume_restore_cmd=getattr(args, "volume_restore_cmd", None),
+        same_host_cow=getattr(args, "same_host_cow", True),
         active_sample_ms=getattr(args, "active_sample_ms", 0),
         check_only=getattr(args, "check_only", False),
         trial_restore=getattr(args, "trial_restore", False),
         journal_dir=getattr(args, "journal_dir", "/var/lib/lkmp/journals"),
         attestation_key_hex=getattr(args, "attestation_key_hex", None),
         tls=tls,
+        target_pids=target_pids,
+        auto_include_coupled=getattr(args, "auto_include_coupled", False),
     )
 
 
@@ -252,6 +307,75 @@ def build_parser() -> argparse.ArgumentParser:
     mig_p = sub.add_parser("migrate", help="Execute live or cold process migration from A to B")
     _add_common_migration_args(mig_p)
 
+    # 4b. `lkmp migrate-set`
+    p_mig_set = sub.add_parser(
+        "migrate-set",
+        help="Live-migrate a pointed set of processes together with lockstep co-freeze barrier (LKMP v2.0)",
+    )
+    p_mig_set.add_argument(
+        "--pids",
+        required=True,
+        help="Comma-separated list of pointed PIDs to inspect/migrate together (v2.0 Process Set)",
+    )
+    p_mig_set.add_argument(
+        "--auto-include-coupled",
+        action="store_true",
+        help="Automatically include external processes coupled via pipes or UNIX sockets",
+    )
+    p_mig_set.add_argument("--source", required=True, help="Source A agent address (host:port)")
+    p_mig_set.add_argument("--dest", required=True, help="Destination B agent address (host:port)")
+    p_mig_set.add_argument(
+        "--strategy",
+        choices=[s.value for s in MigrationStrategy],
+        default=MigrationStrategy.PRE_COPY.value,
+        help="Memory migration strategy: auto, cold, pre-copy, lazy, hybrid (default: pre-copy)",
+    )
+    p_mig_set.add_argument(
+        "--fs-mode",
+        choices=[m.value for m in FilesystemMode],
+        default=FilesystemMode.SHARED.value,
+        help="Filesystem synchronization mode (default: shared)",
+    )
+    p_mig_set.add_argument(
+        "--writable-path",
+        action="append",
+        default=[],
+        dest="writable_paths",
+        help="Writable path to rsync when --fs-mode=rsync (repeatable)",
+    )
+    p_mig_set.add_argument("--quiesce-cmd", help="Workload command to run before network lock and freeze")
+    p_mig_set.add_argument("--resume-cmd", help="Workload command to run after process resume or rollback")
+    p_mig_set.add_argument(
+        "--volume-snapshot-cmd",
+        help="Podman-style volume snapshot hook run while process is frozen",
+    )
+    p_mig_set.add_argument(
+        "--volume-restore-cmd",
+        help="Volume snapshot restore hook run on Destination B before process resume",
+    )
+    p_mig_set.add_argument(
+        "--same-host-cow",
+        action="store_true",
+        default=True,
+        help="Enable same-host CoW fast path",
+    )
+    p_mig_set.add_argument(
+        "--no-same-host-cow",
+        action="store_false",
+        dest="same_host_cow",
+        help="Disable same-host CoW fast path",
+    )
+    p_mig_set.add_argument(
+        "--journal-dir",
+        default="/var/lib/lkmp/journals",
+        help="Directory for durable Write-Ahead Logs (.wal.jsonl)",
+    )
+    p_mig_set.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+    p_mig_set.add_argument("--no-tls", action="store_true", help="Disable TLS on agent & page-server links")
+    p_mig_set.add_argument("--tls-ca", help="Path to CA certificate bundle")
+    p_mig_set.add_argument("--tls-cert", help="Path to TLS certificate")
+    p_mig_set.add_argument("--tls-key", help="Path to TLS private key")
+
     # 5. `lkmp demo`
     demo_p = sub.add_parser(
         "demo",
@@ -294,6 +418,10 @@ def build_parser() -> argparse.ArgumentParser:
     rec_p.add_argument(
         "--gang-journal",
         help="Path to gang coordinator Write-Ahead Log (.gang.wal.jsonl)",
+    )
+    rec_p.add_argument(
+        "--set-journal",
+        help="Path to multi-process set WAL (.set.wal.jsonl) to recover",
     )
     rec_p.add_argument("--source", help="Source A agent address (host:port)")
     rec_p.add_argument("--dest", help="Destination B agent address (host:port)")
@@ -377,10 +505,38 @@ def main(argv: Optional[List[str]] = None) -> int:
             server.shutdown()
         return 0
 
+    if args.subcommand in ("preflight", "portability", "migrate"):
+        pid_val = getattr(args, "pid", 0) or 0
+        pids_arg = getattr(args, "pids", None)
+        if pid_val == 0 and not pids_arg:
+            parser.error("Either --pid or --pids must be supplied")
+
     if args.subcommand == "preflight":
         cfg = _build_migration_config(args)
         src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
         dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
+        is_set = bool(getattr(args, "pids", None)) or len(cfg.target_pids) > 1
+        if is_set:
+            from lkmp.process_set import SetMigrationOrchestrator
+
+            set_orch = SetMigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
+            if hasattr(set_orch, "run_preflight"):
+                report = set_orch.run_preflight()
+            else:
+                report = set_orch.assess_portability(
+                    run_check_only=args.check_only if getattr(args, "check_only", False) else None,
+                    run_trial_restore=args.trial_restore if getattr(args, "trial_restore", False) else None,
+                )
+            if args.json:
+                if hasattr(report, "to_dict"):
+                    payload = report.to_dict()
+                else:
+                    payload = asdict(report)
+                print(json.dumps(payload, indent=2))
+            else:
+                print(render_process_set_portability_report(report))
+            return 0 if getattr(report, "compatible", True) else 2
+
         orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
         report = orch.run_preflight()
         if args.json:
@@ -401,6 +557,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg = _build_migration_config(args)
         src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
         dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
+        is_set = bool(getattr(args, "pids", None)) or len(cfg.target_pids) > 1
+        if is_set:
+            from lkmp.process_set import SetMigrationOrchestrator
+
+            set_orch = SetMigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
+            if hasattr(set_orch, "assess_portability"):
+                report = set_orch.assess_portability(
+                    run_check_only=args.check_only if getattr(args, "check_only", False) else None,
+                    run_trial_restore=args.trial_restore if getattr(args, "trial_restore", False) else None,
+                )
+            else:
+                report = set_orch.run_preflight()
+            if args.json:
+                if hasattr(report, "to_dict"):
+                    payload = report.to_dict()
+                else:
+                    payload = asdict(report)
+                print(json.dumps(payload, indent=2))
+            else:
+                print(render_process_set_portability_report(report))
+            st = getattr(report, "overall_status", "UNKNOWN")
+            st_val = getattr(st, "value", str(st)).upper()
+            is_valid_st = st_val in ("VERIFIED", "UNKNOWN", "PREPARE")
+            is_compat = getattr(report, "compatible", True)
+            return 0 if (is_valid_st and is_compat) else 2
+
         orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
         report = orch.assess_portability(
             run_check_only=args.check_only if args.check_only else None,
@@ -433,6 +615,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg = _build_migration_config(args)
         src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
         dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
+        is_set = bool(getattr(args, "pids", None)) or len(cfg.target_pids) > 1
+        if is_set:
+            from lkmp.process_set import SetMigrationOrchestrator
+
+            set_orch = SetMigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
+            result = set_orch.execute()
+            if args.json:
+                if hasattr(result, "to_dict"):
+                    payload = result.to_dict()
+                else:
+                    payload = asdict(result)
+                print(json.dumps(payload, indent=2))
+            else:
+                print(render_process_set_migration_summary(result))
+            return 0 if getattr(result, "success", False) else 1
+
         orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
         result = orch.execute()
         if args.json:
@@ -443,6 +641,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             print(render_migration_report(result, orch.config.strategy.value))
         return 0 if result.success else 1
+
+    if args.subcommand == "migrate-set":
+        cfg = _build_migration_config(args)
+        src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
+        dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
+        from lkmp.process_set import SetMigrationOrchestrator
+
+        set_orch = SetMigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
+        result = set_orch.execute()
+        if args.json:
+            if hasattr(result, "to_dict"):
+                payload = result.to_dict()
+            else:
+                payload = asdict(result)
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_process_set_migration_summary(result))
+        return 0 if getattr(result, "success", False) else 1
 
     if args.subcommand == "demo":
         result, resolved_strategy, metrics = run_live_demo(
@@ -475,6 +691,41 @@ def main(argv: Optional[List[str]] = None) -> int:
             cert_file=getattr(args, "tls_cert", None),
             key_file=getattr(args, "tls_key", None),
         )
+        set_journal = getattr(args, "set_journal", None) or (
+            args.journal if getattr(args, "journal", None) and args.journal.endswith(".set.wal.jsonl") else None
+        )
+        if set_journal:
+            from lkmp.process_set import SetMigrationOrchestrator
+
+            j_path = Path(set_journal)
+            client_a = AgentClient(args.source, tls=tls) if getattr(args, "source", None) else None
+            client_b = AgentClient(args.dest, tls=tls) if getattr(args, "dest", None) else None
+            try:
+                res_set = SetMigrationOrchestrator.recover_from_journal(
+                    journal_path=j_path,
+                    client_a=client_a,
+                    client_b=client_b,
+                )
+            except TypeError:
+                try:
+                    res_set = SetMigrationOrchestrator.recover_from_journal(
+                        j_path,
+                        client_a,
+                        client_b,
+                    )
+                except TypeError:
+                    res_set = SetMigrationOrchestrator.recover_from_journal(j_path)
+
+            if getattr(args, "json", False):
+                if hasattr(res_set, "to_dict"):
+                    payload = res_set.to_dict()
+                else:
+                    payload = asdict(res_set)
+                print(json.dumps(payload, indent=2))
+            else:
+                print(render_process_set_migration_summary(res_set))
+            return 0 if (getattr(res_set, "success", False) or getattr(res_set, "rolled_back", False)) else 2
+
         gang_journal = getattr(args, "gang_journal", None)
         if gang_journal:
             from lkmp.gang import GangMigrationCoordinator

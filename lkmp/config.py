@@ -84,9 +84,9 @@ class EnvelopeConfig:
 class MigrationConfig:
     """Full configuration for a single process tree migration."""
 
-    pid: int
-    source_addr: str
-    dest_addr: str
+    pid: int = 0
+    source_addr: str = ""
+    dest_addr: str = ""
     workload_id: Optional[str] = None
     strategy: MigrationStrategy = MigrationStrategy.PRE_COPY
     fs_mode: FilesystemMode = FilesystemMode.SHARED
@@ -136,3 +136,21 @@ class MigrationConfig:
     attestation_key_hex: Optional[str] = None
     wipe_images_on_commit: bool = True
     tls: TlsConfig = field(default_factory=TlsConfig)
+
+    # v2.0 Multi-Process Set Live Migration
+    target_pids: List[int] = field(default_factory=list)
+    auto_include_coupled: bool = False
+
+    @property
+    def target_pid(self) -> int:
+        return self.pid
+
+    @target_pid.setter
+    def target_pid(self, value: int) -> None:
+        self.pid = value
+
+    def __post_init__(self) -> None:
+        if not self.target_pids and self.pid > 0:
+            self.target_pids = [self.pid]
+        elif self.target_pids and self.pid == 0:
+            self.pid = self.target_pids[0]

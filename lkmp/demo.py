@@ -284,6 +284,7 @@ def run_live_demo(
                 ip_mobility=IpMobilityMode.TUNNEL,
                 workload_ip="10.0.0.99/24",
                 tls=TlsConfig(enabled=False),
+                journal_dir=str(Path(tmp) / "journals"),
             )
             client_a = AgentClient(cfg.source_addr, tls=cfg.tls)
             client_b = AgentClient(cfg.dest_addr, tls=cfg.tls)

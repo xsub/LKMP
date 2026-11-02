@@ -110,18 +110,31 @@ def config_to_dict(config: MigrationConfig) -> Dict[str, Any]:
     data["fs_mode"] = config.fs_mode.value
     data["ip_mobility"] = config.ip_mobility.value
     data["gpu_plugin"] = config.gpu_plugin.value
+    data["target_pids"] = list(config.target_pids)
+    data["auto_include_coupled"] = bool(config.auto_include_coupled)
     return data
 
 
 def config_from_dict(data: Dict[str, Any]) -> MigrationConfig:
     d = dict(data)
+    if "pid" not in d and "target_pid" in d:
+        d["pid"] = d.pop("target_pid")
+    else:
+        d.pop("target_pid", None)
     d["strategy"] = MigrationStrategy(d["strategy"])
     d["fs_mode"] = FilesystemMode(d["fs_mode"])
     d["ip_mobility"] = IpMobilityMode(d["ip_mobility"])
     d["gpu_plugin"] = GpuPlugin(d["gpu_plugin"])
     if isinstance(d.get("tls"), dict):
         d["tls"] = TlsConfig(**d["tls"])
+    if "target_pids" in d and isinstance(d["target_pids"], list):
+        d["target_pids"] = [int(p) for p in d["target_pids"]]
+    if "auto_include_coupled" in d:
+        d["auto_include_coupled"] = bool(d["auto_include_coupled"])
     return MigrationConfig(**d)
+
+
+dict_to_config = config_from_dict
 
 
 class AgentService:
@@ -203,6 +216,9 @@ class AgentService:
             raise ValueError(f"Invalid migration directory path for {migration_id!r}")
         return mig_dir
 
+    def _mig_dir(self, migration_id: str) -> Path:
+        return self._migration_dir(migration_id)
+
     def _round_dir(self, migration_id: str, round_name: str) -> Path:
         mig_dir = self._migration_dir(migration_id)
         validate_safe_identifier(round_name, "round_name")
@@ -269,7 +285,7 @@ class AgentService:
     def inspect_process(
         self,
         pid: int,
-        ghost_limit_bytes: int,
+        ghost_limit_bytes: int = 64 * 1024 * 1024,
         active_sample_ms: int = 0,
     ) -> Dict[str, Any]:
         try:
@@ -1032,9 +1048,156 @@ class AgentService:
             raise RuntimeError("; ".join(errors))
         return {"rolled_back_source": True, "resumed_pid": config.pid}
 
-    def dispatch_rpc(self, method: str, params: Dict[str, Any]) -> Any:
-        """Dispatch an incoming JSON-RPC call to the corresponding service method."""
-        allowed_methods = {
+    def inspect_process_set(
+        self,
+        pids: List[int],
+        auto_include_coupled: bool = False,
+        ghost_limit_bytes: int = 64 * 1024 * 1024,
+        active_sample_ms: int = 0,
+    ) -> Dict[str, Any]:
+        """Inspect a pointed set of PIDs, analyze process forest topology and coupling closure."""
+        from lkmp.process_set import ProcessSetAnalyzer, edge_to_dict, topology_to_dict
+
+        int_pids = [int(p) for p in pids]
+        auto_included: List[int] = []
+        if auto_include_coupled:
+            try:
+                topology, edges, auto_included = ProcessSetAnalyzer.expand_coupled_closure(
+                    int_pids, proc_root=self.proc_root
+                )
+            except TypeError:
+                topology, edges, auto_included = ProcessSetAnalyzer.expand_coupled_closure(int_pids)
+        else:
+            try:
+                topology = ProcessSetAnalyzer.normalize_process_forest(
+                    int_pids, proc_root=self.proc_root
+                )
+                edges = ProcessSetAnalyzer.analyze_coupling_closure(
+                    topology, proc_root=self.proc_root
+                )
+            except TypeError:
+                topology = ProcessSetAnalyzer.normalize_process_forest(int_pids)
+                edges = ProcessSetAnalyzer.analyze_coupling_closure(topology)
+            auto_included = []
+
+        root_snapshots: Dict[str, Any] = {}
+        for r in topology.root_pids:
+            root_snapshots[str(r)] = self.inspect_process(
+                int(r),
+                ghost_limit_bytes=ghost_limit_bytes,
+                active_sample_ms=active_sample_ms,
+            )
+
+        return {
+            "topology": topology_to_dict(topology),
+            "coupling_edges": [edge_to_dict(e) for e in edges],
+            "auto_included_pids": auto_included,
+            "root_snapshots": root_snapshots,
+        }
+
+    def freeze_process_set(
+        self,
+        migration_id: str,
+        root_pids: List[int],
+        config_dict: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Co-freeze all disjoint root trees in the pointed process set at a simultaneous lockstep barrier."""
+        migration_id = validate_safe_identifier(migration_id, "migration_id")
+        mig_dir = self._mig_dir(migration_id)
+        mig_dir.mkdir(parents=True, exist_ok=True)
+
+        int_roots = [int(r) for r in root_pids]
+        all_tree_pids: List[int] = []
+        seen = set()
+        for r in int_roots:
+            tree = discover_process_tree_pids(r, self.proc_root)
+            for p in tree:
+                if p not in seen:
+                    seen.add(p)
+                    all_tree_pids.append(p)
+
+        starttimes: Dict[str, int] = {}
+        for p in all_tree_pids:
+            st = read_proc_starttime(p, self.proc_root)
+            if st is not None:
+                starttimes[str(p)] = st
+
+        source_state_file = mig_dir / "set_source_state.json"
+        source_state_file.write_text(
+            json.dumps(
+                {
+                    "root_pids": int_roots,
+                    "tree_pids": all_tree_pids,
+                    "starttimes": starttimes,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        for r in int_roots:
+            self._signal_process_tree(r, signal.SIGSTOP, expected_starttimes=starttimes)
+
+        return {
+            "frozen_roots": int_roots,
+            "frozen_pids_count": len(all_tree_pids),
+            "co_freeze_ts_ns": time.time_ns(),
+        }
+
+    def resume_process_set(
+        self,
+        migration_id: str,
+        root_pids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Resume execution of all root process trees in the migration set."""
+        migration_id = validate_safe_identifier(migration_id, "migration_id")
+        mig_dir = self._mig_dir(migration_id)
+        source_state_file = mig_dir / "set_source_state.json"
+        starttimes: Optional[Dict[str, int]] = None
+
+        if source_state_file.exists():
+            try:
+                state_data = json.loads(source_state_file.read_text(encoding="utf-8"))
+                if root_pids is None:
+                    root_pids = [int(p) for p in state_data.get("root_pids", [])]
+                starttimes = state_data.get("starttimes")
+            except Exception:
+                pass
+
+        target_roots = [int(r) for r in (root_pids or [])]
+        for r in target_roots:
+            self._signal_process_tree(r, signal.SIGCONT, expected_starttimes=starttimes)
+
+        return {"resumed_roots": target_roots}
+
+    def kill_process_set(
+        self,
+        migration_id: str,
+        root_pids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Terminate all root process trees on Source A following destination commit."""
+        migration_id = validate_safe_identifier(migration_id, "migration_id")
+        mig_dir = self._mig_dir(migration_id)
+        source_state_file = mig_dir / "set_source_state.json"
+        starttimes: Optional[Dict[str, int]] = None
+
+        if source_state_file.exists():
+            try:
+                state_data = json.loads(source_state_file.read_text(encoding="utf-8"))
+                if root_pids is None:
+                    root_pids = [int(p) for p in state_data.get("root_pids", [])]
+                starttimes = state_data.get("starttimes")
+            except Exception:
+                pass
+
+        target_roots = [int(r) for r in (root_pids or [])]
+        for r in target_roots:
+            self._signal_process_tree(r, signal.SIGKILL, expected_starttimes=starttimes)
+
+        return {"killed_roots": target_roots}
+
+    def _register_methods(self) -> Set[str]:
+        return {
             "get_capabilities",
             "inspect_process",
             "stat_files",
@@ -1056,7 +1219,15 @@ class AgentService:
             "cleanup_dest",
             "rollback_dest",
             "rollback_source",
+            "inspect_process_set",
+            "freeze_process_set",
+            "resume_process_set",
+            "kill_process_set",
         }
+
+    def dispatch_rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        """Dispatch an incoming JSON-RPC call to the corresponding service method."""
+        allowed_methods = self._register_methods()
         if method not in allowed_methods:
             raise ValueError(f"Unknown RPC method: {method}")
         fn = getattr(self, method)

@@ -205,13 +205,27 @@ class TestLiveMigrationAcceptanceSuite(unittest.TestCase):
         self.assertFalse(res.source_tree_resumed_on_rollback)
         self.assertGreater(res.client_observed_blackout_ms, 0.0)
 
-    def test_13_full_acceptance_matrix_and_report_rendering(self) -> None:
-        """Run full 12-scenario matrix and assert formatted report rendering."""
+    def test_scenario_13_pointed_process_set(self) -> None:
+        """13. Pointed Multi-Process Set Lockstep Cutover (v2.0 --pids)."""
+        res = run_acceptance_scenario(
+            scenario_name="13. Pointed Multi-Process Set Lockstep Cutover (v2.0 --pids)",
+            strategy=MigrationStrategy.PRE_COPY,
+            injected_fault="POINTED_PROCESS_SET",
+        )
+        self._assert_scenario_invariants(res)
+        self.assertTrue(res.source_tree_terminated_on_commit)
+        self.assertFalse(res.source_tree_resumed_on_rollback)
+        self.assertGreater(res.client_observed_blackout_ms, 0.0)
+
+    test_13_pointed_process_set_lockstep_cutover = test_scenario_13_pointed_process_set
+
+    def test_14_full_acceptance_matrix_and_report_rendering(self) -> None:
+        """Run full 13-scenario matrix and assert formatted report rendering."""
         results = run_acceptance_matrix(backend="auto")
-        self.assertEqual(len(results), 12)
+        self.assertEqual(len(results), 13)
         report = render_acceptance_report(results)
         self.assertIn("LKMP STATEFUL MULTI-PROCESS LIVE MIGRATION ACCEPTANCE SUITE REPORT", report)
-        self.assertIn("Total Scenarios: 12 | Passed: 12 | Failed: 0", report)
+        self.assertIn("Total Scenarios: 13 | Passed: 13 | Failed: 0", report)
         self.assertIn("Blackout(ms)", report)
         for res in results:
             self._assert_scenario_invariants(res)
