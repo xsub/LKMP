@@ -77,8 +77,8 @@ jobs:
 
       - name: Run acceptance verification suite
         run: |
-          ./bin/lkmp acceptance
-          ./bin/lkmp acceptance --json
+          sudo ./bin/lkmp acceptance --backend REAL_CRIU
+          sudo ./bin/lkmp acceptance --backend REAL_CRIU --json
 
       - name: Run real Linux CRIU E2E verification
         run: sudo python3 scripts/linux_criu_e2e.py

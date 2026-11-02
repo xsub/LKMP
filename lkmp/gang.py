@@ -206,9 +206,6 @@ class GangMigrationCoordinator:
                         migration_id=orch.migration_id,
                         config_dict=config_to_dict(orch.config),
                     )
-                except Exception:
-                    pass
-                try:
                     orch.complete_switchover_and_verify()
                     res = orch.commit()
                     results.append(res)

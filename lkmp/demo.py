@@ -219,6 +219,21 @@ class _SimulatedCluster:
                                 if raw:
                                     raw[0] ^= 0xFF
                                     corrupted.write_bytes(bytes(raw))
+                elif cmd[0] == "cp" and len(cmd) >= 3:
+                    src_file = Path(cmd[-2])
+                    dst_file = Path(cmd[-1])
+                    if src_file.is_file():
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+                        if (
+                            (self.corrupt_final_image or self.inject_fault == "corrupt-image")
+                            and dst_file.name == "core-1.img"
+                            and dst_file.exists()
+                        ):
+                            raw = bytearray(dst_file.read_bytes())
+                            if raw:
+                                raw[0] ^= 0xFF
+                                dst_file.write_bytes(bytes(raw))
             else:
                 if len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "restore":
                     if self.inject_fault == "restore":

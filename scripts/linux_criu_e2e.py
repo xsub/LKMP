@@ -1126,8 +1126,10 @@ def main() -> int:
     print("\n--- JSON TELEMETRY ---")
     print(json.dumps(results, indent=2))
 
-    # The script should not fail the CI run if an unprivileged runner kernel restricts specific features,
-    # as long as the test harness completed and recorded all logs faithfully.
+    if results["summary"]["failed"] > 0:
+        return 1
+    if runner.is_linux and (not runner.criu_available or results["summary"]["passed"] == 0):
+        return 1
     return 0
 
 

@@ -460,32 +460,6 @@ setattr(lkmp.preflight, "evaluate_portability", evaluate_portability)
 setattr(lkmp.preflight, "assess_portability", assess_portability)
 
 
-# --- Podman-Style Consistent Freeze & Volume Snapshot Wrapping on AgentService ---
-
-_orig_freeze_and_final_dump = AgentService.freeze_and_final_dump
-
-def enhanced_freeze_and_final_dump(
-    self: AgentService,
-    migration_id: str,
-    prev_round_name: Optional[str],
-    dest_host: str,
-    config_dict: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Execute freeze_and_final_dump, followed by volume_snapshot_cmd while still frozen."""
-    res = _orig_freeze_and_final_dump(self, migration_id, prev_round_name, dest_host, config_dict)
-    vol_snap = config_dict.get("volume_snapshot_cmd")
-    if vol_snap:
-        subprocess.run(
-            shlex.split(vol_snap) if isinstance(vol_snap, str) else vol_snap,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    return res
-
-AgentService.freeze_and_final_dump = enhanced_freeze_and_final_dump
-
-
 # --- CLI Portability & Migrate Parser Extensions ---
 
 _orig_build_parser = lkmp.cli.build_parser
@@ -786,9 +760,13 @@ class TestPortabilityAndRecovery(unittest.TestCase):
             (p1000 / "stat").write_text("1000 (app) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 100 0\n", encoding="utf-8")
             (p1000 / "status").write_text("Name:\tapp\nVmRSS:\t16384 kB\n", encoding="utf-8")
 
+            nft_cmds: List[List[str]] = []
+
             def mock_runner(cmd: List[str]) -> subprocess.CompletedProcess:
                 if cmd and cmd[0] == "nft":
-                    execution_order.append("lock_network")
+                    nft_cmds.append(list(cmd))
+                    if not execution_order or execution_order[-1] != "lock_network":
+                        execution_order.append("lock_network")
                 elif cmd and cmd[0] == "criu":
                     execution_order.append("criu dump --leave-stopped")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -850,6 +828,8 @@ class TestPortabilityAndRecovery(unittest.TestCase):
                     "volume_snapshot_cmd",
                 ]
                 self.assertEqual(execution_order, expected_order)
+                self.assertEqual(len(nft_cmds), 6)
+                self.assertEqual(sum(1 for c in nft_cmds if "drop" in c), 2)
 
     def test_05_same_host_cow_fast_path(self) -> None:
         """

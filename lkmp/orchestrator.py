@@ -13,6 +13,7 @@ from lkmp.agent import AgentClient, config_from_dict, config_to_dict
 from lkmp.attestation import generate_ephemeral_key_hex
 from lkmp.config import FilesystemMode, IpMobilityMode, MigrationConfig, MigrationStrategy
 from lkmp.convergence import PreCopyConvergenceTracker
+from lkmp.fs_sync import is_same_host_or_shared_storage
 from lkmp.journal import MigrationJournal, validate_safe_identifier
 from lkmp.models import (
     FileArtifact,
@@ -386,7 +387,13 @@ class MigrationOrchestrator:
             # Phase 2: Prepare
             self._transition(MigrationState.PREPARE, commit_decision="PREPARING")
             self.source.call("prepare_migration", migration_id=self.migration_id)
-            self.dest.call("prepare_migration", migration_id=self.migration_id)
+            dst_prep = self.dest.call("prepare_migration", migration_id=self.migration_id)
+            dest_images_dir = (
+                dst_prep.get("images_dir")
+                if isinstance(dst_prep, dict)
+                and is_same_host_or_shared_storage(self.config.source_addr, self.dest.host)
+                else None
+            )
 
             if self.config.fs_mode == FilesystemMode.RSYNC:
                 self.source.call(
@@ -490,13 +497,15 @@ class MigrationOrchestrator:
 
             # Phase 5: Transfer metadata, manifest.sig.json & final filesystem delta
             self._transition(MigrationState.TRANSFER, commit_decision="PREPARING")
-            self.source.call(
-                "transfer_final_state",
-                migration_id=self.migration_id,
-                dest_host=self.dest.host,
-                config_dict=cfg_dict,
-                dest_pages_merkle_root=dest_pages_merkle_root,
-            )
+            transfer_kwargs: Dict[str, object] = {
+                "migration_id": self.migration_id,
+                "dest_host": self.dest.host,
+                "config_dict": cfg_dict,
+                "dest_pages_merkle_root": dest_pages_merkle_root,
+            }
+            if dest_images_dir:
+                transfer_kwargs["dest_images_dir"] = dest_images_dir
+            self.source.call("transfer_final_state", **transfer_kwargs)
 
             # Phase 6: Release IP on Source A (while locked) & Restore on Destination B
             # Note: `restore_process` assigns the IP on B BEFORE running `criu restore --tcp-established`
@@ -677,16 +686,21 @@ class MigrationOrchestrator:
         except Exception as dest_exc:
             rb_errors.append(f"rollback_dest error: {dest_exc}")
 
-        try:
-            src_res = self.source.call(
-                "rollback_source",
-                migration_id=self.migration_id,
-                source_host=self.source.host,
-                config_dict=cfg_dict,
+        if dest_ok:
+            try:
+                src_res = self.source.call(
+                    "rollback_source",
+                    migration_id=self.migration_id,
+                    source_host=self.source.host,
+                    config_dict=cfg_dict,
+                )
+                src_ok = bool(src_res.get("rolled_back_source", False))
+            except Exception as src_exc:
+                rb_errors.append(f"rollback_source error: {src_exc}")
+        else:
+            rb_errors.append(
+                "Skipping rollback_source because rollback_dest failed; keeping source fenced to prevent dual execution"
             )
-            src_ok = bool(src_res.get("rolled_back_source", False))
-        except Exception as src_exc:
-            rb_errors.append(f"rollback_source error: {src_exc}")
 
         rolled_back = dest_ok and src_ok
         if self.journal is not None and rolled_back:

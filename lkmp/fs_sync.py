@@ -101,6 +101,13 @@ class FilesystemSyncManager:
             return cloned
 
         for item in sorted(src.iterdir()):
+            if item.is_symlink():
+                dst_link = dst / item.name
+                if dst_link.exists() or dst_link.is_symlink():
+                    dst_link.unlink()
+                os.symlink(os.readlink(item), dst_link)
+                cloned.append(str(dst_link))
+                continue
             if not item.is_file():
                 continue
             if not include_pages and item.name.startswith("pages-") and item.name.endswith(".img"):
@@ -120,6 +127,16 @@ class FilesystemSyncManager:
         return cloned
 
     cow_clone_directory = _CowCloneDescriptor(_cow_clone_impl)
+
+    @staticmethod
+    def resolve_snapshot_path(snapshot_dir: str | Path, writable_path: str) -> Path:
+        """Resolve the point-in-time frozen snapshot path inside `snapshot_dir` for `writable_path`."""
+        snap_p = Path(snapshot_dir)
+        wp_path = Path(writable_path)
+        rel_candidate = snap_p / writable_path.lstrip("/")
+        if rel_candidate.exists():
+            return rel_candidate
+        return snap_p / wp_path.name
 
     def snapshot_writable_paths_while_frozen(
         self,
@@ -146,7 +163,8 @@ class FilesystemSyncManager:
                 wp_path = Path(wp)
                 if not wp_path.exists():
                     continue
-                target = snap_p / wp_path.name
+                target = snap_p / wp.lstrip("/") if wp.startswith("/") else snap_p / wp_path.name
+                target.parent.mkdir(parents=True, exist_ok=True)
                 if wp_path.is_dir():
                     if sys.platform == "darwin":
                         cmd = ["cp", "-cR", str(wp_path), str(target)]
@@ -176,8 +194,13 @@ class FilesystemSyncManager:
 
     def build_rsync_cmd(self, local_path: str, dest_host: str, dest_path: str) -> List[str]:
         """Build an archive-mode rsync command preserving permissions, xattrs, and hardlinks."""
-        src = local_path.rstrip("/") + "/"
-        dst = f"{dest_host}:{dest_path.rstrip('/')}/"
+        local_p = Path(local_path)
+        if local_p.exists() and local_p.is_file():
+            src = local_path
+            dst = f"{dest_host}:{dest_path}"
+        else:
+            src = local_path.rstrip("/") + "/"
+            dst = f"{dest_host}:{dest_path.rstrip('/')}/"
         return [
             "rsync",
             "-aHAX",
@@ -199,13 +222,27 @@ class FilesystemSyncManager:
             cmds.append(cmd)
         return cmds
 
-    def final_delta_sync(self, config: MigrationConfig, dest_host: str) -> List[List[str]]:
-        """Run final rsync delta pass while the source process tree is frozen."""
+    def final_delta_sync(
+        self,
+        config: MigrationConfig,
+        dest_host: str,
+        snapshot_dir: Optional[str | Path] = None,
+    ) -> List[List[str]]:
+        """
+        Run final rsync delta pass while the source process tree is frozen.
+        When `snapshot_dir` is provided and contains a frozen snapshot of a writable path,
+        reads from the frozen snapshot so destination disk state matches the memory checkpoint.
+        """
         if config.fs_mode != FilesystemMode.RSYNC:
             return []
         cmds: List[List[str]] = []
         for path in config.writable_paths:
-            cmd = self.build_rsync_cmd(path, dest_host, path)
+            src_path = path
+            if snapshot_dir is not None:
+                snap_candidate = self.resolve_snapshot_path(snapshot_dir, path)
+                if snap_candidate.exists():
+                    src_path = str(snap_candidate)
+            cmd = self.build_rsync_cmd(src_path, dest_host, path)
             self.runner(cmd)
             cmds.append(cmd)
         return cmds
@@ -215,13 +252,36 @@ class FilesystemSyncManager:
         images_dir: str,
         dest_host: str,
         include_pages: bool = False,
+        source_host: Optional[str] = None,
+        dest_images_dir: Optional[str] = None,
     ) -> List[str]:
         """
         Sync checkpoint `.img` and `manifest.sig.json` files from Source A to Destination B.
+        - When `source_host` and `dest_host` are on the same host (or `dest_images_dir` is provided),
+          uses the CoW reflink fast path (`cow_clone_directory`) instead of `rsync`.
         - For COLD migration (`include_pages=True`), transfers all files including `pages-*.img`.
         - For PRE_COPY / LAZY / HYBRID (`include_pages=False`), `pages-*.img` are streamed via
           CRIU page-server / lazy-pages, so only metadata `.img` and `manifest.sig.json` are synced.
         """
+        use_cow = bool(
+            dest_images_dir is not None
+            or (source_host is not None and self.is_same_host_or_shared_storage(source_host, dest_host))
+        )
+        if use_cow:
+            target_dir = dest_images_dir or images_dir
+            if Path(target_dir).resolve() != Path(images_dir).resolve():
+                return self.cow_clone_directory(
+                    images_dir,
+                    target_dir,
+                    include_pages=include_pages,
+                )
+            return [
+                str(p)
+                for p in sorted(Path(images_dir).iterdir())
+                if p.is_file()
+                and (include_pages or not (p.name.startswith("pages-") and p.name.endswith(".img")))
+            ]
+
         src = images_dir.rstrip("/") + "/"
         dst = f"{dest_host}:{images_dir.rstrip('/')}/"
         cmd = [

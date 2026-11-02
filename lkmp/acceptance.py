@@ -35,7 +35,11 @@ from lkmp.config import (
 )
 from lkmp.criu_driver import CriuDriver
 from lkmp.envelope import EnvelopeManager
-from lkmp.fs_sync import FilesystemSyncManager
+from lkmp.fs_sync import (
+    FilesystemSyncManager,
+    cow_clone_directory,
+    is_same_host_or_shared_storage,
+)
 from lkmp.gang import GangMigrationCoordinator
 from lkmp.journal import MigrationJournal
 from lkmp.models import MigrationResult, MigrationState
@@ -145,18 +149,23 @@ class DeterministicWorkloadService:
         initial_prng_state: int = DEFAULT_PRNG_SEED,
         initial_offset: int = 0,
         start_stopped: bool = False,
+        use_real_criu: bool = False,
     ) -> None:
         self.workload_id = workload_id
         self.state_log_path = Path(state_log_path).resolve()
+        self.eff_pid_path = self.state_log_path.parent / f".eff_pid.{self.workload_id}"
         self.stream_sock = stream_sock
         self.num_children = max(1, num_children)
         self.counter = initial_counter
         self.prng_state = initial_prng_state
         self.initial_offset = initial_offset
         self.start_stopped = start_stopped
+        self.use_real_criu = use_real_criu
 
         self.root_pid: Optional[int] = None
         self.children_pids: List[int] = []
+        self._unshare_proc: Optional[subprocess.Popen] = None
+        self._unshare_init_pid: Optional[int] = None
 
         # Internal control pipes (Harness -> Root and Root -> Harness)
         self._ctrl_p2c_r: Optional[int] = None
@@ -169,16 +178,21 @@ class DeterministicWorkloadService:
         if self.stream_sock is None:
             raise ValueError("DeterministicWorkloadService requires an active stream_sock before start()")
 
-        self._ctrl_p2c_r, self._ctrl_p2c_w = os.pipe()
-        self._ctrl_c2p_r, self._ctrl_c2p_w = os.pipe()
+        if not self.use_real_criu:
+            self._ctrl_p2c_r, self._ctrl_p2c_w = os.pipe()
+            self._ctrl_c2p_r, self._ctrl_c2p_w = os.pipe()
 
         ready_r, ready_w = os.pipe()
+        self.state_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.eff_pid_path.write_text("0\n", encoding="utf-8")
 
         root_pid = os.fork()
         if root_pid == 0:
             # Inside child (Root Process of the service tree)
-            os.close(self._ctrl_p2c_w)
-            os.close(self._ctrl_c2p_r)
+            if self._ctrl_p2c_w is not None:
+                os.close(self._ctrl_p2c_w)
+            if self._ctrl_c2p_r is not None:
+                os.close(self._ctrl_c2p_r)
             os.close(ready_r)
 
             self._run_root_process(
@@ -190,8 +204,11 @@ class DeterministicWorkloadService:
 
         # In Harness (Parent Process)
         self.root_pid = root_pid
-        os.close(self._ctrl_p2c_r)
-        os.close(self._ctrl_c2p_w)
+        self.eff_pid_path.write_text(f"{root_pid}\n", encoding="utf-8")
+        if self._ctrl_p2c_r is not None:
+            os.close(self._ctrl_p2c_r)
+        if self._ctrl_c2p_w is not None:
+            os.close(self._ctrl_c2p_w)
         os.close(ready_w)
 
         # Wait for root process and children to signal readiness
@@ -212,8 +229,38 @@ class DeterministicWorkloadService:
 
         return self.root_pid
 
-    def _run_root_process(self, ctrl_r: int, ctrl_w: int, ready_w: int) -> None:
+    def _run_root_process(self, ctrl_r: Optional[int], ctrl_w: Optional[int], ready_w: int) -> None:
         """Body of the root service process running in its own OS process."""
+        if self.use_real_criu:
+            try:
+                os.setsid()
+            except OSError:
+                pass
+            devnull_fd = os.open(os.devnull, os.O_RDWR)
+            for std_fd in (0, 1, 2):
+                if devnull_fd != std_fd:
+                    os.dup2(devnull_fd, std_fd)
+            if devnull_fd > 2:
+                os.close(devnull_fd)
+            keep_fds = {0, 1, 2, ready_w}
+            if self.stream_sock is not None:
+                keep_fds.add(self.stream_sock.fileno())
+            if ctrl_r is not None:
+                keep_fds.add(ctrl_r)
+            if ctrl_w is not None:
+                keep_fds.add(ctrl_w)
+            try:
+                for fd_entry in os.listdir("/proc/self/fd"):
+                    if fd_entry.isdigit():
+                        fd_num = int(fd_entry)
+                        if fd_num not in keep_fds:
+                            try:
+                                os.close(fd_num)
+                            except OSError:
+                                pass
+            except OSError:
+                pass
+
         self.state_log_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.state_log_path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
         if self.initial_offset > 0:
@@ -232,8 +279,10 @@ class DeterministicWorkloadService:
                 # Inside worker child process
                 os.close(p2c_w)
                 os.close(c2p_r)
-                os.close(ctrl_r)
-                os.close(ctrl_w)
+                if ctrl_r is not None:
+                    os.close(ctrl_r)
+                if ctrl_w is not None:
+                    os.close(ctrl_w)
                 os.close(ready_w)
                 os.close(fd)
                 if self.stream_sock:
@@ -278,22 +327,24 @@ class DeterministicWorkloadService:
                 except OSError:
                     pass
             while not resumed_after_stopped:
-                # Check for control RESUME as well
-                r_ctrl, _, _ = select.select([ctrl_r], [], [], 0.05)
-                if r_ctrl:
-                    cmd_line = self._read_fd_line(ctrl_r)
-                    if cmd_line.strip() == "RESUME":
-                        resumed_after_stopped = True
-                        for cp in child_pids:
-                            try:
-                                os.kill(cp, signal.SIGCONT)
-                            except OSError:
-                                pass
-                        os.write(ctrl_w, b"RESUMED\n")
-                        break
-                    elif cmd_line.strip() == "STOP":
-                        self._cleanup_children(child_pids, child_pipes, fd)
-                        os._exit(0)
+                if ctrl_r is not None and ctrl_w is not None:
+                    r_ctrl, _, _ = select.select([ctrl_r], [], [], 0.05)
+                    if r_ctrl:
+                        cmd_line = self._read_fd_line(ctrl_r)
+                        if cmd_line.strip() == "RESUME":
+                            resumed_after_stopped = True
+                            for cp in child_pids:
+                                try:
+                                    os.kill(cp, signal.SIGCONT)
+                                except OSError:
+                                    pass
+                            os.write(ctrl_w, b"RESUMED\n")
+                            break
+                        elif cmd_line.strip() == "STOP":
+                            self._cleanup_children(child_pids, child_pipes, fd)
+                            os._exit(0)
+                else:
+                    time.sleep(0.02)
 
         counter = self.counter
         prng_state = self.prng_state
@@ -301,12 +352,14 @@ class DeterministicWorkloadService:
 
         try:
             while True:
-                fds_to_watch = [ctrl_r]
+                fds_to_watch: List[int] = []
+                if ctrl_r is not None:
+                    fds_to_watch.append(ctrl_r)
                 if self.stream_sock is not None and not quiesced:
                     fds_to_watch.append(self.stream_sock.fileno())
 
                 rlist, _, _ = select.select(fds_to_watch, [], [], 0.05)
-                if ctrl_r in rlist:
+                if ctrl_r is not None and ctrl_w is not None and ctrl_r in rlist:
                     cmd_line = self._read_fd_line(ctrl_r).strip()
                     if cmd_line == "QUIESCE":
                         os.fsync(fd)
@@ -366,8 +419,17 @@ class DeterministicWorkloadService:
                     os.write(fd, log_entry.encode("utf-8"))
                     os.fsync(fd)
 
+                    eff_pid = os.getpid()
+                    if self.use_real_criu and self.eff_pid_path.exists():
+                        try:
+                            val = int(self.eff_pid_path.read_text(encoding="utf-8").strip())
+                            if val > 0:
+                                eff_pid = val
+                        except Exception:
+                            pass
+
                     # Send ACK
-                    ack_line = f"ACK {seq} {counter} {prng_state:016x} {os.getpid()} {len(child_pids)}\n"
+                    ack_line = f"ACK {seq} {counter} {prng_state:016x} {eff_pid} {len(child_pids)}\n"
                     self.stream_sock.sendall(ack_line.encode("utf-8"))
 
         finally:
@@ -560,6 +622,17 @@ class DeterministicWorkloadService:
                 os.waitpid(cp, 0)
             except OSError:
                 pass
+        if self._unshare_init_pid is not None:
+            try:
+                os.kill(self._unshare_init_pid, signal.SIGKILL)
+            except OSError:
+                pass
+        if self._unshare_proc is not None:
+            try:
+                self._unshare_proc.kill()
+                self._unshare_proc.wait(timeout=1.0)
+            except Exception:
+                pass
         for fd in (self._ctrl_p2c_r, self._ctrl_p2c_w, self._ctrl_c2p_r, self._ctrl_c2p_w):
             if fd is not None:
                 try:
@@ -645,67 +718,14 @@ class AcceptanceAgentService(AgentService):
         return super().rollback_dest(migration_id, restored_pid, config_dict)
 
 
-def is_same_host_or_shared_storage(source_addr: str, dest_addr: str) -> bool:
-    """Detect whether source and destination are on the same host or share underlying storage."""
-    src_host = source_addr.split(":")[0].strip()
-    dst_host = dest_addr.split(":")[0].strip()
-    loopbacks = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
-    if src_host in loopbacks and dst_host in loopbacks:
-        return True
-    if src_host == dst_host:
-        return True
-    return False
-
-
-def cow_clone_directory(
-    src_dir: str | Path,
-    dst_dir: str | Path,
-    include_pages: bool = True,
-    runner: Optional[Callable[[List[str]], subprocess.CompletedProcess]] = None,
-) -> List[str]:
-    """
-    Perform a fast CoW (Copy-on-Write) reflink clone of checkpoint images between directories
-    on the same host or shared filesystem. Respects `include_pages`.
-    """
-    src_path = Path(src_dir).resolve()
-    dst_path = Path(dst_dir).resolve()
-    dst_path.mkdir(parents=True, exist_ok=True)
-
-    cloned: List[str] = []
-    if not src_path.exists():
-        return cloned
-
-    for item in src_path.iterdir():
-        if not item.is_file():
-            continue
-        if not include_pages and item.name.startswith("pages-"):
-            continue
-        target = dst_path / item.name
-        if runner is not None:
-            runner(["cp", "--reflink=auto", str(item), str(target)])
-        else:
-            try:
-                shutil.copy2(item, target)
-            except Exception:
-                target.write_bytes(item.read_bytes())
-        cloned.append(str(target))
-
-    return cloned
-
-
-# Register CoW fast path on FilesystemSyncManager and module
-FilesystemSyncManager.cow_clone_directory = staticmethod(cow_clone_directory)
-FilesystemSyncManager.is_same_host_or_shared_storage = staticmethod(is_same_host_or_shared_storage)
-
-import lkmp.fs_sync
-if not hasattr(lkmp.fs_sync.FilesystemSyncManager, "cow_clone_directory"):
-    setattr(lkmp.fs_sync.FilesystemSyncManager, "cow_clone_directory", staticmethod(cow_clone_directory))
-if not hasattr(lkmp.fs_sync.FilesystemSyncManager, "is_same_host_or_shared_storage"):
-    setattr(lkmp.fs_sync.FilesystemSyncManager, "is_same_host_or_shared_storage", staticmethod(is_same_host_or_shared_storage))
-if not hasattr(lkmp.fs_sync, "is_same_host_or_shared_storage"):
-    setattr(lkmp.fs_sync, "is_same_host_or_shared_storage", is_same_host_or_shared_storage)
-if not hasattr(lkmp.fs_sync, "cow_clone_directory"):
-    setattr(lkmp.fs_sync, "cow_clone_directory", cow_clone_directory)
+def _can_run_real_criu() -> bool:
+    """Return True iff the current host is Linux with root privileges and has the criu binary."""
+    return bool(
+        os.name == "posix"
+        and sys.platform.startswith("linux")
+        and os.geteuid() == 0
+        and shutil.which("criu") is not None
+    )
 
 
 @dataclass
@@ -766,6 +786,9 @@ class AcceptanceClusterHarness:
         self.dest_workloads: Dict[str, DeterministicWorkloadService] = {}
         self.stream_server_sock: Optional[socket.socket] = None
         self.stream_server_socks: Dict[str, socket.socket] = {}
+        self.stream_client_sock: Optional[socket.socket] = None
+        self.stream_client_socks: Dict[str, socket.socket] = {}
+        self._unshare_by_restored_pid: Dict[int, Tuple[Optional[int], Optional[subprocess.Popen]]] = {}
 
         self._setup_synthetic_proc()
 
@@ -799,13 +822,22 @@ class AcceptanceClusterHarness:
             p.mkdir(parents=True, exist_ok=True)
             (p / "cpuinfo").write_text("vendor_id : GenuineIntel\nflags : sse4_2 avx avx2\n", encoding="utf-8")
 
-    def register_workload(self, srv: DeterministicWorkloadService, server_sock: socket.socket) -> None:
+    def register_workload(
+        self,
+        srv: DeterministicWorkloadService,
+        server_sock: socket.socket,
+        client_sock: Optional[socket.socket] = None,
+    ) -> None:
         if self.source_workload is None:
             self.source_workload = srv
         self.source_workloads[srv.workload_id] = srv
         if self.stream_server_sock is None:
             self.stream_server_sock = server_sock
         self.stream_server_socks[srv.workload_id] = server_sock
+        if client_sock is not None:
+            if self.stream_client_sock is None:
+                self.stream_client_sock = client_sock
+            self.stream_client_socks[srv.workload_id] = client_sock
         pid = srv.root_pid
         if pid:
             pid_dir = self.proc_a / str(pid)
@@ -814,6 +846,19 @@ class AcceptanceClusterHarness:
             (pid_dir / "status").write_text(f"Name:\tstateful-srv\nVmRSS:\t32768 kB\nNSpid:\t{pid}\t1\n", encoding="utf-8")
             (pid_dir / "cgroup").write_text("0::/lkmp/srv-1\n", encoding="utf-8")
             (pid_dir / "maps").write_text("", encoding="utf-8")
+            task_dir = pid_dir / "task" / str(pid)
+            task_dir.mkdir(parents=True, exist_ok=True)
+            (task_dir / "children").write_text(
+                " ".join(str(cp) for cp in srv.children_pids),
+                encoding="utf-8",
+            )
+            for cp in srv.children_pids:
+                cp_dir = self.proc_a / str(cp)
+                cp_dir.mkdir(parents=True, exist_ok=True)
+                (cp_dir / "fd").mkdir(parents=True, exist_ok=True)
+                (cp_dir / "status").write_text(f"Name:\tstateful-worker\nVmRSS:\t4096 kB\nNSpid:\t{cp}\t2\n", encoding="utf-8")
+                (cp_dir / "cgroup").write_text("0::/lkmp/srv-1\n", encoding="utf-8")
+                (cp_dir / "maps").write_text("", encoding="utf-8")
 
     def _signal_sender_a(self, pid: int, sig: int) -> None:
         self.commands_executed.append(f"kill -{sig} {pid} (Host A)")
@@ -822,6 +867,12 @@ class AcceptanceClusterHarness:
         except OSError as exc:
             if exc.errno != errno.ESRCH:
                 raise
+        if sig == signal.SIGKILL:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                pass
+            shutil.rmtree(self.proc_a / str(pid), ignore_errors=True)
 
     def _signal_sender_b(self, pid: int, sig: int) -> None:
         self.commands_executed.append(f"kill -{sig} {pid} (Host B)")
@@ -830,8 +881,34 @@ class AcceptanceClusterHarness:
         except OSError as exc:
             if exc.errno != errno.ESRCH:
                 raise
+        if sig == signal.SIGKILL:
+            unshare_info = self._unshare_by_restored_pid.pop(pid, None)
+            if unshare_info is not None:
+                init_pid, unshare_proc = unshare_info
+                if init_pid is not None:
+                    try:
+                        os.kill(init_pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                if unshare_proc is not None:
+                    try:
+                        unshare_proc.kill()
+                        unshare_proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                pass
+            shutil.rmtree(self.proc_b / str(pid), ignore_errors=True)
 
     def _check_pid_alive_a(self, pid: int) -> bool:
+        try:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                return False
+        except OSError:
+            pass
         try:
             os.kill(pid, 0)
             return True
@@ -841,6 +918,12 @@ class AcceptanceClusterHarness:
     def _check_pid_alive_b(self, pid: int) -> bool:
         if self.injected_fault in ("VERIFY", "verify"):
             return False
+        try:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                return False
+        except OSError:
+            pass
         try:
             os.kill(pid, 0)
             return True
@@ -868,29 +951,94 @@ class AcceptanceClusterHarness:
                         img_dir = Path(cmd[idx + 1])
                         img_dir.mkdir(parents=True, exist_ok=True)
 
-                        if action == "dump":
-                            dump_pid = None
-                            if "--pid" in cmd:
-                                dump_pid = int(cmd[cmd.index("--pid") + 1])
-                            elif "-t" in cmd:
-                                dump_pid = int(cmd[cmd.index("-t") + 1])
+                        dump_pid = None
+                        if "--pid" in cmd:
+                            dump_pid = int(cmd[cmd.index("--pid") + 1])
+                        elif "--tree" in cmd:
+                            dump_pid = int(cmd[cmd.index("--tree") + 1])
+                        elif "-t" in cmd:
+                            dump_pid = int(cmd[cmd.index("-t") + 1])
 
-                            target_srv = self.source_workload
-                            if dump_pid is not None:
-                                for srv in self.source_workloads.values():
-                                    if srv.root_pid == dump_pid:
-                                        target_srv = srv
-                                        break
+                        target_srv = self.source_workload
+                        if dump_pid is not None:
+                            for srv in self.source_workloads.values():
+                                if srv.root_pid == dump_pid:
+                                    target_srv = srv
+                                    break
 
-                            if target_srv:
+                        if self.backend == "REAL_CRIU":
+                            if not _can_run_real_criu():
+                                err_msg = (
+                                    "REAL_CRIU backend requires Linux with root privileges "
+                                    "(CAP_SYS_ADMIN) and installed 'criu' binary"
+                                )
+                                self.error_logs.append(err_msg)
+                                raise RuntimeError(err_msg)
+
+                            if action == "dump" and target_srv is not None:
                                 target_srv.quiesce()
-                                target_srv.checkpoint(img_dir)
-                        elif action == "pre-dump":
-                            # Pre-dump: create synthetic incremental page image and core image
-                            core_file = img_dir / "core-1.img"
-                            core_file.write_bytes(b"PRE_DUMP_REGISTERS\n")
-                            pages_file = img_dir / "pages-1.img"
-                            pages_file.write_bytes(b"\x00" * (1024 * 1024))
+
+                            wl_id = target_srv.workload_id if target_srv else "acc-workload"
+                            s_sock = self.stream_server_socks.get(wl_id, self.stream_server_sock)
+                            c_sock = self.stream_client_socks.get(wl_id, self.stream_client_sock)
+
+                            real_cmd = [
+                                "criu",
+                                action,
+                                "-t",
+                                str(dump_pid),
+                                "--images-dir",
+                                str(img_dir),
+                                "--shell-job",
+                            ]
+                            if "--prev-images-dir" in cmd:
+                                p_idx = cmd.index("--prev-images-dir")
+                                real_cmd.extend(["--prev-images-dir", cmd[p_idx + 1]])
+                            if action == "pre-dump" or "--track-mem" in cmd:
+                                real_cmd.append("--track-mem")
+                            if action == "dump":
+                                real_cmd.append("--leave-stopped")
+                            if s_sock is not None and c_sock is not None:
+                                s_ino = os.fstat(s_sock.fileno()).st_ino
+                                c_ino = os.fstat(c_sock.fileno()).st_ino
+                                real_cmd.append(f"--ext-unix-sk={s_ino},{c_ino}")
+                            else:
+                                real_cmd.append("--ext-unix-sk")
+                            log_file = img_dir / f"criu_{action}.log"
+                            real_cmd.extend(["-v4", "-o", str(log_file)])
+
+                            self.commands_executed.append(" ".join(real_cmd))
+                            res = subprocess.run(real_cmd, capture_output=True, text=True, check=False)
+                            if res.returncode != 0:
+                                log_txt = (
+                                    log_file.read_text(encoding="utf-8", errors="ignore")[-400:]
+                                    if log_file.exists()
+                                    else res.stderr
+                                )
+                                err_msg = f"Real CRIU {action} failed (rc={res.returncode}): {log_txt.strip()}"
+                                self.error_logs.append(err_msg)
+                                raise RuntimeError(err_msg)
+
+                            cp_meta = {
+                                "workload_id": wl_id,
+                                "root_pid": dump_pid,
+                                "children_pids": target_srv.children_pids if target_srv else [],
+                            }
+                            (img_dir / "checkpoint.json").write_text(
+                                json.dumps(cp_meta, indent=2),
+                                encoding="utf-8",
+                            )
+                        else:
+                            if action == "dump":
+                                if target_srv:
+                                    target_srv.quiesce()
+                                    target_srv.checkpoint(img_dir)
+                            elif action == "pre-dump":
+                                # Pre-dump: create synthetic incremental page image and core image
+                                core_file = img_dir / "core-1.img"
+                                core_file.write_bytes(b"PRE_DUMP_REGISTERS\n")
+                                pages_file = img_dir / "pages-1.img"
+                                pages_file.write_bytes(b"\x00" * (1024 * 1024))
 
                         # If page-server or lazy-pages is used, mirror pages-*.img directly to Destination B
                         if "--page-server" in cmd or "--lazy-pages" in cmd:
@@ -900,10 +1048,18 @@ class AcceptanceClusterHarness:
                                 rel = Path(*img_dir.parts[-2:])
                             dst_dir = self.work_b / rel
                             dst_dir.mkdir(parents=True, exist_ok=True)
-                            for p_file in img_dir.glob("pages-*.img"):
-                                shutil.copy2(p_file, dst_dir / p_file.name)
-                            if (img_dir / "checkpoint.json").exists():
-                                shutil.copy2(img_dir / "checkpoint.json", dst_dir / "checkpoint.json")
+                            for item in img_dir.iterdir():
+                                if item.is_symlink():
+                                    dst_link = dst_dir / item.name
+                                    if dst_link.exists() or dst_link.is_symlink():
+                                        dst_link.unlink()
+                                    os.symlink(os.readlink(item), dst_link)
+                                elif item.is_file() and (
+                                    item.name.startswith("pages-")
+                                    or item.name.startswith("pagemap-")
+                                    or item.name in ("checkpoint.json", "stats-dump")
+                                ):
+                                    shutil.copy2(item, dst_dir / item.name)
 
                 elif cmd[0] == "rsync":
                     # Copy checkpoint images and metadata from A to B
@@ -917,18 +1073,33 @@ class AcceptanceClusterHarness:
                         dst_path = self.work_b / rel
                         dst_path.mkdir(parents=True, exist_ok=True)
                         for item in src_path.iterdir():
-                            if item.is_file():
+                            if item.is_symlink():
+                                dst_link = dst_path / item.name
+                                if dst_link.exists() or dst_link.is_symlink():
+                                    dst_link.unlink()
+                                os.symlink(os.readlink(item), dst_link)
+                            elif item.is_file():
                                 shutil.copy2(item, dst_path / item.name)
 
-                        # Fault injection at TRANSFER: corrupt core-1.img on Host B
+                        # Fault injection at TRANSFER: corrupt core-*.img on Host B
                         if self.injected_fault in ("TRANSFER", "transfer", "corrupt-image"):
-                            corrupted = dst_path / "core-1.img"
-                            if corrupted.exists():
+                            core_files = sorted(dst_path.glob("core-*.img"))
+                            if core_files:
+                                corrupted = core_files[0]
                                 raw = bytearray(corrupted.read_bytes())
                                 if raw:
                                     raw[0] ^= 0xFF
                                     corrupted.write_bytes(bytes(raw))
-                                    self.error_logs.append("Injected fault: flipped byte in Destination B core-1.img")
+                                    self.error_logs.append(
+                                        f"Injected fault: flipped byte in Destination B {corrupted.name}"
+                                    )
+
+                elif cmd[0] == "cp" and len(cmd) >= 3:
+                    src_file = Path(cmd[-2])
+                    dst_file = Path(cmd[-1])
+                    if src_file.is_file():
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
 
             else:
                 # Destination Host B
@@ -953,7 +1124,156 @@ class AcceptanceClusterHarness:
                                 pass
 
                         sock_for_restore = self.stream_server_socks.get(wl_id, self.stream_server_sock)
-                        if sock_for_restore is not None:
+                        if self.backend == "REAL_CRIU":
+                            if not _can_run_real_criu():
+                                err_msg = (
+                                    "REAL_CRIU backend requires Linux with root privileges "
+                                    "(CAP_SYS_ADMIN) and installed 'criu' binary"
+                                )
+                                self.error_logs.append(err_msg)
+                                raise RuntimeError(err_msg)
+                            if sock_for_restore is None:
+                                raise RuntimeError(f"No stream socket registered for workload {wl_id}")
+
+                            target_srv = self.source_workloads.get(wl_id, self.source_workload)
+                            if target_srv is None:
+                                raise RuntimeError(f"No source workload registered for {wl_id}")
+
+                            dst_eff_pid_file = self.work_b / f".eff_pid.{wl_id}"
+                            dst_eff_pid_file.parent.mkdir(parents=True, exist_ok=True)
+                            dst_eff_pid_file.write_text("0\n", encoding="utf-8")
+
+                            s_fd = sock_for_restore.fileno()
+                            s_ino = os.fstat(s_fd).st_ino
+                            ns_pid_file = img_dir / "ns_restored.pid"
+                            restore_log = img_dir / "criu_restore.log"
+
+                            restore_script = (
+                                f"mount --make-rprivate / && "
+                                f"mount -t proc proc /proc && "
+                                f"mount --bind {dst_eff_pid_file} {target_srv.eff_pid_path} && "
+                                f"criu restore -D {img_dir} --restore-detached --leave-stopped --shell-job "
+                                f"--ext-unix-sk --inherit-fd fd[{s_fd}]:socket:[{s_ino}] "
+                                f"--pidfile {ns_pid_file} -v4 -o {restore_log} && "
+                                f"exec sleep 300"
+                            )
+                            unshare_cmd = [
+                                "unshare",
+                                "--pid",
+                                "--mount",
+                                "--fork",
+                                "sh",
+                                "-c",
+                                restore_script,
+                            ]
+                            self.commands_executed.append(" ".join(unshare_cmd))
+                            unshare_proc = subprocess.Popen(
+                                unshare_cmd,
+                                pass_fds=(s_fd,),
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True,
+                            )
+                            for _ in range(100):
+                                if ns_pid_file.exists() and ns_pid_file.stat().st_size > 0:
+                                    break
+                                if unshare_proc.poll() is not None:
+                                    break
+                                time.sleep(0.02)
+
+                            if not ns_pid_file.exists() or ns_pid_file.stat().st_size == 0:
+                                log_txt = (
+                                    restore_log.read_text(encoding="utf-8", errors="ignore")[-400:]
+                                    if restore_log.exists()
+                                    else "missing ns_restored.pid"
+                                )
+                                unshare_proc.kill()
+                                err_msg = f"Real CRIU restore failed: {log_txt.strip()}"
+                                self.error_logs.append(err_msg)
+                                raise RuntimeError(err_msg)
+
+                            ns_root_pid = int(ns_pid_file.read_text(encoding="utf-8").strip())
+                            init_children = (
+                                Path(f"/proc/{unshare_proc.pid}/task/{unshare_proc.pid}/children")
+                                .read_text(encoding="utf-8")
+                                .split()
+                            )
+                            init_host_pid = int(init_children[0])
+                            cand_pids = [
+                                int(x)
+                                for x in Path(f"/proc/{init_host_pid}/task/{init_host_pid}/children")
+                                .read_text(encoding="utf-8")
+                                .split()
+                            ]
+                            restored_host_pid: Optional[int] = None
+                            for cand in cand_pids:
+                                try:
+                                    status_txt = Path(f"/proc/{cand}/status").read_text(encoding="utf-8")
+                                    for line in status_txt.splitlines():
+                                        if line.startswith("NSpid:") and line.split()[-1] == str(ns_root_pid):
+                                            restored_host_pid = cand
+                                            break
+                                except OSError:
+                                    pass
+                                if restored_host_pid is not None:
+                                    break
+                            if restored_host_pid is None:
+                                restored_host_pid = cand_pids[0]
+
+                            restored_children_host_pids = [
+                                int(x)
+                                for x in Path(
+                                    f"/proc/{restored_host_pid}/task/{restored_host_pid}/children"
+                                )
+                                .read_text(encoding="utf-8")
+                                .split()
+                            ]
+                            dst_eff_pid_file.write_text(f"{restored_host_pid}\n", encoding="utf-8")
+
+                            if "--pidfile" in cmd:
+                                pidfile_path = Path(cmd[cmd.index("--pidfile") + 1])
+                            else:
+                                pidfile_path = img_dir / "restored.pid"
+                            pidfile_path.write_text(f"{restored_host_pid}\n", encoding="utf-8")
+
+                            dw = DeterministicWorkloadService(
+                                workload_id=wl_id,
+                                state_log_path=target_srv.state_log_path,
+                                stream_sock=sock_for_restore,
+                                num_children=len(restored_children_host_pids),
+                                use_real_criu=True,
+                            )
+                            dw.root_pid = restored_host_pid
+                            dw.children_pids = restored_children_host_pids
+                            dw._unshare_proc = unshare_proc
+                            dw._unshare_init_pid = init_host_pid
+                            self._unshare_by_restored_pid[restored_host_pid] = (init_host_pid, unshare_proc)
+
+                            if wl_id == "acc-workload":
+                                self.dest_workload = dw
+                            self.dest_workloads[wl_id] = dw
+
+                            pid_dir = self.proc_b / str(restored_host_pid)
+                            pid_dir.mkdir(parents=True, exist_ok=True)
+                            (pid_dir / "status").write_text(
+                                f"Name:\tstateful-srv\nVmRSS:\t32768 kB\nNSpid:\t{restored_host_pid}\t{ns_root_pid}\n",
+                                encoding="utf-8",
+                            )
+                            task_dir = pid_dir / "task" / str(restored_host_pid)
+                            task_dir.mkdir(parents=True, exist_ok=True)
+                            (task_dir / "children").write_text(
+                                " ".join(str(cp) for cp in restored_children_host_pids),
+                                encoding="utf-8",
+                            )
+                            for cp in restored_children_host_pids:
+                                cp_dir = self.proc_b / str(cp)
+                                cp_dir.mkdir(parents=True, exist_ok=True)
+                                (cp_dir / "status").write_text(
+                                    f"Name:\tstateful-worker\nVmRSS:\t4096 kB\nNSpid:\t{cp}\t2\n",
+                                    encoding="utf-8",
+                                )
+                        elif sock_for_restore is not None:
                             dw = DeterministicWorkloadService.restore_from_checkpoint(
                                 images_dir=img_dir,
                                 stream_sock=sock_for_restore,
@@ -984,10 +1304,35 @@ def run_acceptance_scenario(
     """Execute a single acceptance scenario end-to-end and assert multi-process invariants."""
     is_real_criu = (
         backend == "REAL_CRIU"
-        or (backend == "auto" and os.name == "posix" and sys.platform.startswith("linux") and os.geteuid() == 0 and shutil.which("criu") is not None)
+        or (backend == "auto" and _can_run_real_criu())
     )
     execution_backend = "REAL_CRIU" if is_real_criu else "POSIX_PROCESS_CLONE"
     criu_version = detect_criu_version()
+
+    if execution_backend == "REAL_CRIU" and not _can_run_real_criu():
+        return AcceptanceScenarioResult(
+            scenario_name=scenario_name,
+            strategy=strategy.value,
+            injected_fault=injected_fault,
+            execution_backend=execution_backend,
+            criu_version=criu_version,
+            commands_executed=[],
+            passed=False,
+            same_tcp_connection_preserved=False,
+            requests_before=0,
+            requests_during_and_after=0,
+            sequence_contiguous_no_loss_or_dup=False,
+            prng_trajectory_exact_match=False,
+            file_records_verified=0,
+            source_tree_terminated_on_commit=False,
+            source_tree_resumed_on_rollback=False,
+            all_children_resumed=False,
+            no_dual_execution_observed=False,
+            error_logs=[
+                "REAL_CRIU backend requires Linux with root privileges (CAP_SYS_ADMIN) and installed 'criu' binary"
+            ],
+            guarantee_notes="Failed closed: REAL_CRIU backend unavailable on this host.",
+        )
 
     error_logs: List[str] = []
     commands_executed: List[str] = []
@@ -1008,9 +1353,10 @@ def run_acceptance_scenario(
             state_log_path=log_path,
             stream_sock=server_sock,
             num_children=2,
+            use_real_criu=(execution_backend == "REAL_CRIU"),
         )
         service_a.start()
-        harness.register_workload(service_a, server_sock)
+        harness.register_workload(service_a, server_sock, client_sock)
 
         src_root_pid = service_a.root_pid
         assert src_root_pid is not None
@@ -1092,8 +1438,10 @@ def run_acceptance_scenario(
                     state_log_path=log_path2,
                     stream_sock=s_sock2,
                     num_children=2,
+                    use_real_criu=(execution_backend == "REAL_CRIU"),
                 )
                 service_b2.start()
+                harness.register_workload(service_b2, s_sock2, c_sock2)
 
                 pid2_dir = harness.proc_a / str(service_b2.root_pid)
                 pid2_dir.mkdir(parents=True, exist_ok=True)
@@ -1141,9 +1489,10 @@ def run_acceptance_scenario(
                     state_log_path=log_path2,
                     stream_sock=s_sock2,
                     num_children=2,
+                    use_real_criu=(execution_backend == "REAL_CRIU"),
                 )
                 service_b2.start()
-                harness.register_workload(service_b2, s_sock2)
+                harness.register_workload(service_b2, s_sock2, c_sock2)
 
                 pid2_dir = harness.proc_a / str(service_b2.root_pid)
                 pid2_dir.mkdir(parents=True, exist_ok=True)
@@ -1271,42 +1620,26 @@ def run_acceptance_scenario(
                 )
 
             elif injected_fault == "SAME_HOST_COW":
-                # Scenario 12: Same-Host Two-VM CoW Snapshot Fast Path
+                # Scenario 12: Same-Host Two-VM CoW Snapshot Fast Path via production orchestrator
+                cfg.source_addr = "127.0.0.1:9700"
+                cfg.dest_addr = "127.0.0.1:9701"
                 cfg.fs_mode = FilesystemMode.SHARED
                 wal_dir = Path(tmp) / "wal"
                 wal_dir.mkdir(parents=True, exist_ok=True)
-                orch = MigrationOrchestrator(cfg, client_a, client_b, migration_id="mig-cow-12", journal_dir=wal_dir)
-
-                orch.run_preflight()
-                orch._transition(MigrationState.PREPARE)
-                client_a.call("prepare_migration", migration_id=orch.migration_id)
-                client_b.call("prepare_migration", migration_id=orch.migration_id)
-
-                orch._transition(MigrationState.FREEZE)
-                orch._transition(MigrationState.FINAL_DUMP)
-                client_a.call("freeze_and_final_dump", migration_id=orch.migration_id, prev_round_name=None, dest_host=client_b.host, config_dict=config_to_dict(cfg))
-
-                # CoW clone fast path instead of network transfer
-                orch._transition(MigrationState.TRANSFER)
-                src_img = harness.work_a / orch.migration_id / "final"
-                dst_img = harness.work_b / orch.migration_id / "final"
-                FilesystemSyncManager.cow_clone_directory(src_img, dst_img, include_pages=True)
-
-                orch._transition(MigrationState.RESTORE)
-                client_a.call("release_ip", config_dict=config_to_dict(cfg), migration_id=orch.migration_id)
-                restore_res = client_b.call("restore_process", migration_id=orch.migration_id, source_host=client_a.host, config_dict=config_to_dict(cfg))
-                restored_pid = int(restore_res["restored_pid"])
-                orch._restored_pid = restored_pid
-
-                orch._transition(MigrationState.SWITCHOVER)
-                client_b.call(
-                    "claim_ip_and_resume",
-                    restored_pid=restored_pid,
-                    target_host=client_b.host,
-                    config_dict=config_to_dict(cfg),
-                    migration_id=orch.migration_id,
+                client_a_cow = AgentClient(cfg.source_addr, direct_service=harness.service_a)
+                client_b_cow = AgentClient(cfg.dest_addr, direct_service=harness.service_b)
+                orch = MigrationOrchestrator(
+                    cfg,
+                    client_a_cow,
+                    client_b_cow,
+                    migration_id="mig-cow-12",
+                    journal_dir=wal_dir,
                 )
-                mig_result = orch.commit()
+                mig_result = orch.execute()
+                if not any(c.startswith("cp ") for c in harness.commands_executed):
+                    raise AssertionError("Production transfer_final_state did not invoke CoW cp fast path")
+                if any(c.startswith("rsync ") for c in harness.commands_executed):
+                    raise AssertionError("Same-host CoW fast path unexpectedly invoked rsync")
 
             else:
                 # Normal live migration or standard phase boundary fault injection
@@ -1321,15 +1654,19 @@ def run_acceptance_scenario(
 
         # Measure client-perceived blackout duration: from just before freezing the service for cutover
         # to the completion of the first post-cutover request `seq=11` ACK on the persistent TCP connection!
-        ack_11 = client.send_request(11, f"after-11")
+        acks_after: List[WorkloadAck] = []
         blackout_end_time = time.monotonic()
+        try:
+            ack_11 = client.send_request(11, "after-11")
+            blackout_end_time = time.monotonic()
+            acks_after.append(ack_11)
+            # Phase 2: 10 requests during and after migration cutover or rollback
+            for seq in range(12, 21):
+                ack = client.send_request(seq, f"after-{seq}")
+                acks_after.append(ack)
+        except Exception as exc:
+            error_logs.append(f"Post-cutover request failed: {exc}")
         client_observed_blackout_ms = max(0.1, (blackout_end_time - blackout_start_time[0]) * 1000.0)
-
-        # Phase 2: 10 requests during and after migration cutover or rollback
-        acks_after: List[WorkloadAck] = [ack_11]
-        for seq in range(12, 21):
-            ack = client.send_request(seq, f"after-{seq}")
-            acks_after.append(ack)
 
         client.close()
 

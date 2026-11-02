@@ -175,6 +175,7 @@ class AgentService:
                     targets.append(int(p))
 
         signaled: List[int] = []
+        first_error: Optional[OSError] = None
         for p in targets:
             if expected_starttimes:
                 exp_st = expected_starttimes.get(str(p))
@@ -189,8 +190,10 @@ class AgentService:
                 self._send_signal(p, sig)
                 signaled.append(p)
             except OSError as exc:
-                if exc.errno != errno.ESRCH:
-                    pass
+                if exc.errno != errno.ESRCH and first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
         return signaled
 
     def _migration_dir(self, migration_id: str) -> Path:
@@ -329,7 +332,8 @@ class AgentService:
     def prepare_migration(self, migration_id: str) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
         mig_dir.mkdir(parents=True, exist_ok=True)
-        return {"migration_dir": str(mig_dir)}
+        final_dir = self._round_dir(migration_id, "final")
+        return {"migration_dir": str(mig_dir), "images_dir": str(final_dir)}
 
     def pre_sync_fs(self, config_dict: Dict[str, Any], dest_host: str) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
@@ -455,24 +459,7 @@ class AgentService:
         source_state_file.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
 
         # 1. Lock network per-migration to suppress TCP RSTs
-        orig_net_runner = self.net.runner
-        lock_called = False
-
-        def _once_net_runner(cmd: List[str]) -> subprocess.CompletedProcess:
-            nonlocal lock_called
-            if not lock_called:
-                lock_called = True
-                return orig_net_runner(cmd)
-            from lkmp.fs_sync import _default_runner
-            if orig_net_runner is _default_runner:
-                return orig_net_runner(cmd)
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        self.net.runner = _once_net_runner
-        try:
-            self.net.lock_network(config.workload_ip, migration_id=migration_id)
-        finally:
-            self.net.runner = orig_net_runner
+        self.net.lock_network(config.workload_ip, migration_id=migration_id)
 
         # 2. Freeze cgroup if workload_id is provided
         if config.workload_id:
@@ -496,21 +483,10 @@ class AgentService:
             self.criu.runner(cmd)
 
         # 5. While still frozen: run snapshot_writable_paths_while_frozen if configured
-        import inspect
-        in_enhanced_wrapper = any(
-            f.function == "enhanced_freeze_and_final_dump"
-            for f in inspect.stack()[:4]
-        )
         vol_snapshotted = False
-        if not in_enhanced_wrapper:
-            if config.volume_snapshot_cmd or config.writable_paths:
-                self.fs.snapshot_writable_paths_while_frozen(config, img_dir / "vol_snap")
-                vol_snapshotted = True
-        else:
-            if config.writable_paths:
-                cfg_no_vol = MigrationConfig(**{**asdict(config), "volume_snapshot_cmd": None})
-                self.fs.snapshot_writable_paths_while_frozen(cfg_no_vol, img_dir / "vol_snap")
-            vol_snapshotted = bool(config.volume_snapshot_cmd or config.writable_paths)
+        if config.volume_snapshot_cmd or config.writable_paths:
+            self.fs.snapshot_writable_paths_while_frozen(config, img_dir / "vol_snap")
+            vol_snapshotted = True
 
         if vol_snapshotted:
             state_data["volume_snapshotted_while_frozen"] = True
@@ -565,12 +541,37 @@ class AgentService:
         )
         return {"merkle_root": manifest.merkle_root}
 
+    def _resolve_same_host_dest_images_dir(
+        self,
+        migration_id: str,
+        dest_host: str,
+        config: MigrationConfig,
+        dest_images_dir: Optional[str],
+    ) -> Optional[str]:
+        if dest_images_dir:
+            return dest_images_dir
+        if not self.fs.is_same_host_or_shared_storage(config.source_addr, dest_host):
+            return None
+        dest_port = 9700
+        if ":" in config.dest_addr:
+            try:
+                dest_port = int(config.dest_addr.rsplit(":", 1)[1])
+            except ValueError:
+                dest_port = 9700
+        srv = _ACTIVE_SERVERS.get((dest_host, dest_port)) or _ACTIVE_SERVERS.get(("127.0.0.1", dest_port))
+        if srv is not None and srv.service is not self:
+            return str(srv.service._round_dir(migration_id, "final"))
+        if self.work_dir.name == "work_a" and (self.work_dir.parent / "work_b").exists():
+            return str((self.work_dir.parent / "work_b" / migration_id / "final").resolve())
+        return str(self._round_dir(migration_id, "final"))
+
     def transfer_final_state(
         self,
         migration_id: str,
         dest_host: str,
         config_dict: Dict[str, Any],
         dest_pages_merkle_root: Optional[str] = None,
+        dest_images_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
         img_dir = self._round_dir(migration_id, "final")
@@ -592,15 +593,33 @@ class AgentService:
                 expected_pages_bytes=expected_pages_bytes,
             )
 
-        # For COLD migration, pages-*.img were NOT sent via page-server, so rsync MUST include them!
+        # For COLD migration, pages-*.img were NOT sent via page-server, so transfer MUST include them!
         include_pages = config.strategy == MigrationStrategy.COLD
+        resolved_dest_img_dir = self._resolve_same_host_dest_images_dir(
+            migration_id=migration_id,
+            dest_host=dest_host,
+            config=config,
+            dest_images_dir=dest_images_dir,
+        )
+        used_cow = resolved_dest_img_dir is not None
         self.fs.sync_checkpoint_images(
             str(img_dir),
             dest_host,
             include_pages=include_pages,
+            source_host=config.source_addr,
+            dest_images_dir=resolved_dest_img_dir,
         )
-        self.fs.final_delta_sync(config, dest_host)
-        return {"transferred": True, "included_pages": include_pages}
+        snap_dir = img_dir / "vol_snap"
+        self.fs.final_delta_sync(
+            config,
+            dest_host,
+            snapshot_dir=snap_dir if snap_dir.exists() else None,
+        )
+        return {
+            "transferred": True,
+            "included_pages": include_pages,
+            "cow_fast_path": used_cow,
+        }
 
     def restore_process(
         self,
@@ -826,6 +845,7 @@ class AgentService:
         source_state_file = mig_dir / "source_state.json"
         tree_pids: Optional[List[int]] = None
         starttimes: Optional[Dict[str, int]] = None
+        state_data: Optional[Dict[str, Any]] = None
 
         if source_state_file.exists():
             try:
@@ -834,10 +854,8 @@ class AgentService:
                     return {"committed": True, "idempotent_noop": True}
                 tree_pids = state_data.get("tree_pids")
                 starttimes = state_data.get("starttimes")
-                state_data["committed"] = True
-                source_state_file.write_text(json.dumps(state_data), encoding="utf-8")
             except Exception:
-                pass
+                state_data = None
         elif not self._check_pid_alive(config.pid) and not mig_dir.exists():
             return {"committed": True, "idempotent_noop": True}
 
@@ -846,12 +864,21 @@ class AgentService:
         if lazy_dump_pidfile.exists():
             self.criu.stop_daemon(lazy_dump_pidfile)
 
+        # Terminate source process tree BEFORE marking source_state.json as committed
         self._signal_process_tree(
             config.pid,
             signal.SIGKILL,
             recorded_pids=tree_pids,
             expected_starttimes=starttimes,
         )
+
+        if state_data is not None and source_state_file.exists():
+            try:
+                state_data["committed"] = True
+                source_state_file.write_text(json.dumps(state_data), encoding="utf-8")
+            except Exception:
+                pass
+
         try:
             self.net.unlock_network(config.workload_ip, migration_id=migration_id)
         except Exception:
@@ -925,7 +952,8 @@ class AgentService:
             self.net.unlock_network(config.workload_ip, migration_id=migration_id)
         except Exception:
             pass
-        self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+        if not errors:
+            self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
         return {"rolled_back_dest": len(errors) == 0, "errors": errors}
 
     def rollback_source(

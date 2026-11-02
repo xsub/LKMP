@@ -871,6 +871,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
         claim_ip_and_resume, rollback_source, commit_source, and rollback_dest signal ALL 3 PIDs,
         AND if a PID's starttime in <proc_root>/<pid>/stat changed, that PID is NOT signaled.
         """
+        import errno
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             proc_root = root / "proc"
@@ -988,6 +989,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
         Verify freeze_cgroup polls cgroup.events for frozen 1 (and raises TimeoutError if frozen 0 persists),
         and quiesce_cmd runs before lock_network while resume_cmd runs after SIGCONT.
         """
+        import errno
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             cg_root = root / "cgroup"
@@ -1187,6 +1189,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
         Verify that when rollback_dest is called with restored_pid=None,
         it reads final/restore_state.json and kills the orphaned restored root PID and child PIDs on Destination B.
         """
+        import errno
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             work_dir = root / "work"
@@ -1266,6 +1269,315 @@ class TestAuditRound2Fixes(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx_cli:
             client.call("get_capabilities")
         self.assertIn("ca_cert", str(ctx_cli.exception))
+
+
+class TestStaffAuditFindingsFixes(unittest.TestCase):
+    """Regression tests for the 5 Staff-level production readiness audit findings (2 P0s, 3 P1s)."""
+
+    def test_p0_1_freeze_and_final_dump_installs_full_nft_drop_rules(self) -> None:
+        """P0-1: freeze_and_final_dump must execute all 6 nft commands including input/output drop rules."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work_dir = root / "work"
+            proc_dir = root / "proc"
+            (proc_dir / "1234").mkdir(parents=True, exist_ok=True)
+            (proc_dir / "1234" / "stat").write_text(
+                "1234 (app) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 555 0\n",
+                encoding="utf-8",
+            )
+            (proc_dir / "1234" / "status").write_text("Name:\tapp\nVmRSS:\t4096 kB\n", encoding="utf-8")
+
+            nft_cmds: List[List[str]] = []
+
+            def runner(cmd: List[str]) -> subprocess.CompletedProcess:
+                if cmd and cmd[0] == "nft":
+                    nft_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            service = AgentService(
+                work_dir=str(work_dir),
+                proc_root=str(proc_dir),
+                criu_driver=CriuDriver(runner=runner),
+                net_manager=NetworkMobilityManager(runner=runner),
+                fs_manager=FilesystemSyncManager(runner=runner),
+                pid_alive_checker=lambda _p: True,
+            )
+            cfg = MigrationConfig(
+                pid=1234,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                workload_ip="10.244.1.10/32",
+                tls=TlsConfig(enabled=False),
+            )
+            service.prepare_migration("mig-nft-drop")
+            service.freeze_and_final_dump(
+                migration_id="mig-nft-drop",
+                prev_round_name=None,
+                dest_host="10.0.0.2",
+                config_dict=config_to_dict(cfg),
+            )
+
+            self.assertEqual(len(nft_cmds), 6)
+            self.assertEqual(nft_cmds[0][:3], ["nft", "add", "table"])
+            self.assertEqual(nft_cmds[1][:3], ["nft", "flush", "table"])
+            self.assertIn("input", nft_cmds[2])
+            self.assertIn("output", nft_cmds[3])
+            self.assertIn("drop", nft_cmds[4])
+            self.assertIn("daddr", nft_cmds[4])
+            self.assertIn("drop", nft_cmds[5])
+            self.assertIn("saddr", nft_cmds[5])
+
+    def test_p0_2_no_dual_active_instances_on_rollback_or_commit_errors(self) -> None:
+        """
+        P0-2:
+        1. Orchestrator.rollback must NOT call rollback_source if rollback_dest fails.
+        2. AgentService._signal_process_tree must propagate non-ESRCH OSError (e.g. EPERM).
+        3. AgentService.commit_source must NOT mark source_state.json committed=True before SIGKILL succeeds.
+        """
+        import errno
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work_a = root / "work_a"
+            work_b = root / "work_b"
+            proc_a = root / "proc_a"
+            proc_b = root / "proc_b"
+            for p in (proc_a / "100", proc_b / "200"):
+                p.mkdir(parents=True, exist_ok=True)
+                (p / "stat").write_text(f"{p.name} (app) S 1 " + "0 " * 17 + "999 0\n", encoding="utf-8")
+                (p / "status").write_text("Name:\tapp\nVmRSS:\t4096 kB\n", encoding="utf-8")
+
+            def fail_signal_eperm(_pid: int, _sig: int) -> None:
+                raise OSError(errno.EPERM, "Operation not permitted")
+
+            service_a = AgentService(
+                work_dir=str(work_a),
+                proc_root=str(proc_a),
+                signal_sender=fail_signal_eperm,
+                pid_alive_checker=lambda _p: True,
+            )
+
+            # 1. _signal_process_tree raises EPERM
+            with self.assertRaises(OSError) as ctx:
+                service_a._signal_process_tree(100, signal.SIGKILL)
+            self.assertEqual(ctx.exception.errno, errno.EPERM)
+
+            # 2. commit_source does NOT mark committed=True when SIGKILL raises EPERM
+            mig_dir_a = work_a / "mig-commit-fail"
+            mig_dir_a.mkdir(parents=True, exist_ok=True)
+            state_file = mig_dir_a / "source_state.json"
+            state_file.write_text(
+                json.dumps({"pid": 100, "tree_pids": [100], "committed": False}),
+                encoding="utf-8",
+            )
+            cfg = MigrationConfig(
+                pid=100,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                tls=TlsConfig(enabled=False),
+            )
+            with self.assertRaises(OSError):
+                service_a.commit_source("mig-commit-fail", config_to_dict(cfg))
+            saved_state = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertFalse(saved_state["committed"])
+
+            # 3. Orchestrator.rollback skips rollback_source when rollback_dest fails
+            rollback_source_called = [False]
+
+            class DummySourceClient:
+                host = "10.0.0.1"
+
+                def call(self, method: str, **_kwargs: Any) -> Dict[str, Any]:
+                    if method == "rollback_source":
+                        rollback_source_called[0] = True
+                    return {"rolled_back_source": True}
+
+            class FailingDestClient:
+                host = "10.0.0.2"
+
+                def call(self, method: str, **_kwargs: Any) -> Dict[str, Any]:
+                    if method == "rollback_dest":
+                        return {"rolled_back_dest": False, "errors": ["dest process 200 still alive"]}
+                    return {}
+
+            orch = MigrationOrchestrator(
+                cfg,
+                DummySourceClient(),  # type: ignore[arg-type]
+                FailingDestClient(),  # type: ignore[arg-type]
+                migration_id="mig-rb-fence",
+            )
+            rb_res = orch.rollback("Verify failed on B")
+            self.assertFalse(rb_res.rolled_back)
+            self.assertFalse(rollback_source_called[0])
+            self.assertIn("Skipping rollback_source because rollback_dest failed", rb_res.error_message or "")
+
+    def test_p1_1_transfer_final_state_uses_consistent_frozen_snapshot(self) -> None:
+        """P1-1: transfer_final_state must sync writable_paths from the frozen vol_snap rather than mutated live paths."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work_dir = root / "work"
+            proc_dir = root / "proc"
+            (proc_dir / "1234").mkdir(parents=True, exist_ok=True)
+            (proc_dir / "1234" / "stat").write_text(
+                "1234 (app) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 555 0\n",
+                encoding="utf-8",
+            )
+            (proc_dir / "1234" / "status").write_text("Name:\tapp\nVmRSS:\t4096 kB\n", encoding="utf-8")
+
+            live_data_dir = root / "data"
+            live_data_dir.mkdir(parents=True, exist_ok=True)
+            live_file = live_data_dir / "db.wal"
+            live_file.write_text("CHECKPOINT_CONSISTENT_STATE\n", encoding="utf-8")
+
+            rsync_cmds: List[List[str]] = []
+
+            def runner(cmd: List[str]) -> subprocess.CompletedProcess:
+                if cmd and cmd[0] == "criu" and "dump" in cmd:
+                    idx = cmd.index("--images-dir")
+                    img_d = Path(cmd[idx + 1])
+                    (img_d / "core-1.img").write_bytes(b"CORE")
+                    (img_d / "pages-1.img").write_bytes(b"PAGES")
+                elif cmd and cmd[0] == "rsync":
+                    rsync_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            service = AgentService(
+                work_dir=str(work_dir),
+                proc_root=str(proc_dir),
+                criu_driver=CriuDriver(runner=runner),
+                net_manager=NetworkMobilityManager(runner=runner),
+                fs_manager=FilesystemSyncManager(runner=runner),
+                pid_alive_checker=lambda _p: True,
+            )
+            cfg = MigrationConfig(
+                pid=1234,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                fs_mode=FilesystemMode.RSYNC,
+                writable_paths=[str(live_file)],
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            cfg_dict = config_to_dict(cfg)
+            service.prepare_migration("mig-snap-sync")
+            service.freeze_and_final_dump(
+                migration_id="mig-snap-sync",
+                prev_round_name=None,
+                dest_host="10.0.0.2",
+                config_dict=cfg_dict,
+            )
+
+            # Mutate the live file AFTER the frozen snapshot was taken
+            live_file.write_text("MUTATED_POST_DUMP_GARBAGE\n", encoding="utf-8")
+
+            service.transfer_final_state(
+                migration_id="mig-snap-sync",
+                dest_host="10.0.0.2",
+                config_dict=cfg_dict,
+            )
+
+            # Find the rsync command that synced db.wal
+            delta_rsync = [c for c in rsync_cmds if any("db.wal" in arg for arg in c)]
+            self.assertEqual(len(delta_rsync), 1)
+            src_arg = delta_rsync[0][-2]
+            self.assertIn("vol_snap", src_arg)
+            self.assertEqual(Path(src_arg).read_text(encoding="utf-8"), "CHECKPOINT_CONSISTENT_STATE\n")
+
+    def test_p1_2_ci_gates_fail_closed_on_criu_errors(self) -> None:
+        """P1-2: linux_criu_e2e.main() returns non-zero on failure, and REAL_CRIU acceptance fails closed when unavailable."""
+        from unittest.mock import patch
+        import scripts.linux_criu_e2e as e2e
+        from lkmp.acceptance import run_acceptance_scenario
+
+        fake_results = {
+            "environment": {},
+            "scenarios": {},
+            "summary": {"total": 4, "passed": 3, "skipped": 0, "failed": 1},
+        }
+        with patch.object(e2e.LinuxCriuE2ERunner, "run_all", return_value=fake_results), patch.object(
+            e2e.LinuxCriuE2ERunner, "render_markdown", return_value="MD"
+        ), patch("sys.argv", ["linux_criu_e2e.py"]):
+            rc = e2e.main()
+        self.assertEqual(rc, 1)
+
+        with patch("lkmp.acceptance._can_run_real_criu", return_value=False):
+            acc_res = run_acceptance_scenario(
+                scenario_name="REAL_CRIU Fail-Closed Check",
+                strategy=MigrationStrategy.COLD,
+                backend="REAL_CRIU",
+            )
+        self.assertFalse(acc_res.passed)
+        self.assertEqual(acc_res.execution_backend, "REAL_CRIU")
+        self.assertTrue(any("REAL_CRIU backend requires Linux" in e for e in acc_res.error_logs))
+
+    def test_p1_3_cow_fast_path_used_in_production_migration(self) -> None:
+        """P1-3: Production transfer_final_state uses CoW fast path instead of rsync on same-host migration."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work_a = root / "work_a"
+            work_b = root / "work_b"
+            proc_a = root / "proc_a"
+            proc_b = root / "proc_b"
+            for p in (proc_a / "4242", proc_b / "4242"):
+                p.mkdir(parents=True, exist_ok=True)
+                (p / "stat").write_text("4242 (app) S 1 " + "0 " * 17 + "100 0\n", encoding="utf-8")
+                (p / "status").write_text("Name:\tapp\nVmRSS:\t4096 kB\n", encoding="utf-8")
+
+            cmds_a: List[List[str]] = []
+
+            def runner_a(cmd: List[str]) -> subprocess.CompletedProcess:
+                cmds_a.append(list(cmd))
+                if cmd and cmd[0] == "criu" and "dump" in cmd:
+                    idx = cmd.index("--images-dir")
+                    img_d = Path(cmd[idx + 1])
+                    (img_d / "core-1.img").write_bytes(b"CORE_STATE")
+                    (img_d / "pages-1.img").write_bytes(b"PAGES_STATE")
+                elif cmd and cmd[0] == "cp" and len(cmd) >= 3:
+                    shutil.copy2(cmd[-2], cmd[-1])
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            service_a = AgentService(
+                work_dir=str(work_a),
+                proc_root=str(proc_a),
+                criu_driver=CriuDriver(runner=runner_a),
+                net_manager=NetworkMobilityManager(runner=runner_a),
+                fs_manager=FilesystemSyncManager(runner=runner_a),
+                pid_alive_checker=lambda _p: True,
+            )
+            service_b = AgentService(
+                work_dir=str(work_b),
+                proc_root=str(proc_b),
+                pid_alive_checker=lambda _p: True,
+            )
+            dst_prep = service_b.prepare_migration("mig-cow-prod")
+            service_a.prepare_migration("mig-cow-prod")
+
+            cfg = MigrationConfig(
+                pid=4242,
+                source_addr="127.0.0.1:9700",
+                dest_addr="127.0.0.1:9701",
+                strategy=MigrationStrategy.COLD,
+                fs_mode=FilesystemMode.SHARED,
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            cfg_dict = config_to_dict(cfg)
+            service_a.freeze_and_final_dump(
+                migration_id="mig-cow-prod",
+                prev_round_name=None,
+                dest_host="127.0.0.1",
+                config_dict=cfg_dict,
+            )
+            res = service_a.transfer_final_state(
+                migration_id="mig-cow-prod",
+                dest_host="127.0.0.1",
+                config_dict=cfg_dict,
+                dest_images_dir=dst_prep["images_dir"],
+            )
+            self.assertTrue(res.get("cow_fast_path"))
+            self.assertTrue(any(c[0] == "cp" for c in cmds_a))
+            self.assertFalse(any(c[0] == "rsync" for c in cmds_a))
+            self.assertTrue((Path(dst_prep["images_dir"]) / "core-1.img").exists())
+            self.assertTrue((Path(dst_prep["images_dir"]) / "pages-1.img").exists())
 
 
 if __name__ == "__main__":
