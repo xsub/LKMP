@@ -2,8 +2,10 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+WORKDIR /opt/lkmp
+COPY . /opt/lkmp
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    criu \
     iproute2 \
     iputils-arping \
     nftables \
@@ -12,11 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
     python3 \
     stress-ng \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /opt/lkmp
-COPY . /opt/lkmp
-RUN chmod +x /opt/lkmp/bin/lkmp && ln -s /opt/lkmp/bin/lkmp /usr/local/bin/lkmp
+    && (apt-get install -y --no-install-recommends criu || bash /opt/lkmp/scripts/install_criu_on_linux.sh) \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod +x /opt/lkmp/bin/lkmp && ln -sf /opt/lkmp/bin/lkmp /usr/local/bin/lkmp
 
 EXPOSE 9440 27000 27001
 

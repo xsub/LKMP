@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SUDO=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+fi
+
 echo "=== Installing libnftables-dev and CRIU dependencies ==="
-sudo apt-get update -qq
-sudo apt-get install -y -qq \
+$SUDO apt-get update -qq
+$SUDO apt-get install -y -qq \
     iproute2 \
     nftables \
     libnftables-dev \
@@ -36,10 +41,11 @@ cd "$WORKDIR"
 git clone --depth 1 https://github.com/checkpoint-restore/criu.git criu-src
 cd criu-src
 make -j"$(nproc)" criu/criu
-sudo install -m 0755 criu/criu /usr/local/sbin/criu
-sudo ln -sf /usr/local/sbin/criu /usr/bin/criu
+$SUDO install -m 0755 criu/criu /usr/local/sbin/criu
+$SUDO ln -sf /usr/local/sbin/criu /usr/bin/criu
+rm -rf "$WORKDIR"
 
 echo "=== Installed CRIU successfully ==="
-sudo criu --version
-sudo criu check
-sudo criu check --extra || true
+$SUDO criu --version
+$SUDO criu check || true
+$SUDO criu check --extra || true

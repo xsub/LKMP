@@ -46,10 +46,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies (CRIU, iproute2, nftables, rsync)
+      - name: Install system dependencies & CRIU 4.2+ (iproute2, nftables, rsync, CRIU)
         run: |
           sudo apt-get update
-          sudo apt-get install -y criu iproute2 nftables rsync
+          sudo apt-get install -y iproute2 nftables rsync
+          if ! sudo apt-get install -y criu || ! sudo criu check; then
+            sudo bash scripts/install_criu_on_linux.sh
+          fi
 
       - name: Inspect CRIU installation and kernel check
         run: |
