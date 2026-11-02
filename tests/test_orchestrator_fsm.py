@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -29,7 +30,7 @@ class _FakeClusterHarness:
     """Simulated two-node (Source A and Destination B) test harness with controllable faults."""
 
     def __init__(self, tmp_dir: str) -> None:
-        self.root = Path(tmp_dir)
+        self.root = Path(tmp_dir).resolve()
         self.proc_a = self.root / "proc_a"
         self.proc_b = self.root / "proc_b"
         self.work_a = self.root / "work_a"
@@ -88,19 +89,59 @@ class _FakeClusterHarness:
 
     def _run_a(self, cmd: List[str]) -> subprocess.CompletedProcess:
         self.commands_a.append(cmd)
-        if len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "pre-dump":
-            idx = cmd.index("--images-dir")
-            img_dir = Path(cmd[idx + 1])
-            size = self.predump_sizes[min(self._predump_idx, len(self.predump_sizes) - 1)]
-            self._predump_idx += 1
-            # Write synthetic page image with sparse size so dirty byte tracker reads it
-            pages_file = img_dir / "pages-1.img"
-            with pages_file.open("wb") as f:
-                f.truncate(size)
-        elif len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "dump":
-            idx = cmd.index("--images-dir")
-            img_dir = Path(cmd[idx + 1])
-            (img_dir / "core-1234.img").write_bytes(b"SECRET_KEY_MATERIAL_IN_RAM")
+        if len(cmd) >= 2 and cmd[0] == "criu":
+            if cmd[1] == "pre-dump":
+                idx = cmd.index("--images-dir")
+                img_dir = Path(cmd[idx + 1])
+                size = self.predump_sizes[min(self._predump_idx, len(self.predump_sizes) - 1)]
+                self._predump_idx += 1
+                # Write synthetic page image with sparse size so dirty byte tracker reads it
+                pages_file = img_dir / "pages-1.img"
+                with pages_file.open("wb") as f:
+                    f.truncate(size)
+            elif cmd[1] == "dump":
+                idx = cmd.index("--images-dir")
+                img_dir = Path(cmd[idx + 1])
+                (img_dir / "core-1234.img").write_bytes(b"SECRET_KEY_MATERIAL_IN_RAM")
+                (img_dir / "pages-1.img").write_bytes(b"COLD_PAGES_RAM_DATA")
+
+            if "--page-server" in cmd and "--images-dir" in cmd:
+                idx = cmd.index("--images-dir")
+                src_img_dir = Path(cmd[idx + 1]).resolve()
+                try:
+                    rel = src_img_dir.relative_to(self.work_a)
+                    dest_img_dir = self.work_b / rel
+                    dest_img_dir.mkdir(parents=True, exist_ok=True)
+                    src_pages = src_img_dir / "pages-1.img"
+                    dest_pages = dest_img_dir / "pages-1.img"
+                    if src_pages.exists():
+                        shutil.copy2(src_pages, dest_pages)
+                    else:
+                        dest_pages.write_bytes(b"PAGE_SERVER_PAGES_DATA")
+                except ValueError:
+                    pass
+
+        elif cmd and cmd[0] == "rsync":
+            src_str = cmd[-2].rstrip("/")
+            src_path = Path(src_str).resolve()
+            try:
+                rel = src_path.relative_to(self.work_a)
+                dest_path = self.work_b / rel
+                dest_path.mkdir(parents=True, exist_ok=True)
+                exclude_pages = any("--exclude=pages-*.img" in arg for arg in cmd)
+                if src_path.exists():
+                    for item in src_path.iterdir():
+                        if not item.is_file():
+                            continue
+                        if item.name == "manifest.sig.json":
+                            shutil.copy2(item, dest_path / item.name)
+                        elif item.name.endswith(".img"):
+                            if exclude_pages and item.name.startswith("pages-"):
+                                continue
+                            shutil.copy2(item, dest_path / item.name)
+            except ValueError:
+                pass
+
         return subprocess.CompletedProcess(cmd, 0, "CRIU 4.3\n", "")
 
     def _run_b(self, cmd: List[str]) -> subprocess.CompletedProcess:

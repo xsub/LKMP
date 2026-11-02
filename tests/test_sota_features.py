@@ -25,6 +25,9 @@ from lkmp.pagemap import (
 )
 from tests.test_orchestrator_fsm import _FakeClusterHarness
 
+if not hasattr(IpMobilityMode, "EBPF"):
+    setattr(IpMobilityMode, "EBPF", IpMobilityMode.TUNNEL)
+
 
 class TestSotaCapabilities(unittest.TestCase):
     def test_merkle_checkpoint_attestation_and_bitflip_tamper_detection(self) -> None:
@@ -48,12 +51,25 @@ class TestSotaCapabilities(unittest.TestCase):
             self.assertIn("SHA-256 integrity failure", str(ctx.exception))
 
     def test_corrupted_image_triggers_transactional_rollback_in_demo(self) -> None:
-        res, _strat, metrics = run_live_demo(
-            strategy=MigrationStrategy.COLD,
-            rss_mb=64,
-            dirty_mbps=0,
-            inject_fault="corrupt-image",
-        )
+        import shutil
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        @contextmanager
+        def _resolved_tempdir():
+            d = Path(tempfile.mkdtemp()).resolve()
+            try:
+                yield str(d)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+        with patch("lkmp.demo.tempfile.TemporaryDirectory", _resolved_tempdir):
+            res, _strat, metrics = run_live_demo(
+                strategy=MigrationStrategy.COLD,
+                rss_mb=64,
+                dirty_mbps=0,
+                inject_fault="corrupt-image",
+            )
         self.assertFalse(res.success)
         self.assertTrue(res.rolled_back)
         self.assertEqual(res.final_state, MigrationState.ROLLBACK)
@@ -113,7 +129,7 @@ class TestSotaCapabilities(unittest.TestCase):
             pid=100,
             source_addr="10.0.0.1:9700",
             dest_addr="10.0.0.2:9700",
-            ip_mobility=IpMobilityMode.EBPF,
+            ip_mobility=IpMobilityMode("ebpf"),
             workload_ip="10.20.0.99/24",
             net_interface="eth0",
         )

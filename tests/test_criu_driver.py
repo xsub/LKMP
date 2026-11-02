@@ -40,6 +40,9 @@ class TestCriuAndNetworkDrivers(unittest.TestCase):
             [
                 "criu",
                 "page-server",
+                "--daemon",
+                "--pidfile",
+                "/var/lib/lkmp/img/2/page-server.pid",
                 "--images-dir",
                 "/var/lib/lkmp/img/2",
                 "--port",

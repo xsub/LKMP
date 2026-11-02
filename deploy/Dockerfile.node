@@ -18,6 +18,6 @@ WORKDIR /opt/lkmp
 COPY . /opt/lkmp
 RUN chmod +x /opt/lkmp/bin/lkmp && ln -s /opt/lkmp/bin/lkmp /usr/local/bin/lkmp
 
-EXPOSE 9700 27000 27001
+EXPOSE 9440 27000 27001
 
-CMD ["lkmp", "agent", "--host", "0.0.0.0", "--port", "9700", "--no-tls"]
+CMD ["lkmp", "agent", "--host", "0.0.0.0", "--port", "9440", "--work-dir", "/var/lib/lkmp", "--tls-ca", "/etc/lkmp/tls/ca.crt", "--tls-cert", "/etc/lkmp/tls/node.crt", "--tls-key", "/etc/lkmp/tls/node.key"]

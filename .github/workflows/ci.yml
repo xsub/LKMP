@@ -7,7 +7,7 @@ on:
     branches: ["main"]
 
 jobs:
-  test:
+  test-and-lint:
     name: Unit & Two-Node RPC Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -33,3 +33,49 @@ jobs:
           ./bin/lkmp demo --strategy pre-copy --inject-fault verify --prometheus
           ./bin/lkmp demo --strategy cold --inject-fault corrupt-image
           ./bin/lkmp benchmark
+
+  linux-criu-verification:
+    name: Real Linux CRIU & Acceptance Verification (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies (CRIU, iproute2, nftables, rsync)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y criu iproute2 nftables rsync
+
+      - name: Inspect CRIU installation and kernel check
+        run: |
+          criu --version
+          sudo criu check || true
+
+      - name: Verify CRIU CLI flag compatibility (page-server, dump, lazy-pages)
+        run: |
+          criu page-server --help
+          criu dump --help
+          criu lazy-pages --help
+
+      - name: Run full unit and acceptance test suite
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Run CLI live migration demo & benchmarks
+        run: |
+          ./bin/lkmp demo --strategy auto --rss-mb 256 --dirty-mbps 40 --prometheus
+          ./bin/lkmp demo --strategy pre-copy --inject-fault verify --prometheus
+          ./bin/lkmp demo --strategy cold --inject-fault corrupt-image
+          ./bin/lkmp benchmark
+
+      - name: Run acceptance verification suite
+        run: |
+          ./bin/lkmp acceptance
+          ./bin/lkmp acceptance --json
+
+      - name: Run real Linux CRIU E2E verification
+        run: sudo python3 scripts/linux_criu_e2e.py

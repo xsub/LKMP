@@ -162,13 +162,15 @@ def reset_soft_dirty_bits(pid: int, proc_root: str = "/proc") -> bool:
 def sample_process_dirty_rate(
     pid: int,
     proc_root: str = "/proc",
-    sample_ms: int = 100,
+    sample_ms: int = 0,
     bandwidth_mbps: float = 1000.0,
     has_userfaultfd: bool = True,
+    allow_clear_refs: bool = False,
 ) -> MemoryHeatProfile:
     """
-    Reset soft-dirty bits on `pid`, wait `sample_ms`, and read `/proc/<pid>/pagemap`
-    across writable VMAs to measure live memory dirtying rate and VMA heat locality.
+    Read `/proc/<pid>/pagemap` across writable VMAs to measure memory residency and soft-dirty bits.
+    When `allow_clear_refs=False` (default for non-destructive preflight), never writes to
+    `/proc/<pid>/clear_refs`. Only resets soft-dirty bits when `allow_clear_refs=True` and `sample_ms > 0`.
     """
     proc_dir = Path(proc_root) / str(pid)
     maps_path = proc_dir / "maps"
@@ -180,7 +182,9 @@ def sample_process_dirty_rate(
     vmas = parse_writable_vmas_with_labels(
         maps_path.read_text(encoding="utf-8", errors="ignore")
     )
-    reset_ok = reset_soft_dirty_bits(pid, proc_root=proc_root)
+    reset_ok = False
+    if allow_clear_refs and sample_ms > 0:
+        reset_ok = reset_soft_dirty_bits(pid, proc_root=proc_root)
 
     t0 = time.monotonic()
     if sample_ms > 0 and reset_ok:
@@ -222,7 +226,12 @@ def sample_process_dirty_rate(
     rss_bytes = total_present * PAGE_SIZE
     dirty_bytes = total_dirty * PAGE_SIZE
     hot_thrashing_bytes = hot_thrashing_pages * PAGE_SIZE
-    dirty_rate_bps = int(dirty_bytes / elapsed_sec) if reset_ok else 0
+    if reset_ok:
+        dirty_rate_bps = int(dirty_bytes / elapsed_sec)
+    elif total_dirty > 0:
+        dirty_rate_bps = int(total_dirty * PAGE_SIZE)
+    else:
+        dirty_rate_bps = 0
 
     strategy, reason = select_optimal_strategy(
         rss_bytes=rss_bytes,

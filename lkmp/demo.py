@@ -27,7 +27,7 @@ from lkmp.telemetry import PrometheusMetricsCollector, format_bytes
 import struct
 
 
-class DemoClusterNodeSet:
+class _SimulatedCluster:
     """In-memory two-node (Source A & Destination B) cluster communicating over real TCP RPC."""
 
     def __init__(
@@ -36,11 +36,13 @@ class DemoClusterNodeSet:
         rss_mb: int = 256,
         dirty_mbps: int = 40,
         inject_fault: str = "none",
+        corrupt_final_image: bool = False,
     ) -> None:
         self.root = Path(tmp_dir)
         self.rss_bytes = rss_mb * 1024 * 1024
         self.dirty_bps = dirty_mbps * 1024 * 1024
         self.inject_fault = inject_fault
+        self.corrupt_final_image = corrupt_final_image or (inject_fault == "corrupt-image")
 
         self.proc_a = self.root / "proc_a"
         self.proc_b = self.root / "proc_b"
@@ -59,6 +61,17 @@ class DemoClusterNodeSet:
         self._predump_idx = 0
 
         self._populate_synthetic_proc()
+
+        self._run_a = self._make_runner(
+            work_dir=self.work_a,
+            peer_work_dir=self.work_b,
+            is_source=True,
+        )
+        self._run_b = self._make_runner(
+            work_dir=self.work_b,
+            peer_work_dir=self.work_a,
+            is_source=False,
+        )
 
         self.service_a = AgentService(
             work_dir=str(self.work_a),
@@ -113,47 +126,115 @@ class DemoClusterNodeSet:
         ]
         (pid_dir / "pagemap").write_bytes(b"".join(struct.pack("<Q", e) for e in entries))
 
-    def _run_a(self, cmd: List[str]) -> subprocess.CompletedProcess:
-        if len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "pre-dump":
-            idx = cmd.index("--images-dir")
-            img_dir = Path(cmd[idx + 1])
-            size = self.predump_sizes[min(self._predump_idx, len(self.predump_sizes) - 1)]
-            self._predump_idx += 1
-            pages_file = img_dir / "pages-1.img"
-            with pages_file.open("wb") as f:
-                f.truncate(size)
-        elif len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "dump":
-            idx = cmd.index("--images-dir")
-            img_dir = Path(cmd[idx + 1])
-            (img_dir / "core-4242.img").write_bytes(b"DEMO_PROCESS_CONTEXT_REGISTERS")
-        elif len(cmd) >= 1 and cmd[0] == "rsync":
-            # Copy final images (including manifest.sig.json) from work_a to work_b
-            src_arg = cmd[-2].rstrip("/")
-            src_path = Path(src_arg)
-            if src_path.exists() and "work_a" in str(src_path):
-                rel = src_path.relative_to(self.work_a)
-                dst_path = self.work_b / rel
-                dst_path.mkdir(parents=True, exist_ok=True)
-                for item in src_path.iterdir():
-                    if item.is_file() and not item.name.startswith("pages-"):
-                        shutil.copy2(item, dst_path / item.name)
-                if self.inject_fault == "corrupt-image":
-                    corrupted = dst_path / "core-4242.img"
-                    if corrupted.exists():
-                        # Flip 1 byte in-place (preserving file size) to test SHA-256 & Merkle detection
-                        raw = bytearray(corrupted.read_bytes())
-                        raw[0] ^= 0xFF
-                        corrupted.write_bytes(bytes(raw))
-        return subprocess.CompletedProcess(cmd, 0, "CRIU 4.3\n", "")
+    def _make_runner(
+        self,
+        work_dir: Optional[Path] = None,
+        peer_work_dir: Optional[Path] = None,
+        is_source: bool = True,
+    ):
+        if work_dir is None:
+            work_dir = self.work_a if is_source else self.work_b
+        if peer_work_dir is None:
+            peer_work_dir = self.work_b if is_source else self.work_a
 
-    def _run_b(self, cmd: List[str]) -> subprocess.CompletedProcess:
-        if len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "restore":
-            if self.inject_fault == "restore":
-                raise RuntimeError("Injected fault: Destination B CRIU restore failed")
-            if "--pidfile" in cmd:
-                idx = cmd.index("--pidfile")
-                Path(cmd[idx + 1]).write_text("8484\n", encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0, "CRIU 4.3\n", "")
+        def runner(cmd: List[str]) -> subprocess.CompletedProcess:
+            if not cmd:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            if is_source:
+                if cmd[0] == "criu":
+                    action = cmd[1] if len(cmd) > 1 else ""
+                    if action in ("pre-dump", "dump"):
+                        idx = cmd.index("--images-dir")
+                        img_dir = Path(cmd[idx + 1])
+                        img_dir.mkdir(parents=True, exist_ok=True)
+
+                        if action == "pre-dump":
+                            size = self.predump_sizes[min(self._predump_idx, len(self.predump_sizes) - 1)]
+                            self._predump_idx += 1
+                        else:
+                            size = (
+                                max(512 * 1024, int(self.dirty_bps * 0.15))
+                                if self._predump_idx > 0
+                                else self.predump_sizes[0]
+                            )
+
+                        # Create core-1.img and pages-1.img inside img_dir on Host A
+                        core_file = img_dir / "core-1.img"
+                        core_file.write_bytes(b"DEMO_PROCESS_CONTEXT_REGISTERS")
+
+                        pages_file = img_dir / "pages-1.img"
+                        with pages_file.open("wb") as f:
+                            f.truncate(size)
+
+                        # ALSO mirror pages-1.img into the corresponding directory on Host B
+                        # (peer_work_dir / img_dir.relative_to(work_dir)) when --page-server or --lazy-pages is in cmd
+                        if "--page-server" in cmd or "--lazy-pages" in cmd:
+                            try:
+                                rel = img_dir.relative_to(work_dir)
+                            except ValueError:
+                                try:
+                                    rel = img_dir.resolve().relative_to(work_dir.resolve())
+                                except ValueError:
+                                    rel = Path(*img_dir.parts[-2:])
+                            peer_dir = peer_work_dir / rel
+                            peer_dir.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(pages_file, peer_dir / "pages-1.img")
+
+                elif cmd[0] == "rsync":
+                    # Copy all .img files (respecting --exclude=pages-*.img if present in cmd)
+                    # AND manifest.sig.json from the source directory on Host A to the corresponding
+                    # round directory on Host B (work_b / mig_id / round_name).
+                    src_arg = cmd[-2].rstrip("/")
+                    src_path = Path(src_arg)
+                    if src_path.exists():
+                        try:
+                            rel = src_path.relative_to(work_dir)
+                        except ValueError:
+                            try:
+                                rel = src_path.resolve().relative_to(work_dir.resolve())
+                            except ValueError:
+                                rel = Path(*src_path.parts[-2:])
+                        dst_path = peer_work_dir / rel
+                        dst_path.mkdir(parents=True, exist_ok=True)
+
+                        exclude_pages = any(arg.startswith("--exclude=pages-") for arg in cmd)
+                        for item in src_path.iterdir():
+                            if not item.is_file():
+                                continue
+                            if item.name.endswith(".img"):
+                                if exclude_pages and item.name.startswith("pages-"):
+                                    continue
+                                shutil.copy2(item, dst_path / item.name)
+                            elif item.name == "manifest.sig.json":
+                                shutil.copy2(item, dst_path / item.name)
+
+                        # Note: keep the corrupt_final_image hook working! Specifically, if self.corrupt_final_image
+                        # is True, flip a byte in core-1.img on Host B after copying it during rsync so
+                        # restore_process's mandatory verify_directory detects the bit-rot and triggers rollback!
+                        if self.corrupt_final_image or self.inject_fault == "corrupt-image":
+                            corrupted = dst_path / "core-1.img"
+                            if corrupted.exists():
+                                raw = bytearray(corrupted.read_bytes())
+                                if raw:
+                                    raw[0] ^= 0xFF
+                                    corrupted.write_bytes(bytes(raw))
+            else:
+                if len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "restore":
+                    if self.inject_fault == "restore":
+                        raise RuntimeError("Injected fault: Destination B CRIU restore failed")
+                    if "--pidfile" in cmd:
+                        idx = cmd.index("--pidfile")
+                        Path(cmd[idx + 1]).write_text("8484\n", encoding="utf-8")
+
+            return subprocess.CompletedProcess(cmd, 0, "CRIU 4.3\n", "")
+
+        return runner
+
+
+class DemoClusterNodeSet(_SimulatedCluster):
+    """Backward-compatible subclass for _SimulatedCluster."""
+    pass
 
 
 def run_live_demo(
@@ -185,7 +266,7 @@ def run_live_demo(
                 dest_addr=f"{host_b}:{port_b}",
                 strategy=strategy,
                 fs_mode=FilesystemMode.SHARED,
-                ip_mobility=IpMobilityMode.EBPF,
+                ip_mobility=IpMobilityMode.TUNNEL,
                 workload_ip="10.0.0.99/24",
                 tls=TlsConfig(enabled=False),
             )

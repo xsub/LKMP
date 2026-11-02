@@ -1,8 +1,9 @@
-"""Network locking (nftables) and IP mobility drivers (GARP, BGP, Cloud API)."""
+"""Per-migration network locking (nftables) and idempotent IP mobility drivers."""
 
 from __future__ import annotations
 
 import ipaddress
+import re
 import shlex
 import subprocess
 from typing import Callable, List, Optional
@@ -18,9 +19,12 @@ def _default_runner(cmd: List[str]) -> subprocess.CompletedProcess:
 
 
 class NetworkMobilityManager:
-    """Manages nftables TCP packet drop locks and IP mobility across Source A and Destination B."""
+    """
+    Manages per-migration nftables TCP packet drop locks and idempotent IP mobility
+    across Source A and Destination B.
+    """
 
-    NFT_TABLE = "lkmp_migration_lock"
+    NFT_TABLE_PREFIX = "lkmp_lock"
 
     def __init__(self, runner: Optional[CommandRunner] = None) -> None:
         self.runner = runner or _default_runner
@@ -36,24 +40,51 @@ class NetworkMobilityManager:
         addr = ipaddress.ip_address(ip_str)
         return f"{ip_str}/128" if addr.version == 6 else f"{ip_str}/32"
 
-    def lock_network(self, workload_ip: Optional[str]) -> List[List[str]]:
+    @classmethod
+    def table_name_for(cls, workload_ip: str, migration_id: Optional[str] = None) -> str:
         """
-        Install an nftables drop rule for `workload_ip` so the kernel never sends TCP RST
-        while the workload is frozen or mid-switchover.
+        Build a per-migration / per-IP nftables table name so concurrent migrations on the
+        same host never overwrite or delete each other's packet locks.
+        """
+        bare_ip = cls._strip_cidr(workload_ip)
+        safe_ip = re.sub(r"[^A-Za-z0-9_]", "_", bare_ip)
+        if migration_id:
+            safe_id = re.sub(r"[^A-Za-z0-9_]", "_", migration_id)[:24]
+            return f"{cls.NFT_TABLE_PREFIX}_{safe_id}_{safe_ip}"
+        return f"{cls.NFT_TABLE_PREFIX}_{safe_ip}"
+
+    @staticmethod
+    def tunnel_dev_for(migration_id: Optional[str] = None) -> str:
+        """Build a per-migration Linux tunnel interface name (<= 15 chars, IFNAMSIZ)."""
+        if migration_id:
+            suffix = re.sub(r"[^A-Za-z0-9]", "", migration_id)[-8:]
+            return f"lkmp{suffix}"
+        return "lkmp0"
+
+    def lock_network(
+        self,
+        workload_ip: Optional[str],
+        migration_id: Optional[str] = None,
+    ) -> List[List[str]]:
+        """
+        Install an isolated, idempotent nftables drop rule for `workload_ip` so the kernel
+        never sends TCP RST while the workload is frozen or mid-switchover.
         """
         if not workload_ip:
             return []
         bare_ip = self._strip_cidr(workload_ip)
         addr = ipaddress.ip_address(bare_ip)
         addr_family = "ip6" if addr.version == 6 else "ip"
+        table = self.table_name_for(workload_ip, migration_id)
         cmds = [
-            ["nft", "add", "table", "inet", self.NFT_TABLE],
+            ["nft", "add", "table", "inet", table],
+            ["nft", "flush", "table", "inet", table],
             [
                 "nft",
                 "add",
                 "chain",
                 "inet",
-                self.NFT_TABLE,
+                table,
                 "input",
                 "{ type filter hook input priority -100 ; }",
             ],
@@ -62,7 +93,7 @@ class NetworkMobilityManager:
                 "add",
                 "chain",
                 "inet",
-                self.NFT_TABLE,
+                table,
                 "output",
                 "{ type filter hook output priority -100 ; }",
             ],
@@ -71,7 +102,7 @@ class NetworkMobilityManager:
                 "add",
                 "rule",
                 "inet",
-                self.NFT_TABLE,
+                table,
                 "input",
                 addr_family,
                 "daddr",
@@ -83,7 +114,7 @@ class NetworkMobilityManager:
                 "add",
                 "rule",
                 "inet",
-                self.NFT_TABLE,
+                table,
                 "output",
                 addr_family,
                 "saddr",
@@ -91,19 +122,56 @@ class NetworkMobilityManager:
                 "drop",
             ],
         ]
-        for cmd in cmds:
-            self.runner(cmd)
+        try:
+            for cmd in cmds:
+                self.runner(cmd)
+        except Exception:
+            try:
+                self.unlock_network(workload_ip, migration_id)
+            except Exception:
+                pass
+            raise
         return cmds
 
-    def unlock_network(self, workload_ip: Optional[str]) -> List[List[str]]:
-        """Remove the nftables lock table."""
+    def unlock_network(
+        self,
+        workload_ip: Optional[str],
+        migration_id: Optional[str] = None,
+    ) -> List[List[str]]:
+        """Remove the per-migration nftables lock table."""
         if not workload_ip:
             return []
-        cmd = ["nft", "delete", "table", "inet", self.NFT_TABLE]
+        table = self.table_name_for(workload_ip, migration_id)
+        cmd = ["nft", "delete", "table", "inet", table]
+        try:
+            self.runner(cmd)
+        except subprocess.CalledProcessError:
+            pass
+        return [cmd]
+
+    def assign_ip_for_restore(self, config: MigrationConfig) -> List[List[str]]:
+        """
+        Assign `workload_ip` on the target interface BEFORE `criu restore --tcp-established`
+        (using idempotent `ip addr replace`) so CRIU can bind and repair established TCP sockets.
+        """
+        if config.ip_mobility == IpMobilityMode.NONE or not config.workload_ip:
+            return []
+        if config.ip_mobility not in (
+            IpMobilityMode.GARP,
+            IpMobilityMode.BGP,
+            IpMobilityMode.TUNNEL,
+        ):
+            return []
+        cidr = self._ensure_cidr(config.workload_ip)
+        cmd = ["ip", "addr", "replace", cidr, "dev", config.net_interface]
         self.runner(cmd)
         return [cmd]
 
-    def release_ip_on_host(self, config: MigrationConfig) -> List[List[str]]:
+    def release_ip_on_host(
+        self,
+        config: MigrationConfig,
+        migration_id: Optional[str] = None,
+    ) -> List[List[str]]:
         """Remove the workload IP and/or withdraw BGP route on a host."""
         if config.ip_mobility == IpMobilityMode.NONE or not config.workload_ip:
             return []
@@ -113,22 +181,26 @@ class NetworkMobilityManager:
         addr = ipaddress.ip_address(bare_ip)
         cmds: List[List[str]] = []
 
-        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.BGP, IpMobilityMode.EBPF):
+        if config.ip_mobility in (
+            IpMobilityMode.GARP,
+            IpMobilityMode.BGP,
+            IpMobilityMode.TUNNEL,
+        ):
             cmds.append(["ip", "addr", "del", cidr, "dev", config.net_interface])
 
         if config.ip_mobility == IpMobilityMode.BGP:
             af = "ipv6" if addr.version == 6 else "ipv4"
             host_route = f"{bare_ip}/128" if addr.version == 6 else f"{bare_ip}/32"
             cmds.append(["gobgp", "global", "rib", "del", "-a", af, host_route])
-        elif config.ip_mobility == IpMobilityMode.EBPF:
+        elif config.ip_mobility == IpMobilityMode.TUNNEL:
             dest_host = config.dest_addr.split(":", 1)[0]
             host_route = f"{bare_ip}/128" if addr.version == 6 else f"{bare_ip}/32"
-            # Set up zero-drop tunnel/TC forwarding on Source A so in-flight packets reach B
+            tun_dev = self.tunnel_dev_for(migration_id)
             cmds.extend(
                 [
-                    ["ip", "tunnel", "add", "lkmp0", "mode", "ipip", "remote", dest_host],
-                    ["ip", "link", "set", "lkmp0", "up"],
-                    ["ip", "route", "replace", host_route, "dev", "lkmp0"],
+                    ["ip", "tunnel", "add", tun_dev, "mode", "ipip", "remote", dest_host],
+                    ["ip", "link", "set", tun_dev, "up"],
+                    ["ip", "route", "replace", host_route, "dev", tun_dev],
                 ]
             )
 
@@ -136,8 +208,16 @@ class NetworkMobilityManager:
             self.runner(cmd)
         return cmds
 
-    def claim_ip_on_host(self, config: MigrationConfig, target_host: str) -> List[List[str]]:
-        """Assign the workload IP and announce its new location via GARP, BGP, eBPF, or Cloud API."""
+    def announce_ip_on_host(
+        self,
+        config: MigrationConfig,
+        target_host: str,
+        ensure_assigned: bool = True,
+    ) -> List[List[str]]:
+        """
+        Ensure the workload IP is present on `target_host` and announce its location via
+        Gratuitous ARP (L2), BGP /32 route (L3), or Cloud API webhook.
+        """
         if config.ip_mobility == IpMobilityMode.NONE or not config.workload_ip:
             return []
 
@@ -146,10 +226,14 @@ class NetworkMobilityManager:
         addr = ipaddress.ip_address(bare_ip)
         cmds: List[List[str]] = []
 
-        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.BGP, IpMobilityMode.EBPF):
-            cmds.append(["ip", "addr", "add", cidr, "dev", config.net_interface])
+        if ensure_assigned and config.ip_mobility in (
+            IpMobilityMode.GARP,
+            IpMobilityMode.BGP,
+            IpMobilityMode.TUNNEL,
+        ):
+            cmds.append(["ip", "addr", "replace", cidr, "dev", config.net_interface])
 
-        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.EBPF):
+        if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.TUNNEL):
             if addr.version == 6:
                 cmds.append(["ndsend", bare_ip, config.net_interface])
             else:
@@ -171,3 +255,7 @@ class NetworkMobilityManager:
         for cmd in cmds:
             self.runner(cmd)
         return cmds
+
+    def claim_ip_on_host(self, config: MigrationConfig, target_host: str) -> List[List[str]]:
+        """Backward-compatible alias for `announce_ip_on_host`."""
+        return self.announce_ip_on_host(config, target_host=target_host, ensure_assigned=True)

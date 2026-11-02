@@ -30,8 +30,18 @@ class IpMobilityMode(str, Enum):
     NONE = "none"            # Do not move IP (e.g., clients reconnect to new host)
     GARP = "garp"            # L2 Gratuitous ARP (IPv4) / Unsolicited NA (IPv6)
     BGP = "bgp"              # L3 BGP /32 route announce on B and withdraw on A
-    EBPF = "ebpf"            # Zero-drop eBPF/IPIP tunnel hairpin redirect from A -> B + GARP
+    TUNNEL = "tunnel"        # IPIP /32 tunnel forwarding from A -> B during switchover + GARP
     CLOUD = "cloud"          # Custom cloud secondary-IP reassignment webhook/command
+    EBPF = "tunnel"          # Backward compatibility alias
+    ARP = "garp"             # Backward compatibility alias
+
+    @classmethod
+    def _missing_(cls, value: object) -> Optional[IpMobilityMode]:
+        if value in ("ebpf", "tunnel"):
+            return cls.TUNNEL
+        if value in ("arp", "garp"):
+            return cls.GARP
+        return None
 
 
 class GpuPlugin(str, Enum):
@@ -95,6 +105,17 @@ class MigrationConfig:
     target_downtime_ms: int = 200
     min_shrink_ratio: float = 0.10
     estimated_bandwidth_mbps: float = 1000.0
+    allow_hybrid_upgrade: bool = True
+
+    # Storage & volume snapshot hooks
+    volume_snapshot_cmd: Optional[str] = None
+    volume_restore_cmd: Optional[str] = None
+    same_host_cow: bool = True
+
+    # Portability & active verification
+    active_sample_ms: int = 0
+    check_only: bool = False
+    trial_restore: bool = False
 
     # CRIU & storage settings
     work_dir: str = "/var/lib/lkmp/migrations"
@@ -107,6 +128,11 @@ class MigrationConfig:
     # Verification & security
     health_check_cmd: Optional[str] = None
     health_check_timeout_sec: float = 5.0
+    quiesce_cmd: Optional[str] = None
+    resume_cmd: Optional[str] = None
+    quiesce_timeout_sec: float = 10.0
+    journal_dir: Optional[str] = "/var/lib/lkmp/journals"
     verify_attestation: bool = True
+    attestation_key_hex: Optional[str] = None
     wipe_images_on_commit: bool = True
     tls: TlsConfig = field(default_factory=TlsConfig)

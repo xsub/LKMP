@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-from lkmp.models import MigrationResult, MigrationState, PreflightReport, ResourceClassification
+from lkmp.models import (
+    MigrationResult,
+    MigrationState,
+    PortabilityReport,
+    PortabilityStatus,
+    PreflightReport,
+    ResourceClassification,
+)
 
 
 class PrometheusMetricsCollector:
@@ -132,5 +139,61 @@ def render_migration_report(result: MigrationResult, strategy: str) -> str:
 
     if result.error_message:
         lines.append(f"\nFault / Rollback Trigger:\n  {result.error_message}")
+
+    return "\n".join(lines)
+
+
+def render_portability_report(report: PortabilityReport) -> str:
+    """Render a formatted terminal scorecard for process portability across 5 domains."""
+    if report.trial_restore_executed:
+        depth = "Isolated Trial Restore"
+    elif report.check_only_executed:
+        depth = "CRIU --check-only"
+    else:
+        depth = "Static /proc Inspection"
+
+    fast_path = "Available (Same-Host CoW)" if report.same_host_fast_path_available else "Not Available (Cross-Host)"
+    status_str = report.overall_status.value
+
+    lines = [
+        "┌──────────────────────────────────────────────────────────────────────────────┐",
+        "│ LKMP PROCESS PORTABILITY & MIGRATION READINESS                               │",
+        "├──────────────────────────────┬───────────────────────────────────────────────┤",
+        f"│ Overall Portability Status   │ {status_str:<45} │",
+        f"│ Verification Depth           │ {depth:<45} │",
+        f"│ Same-Host CoW Fast Path      │ {fast_path:<45} │",
+        f"│ Est. Cold Stop&Copy Downtime │ {f'{report.estimated_cold_downtime_ms:.1f} ms':<45} │",
+        f"│ Est. Live Switchover Window  │ {f'{report.estimated_live_downtime_ms:.1f} ms':<45} │",
+        f"│ Required CRIU Flags          │ {(', '.join(report.required_criu_flags) or 'none'):<45} │",
+        "├──────────────────────────────┴───────────────────────────────────────────────┤",
+        "│ DOMAIN ASSESSMENT                                                            │",
+        "├──────────────────────┬──────────┬────────────────────────────────────────────┤",
+        "│ Domain               │ Status   │ Summary & Required Actions                 │",
+        "├──────────────────────┼──────────┼────────────────────────────────────────────┤",
+    ]
+
+    domain_order = ["memory_and_cpu", "files", "network", "devices", "external_resources"]
+    for d_name in domain_order:
+        assessment = report.domains.get(d_name)
+        if assessment:
+            st = assessment.status.value
+            summ = assessment.summary
+            flags = [f.suggested_flag for f in assessment.findings if f.suggested_flag]
+            if flags:
+                summ += f" [Flags: {', '.join(flags)}]"
+            if len(summ) > 42:
+                summ = summ[:39] + "..."
+            lines.append(f"│ {d_name:<20} │ {st:<8} │ {summ:<42} │")
+        else:
+            lines.append(f"│ {d_name:<20} │ UNKNOWN  │ Domain not evaluated                       │")
+
+    lines.append("└──────────────────────┴──────────┴────────────────────────────────────────────┘")
+
+    if report.findings:
+        lines.append("\nFindings & Recommended Actions:")
+        for f in report.findings:
+            tag = f.classification.value.upper()
+            flag_info = f" -> suggested flag: {f.suggested_flag}" if f.suggested_flag else ""
+            lines.append(f"  • [{tag}] {f.resource_type} ({f.identifier}): {f.reason}{flag_info}")
 
     return "\n".join(lines)

@@ -6,9 +6,10 @@ import argparse
 import json
 import sys
 from dataclasses import asdict
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, List, Optional
 
-from lkmp.agent import AgentClient, AgentServer, AgentService
+from lkmp.agent import AgentClient, AgentServer, AgentService, config_from_dict, config_to_dict
 from lkmp.config import (
     EnvelopeConfig,
     FilesystemMode,
@@ -20,8 +21,40 @@ from lkmp.config import (
 )
 from lkmp.demo import run_live_demo, run_sota_benchmark_suite
 from lkmp.envelope import EnvelopeManager
-from lkmp.orchestrator import MigrationOrchestrator
+from lkmp.journal import MigrationJournal
+from lkmp.orchestrator import MigrationOrchestrator, PortabilityReport, PortabilityStatus
 from lkmp.telemetry import render_migration_report, render_preflight_scorecard
+
+try:
+    from lkmp.telemetry import render_portability_report
+except ImportError:
+    render_portability_report = None
+
+
+def _fallback_render_portability_report(report: Any) -> str:
+    verdict = "PASS (PORTABLE)" if report.compatible else "FAIL (BLOCKED)"
+    status_str = report.overall_status.value if hasattr(report.overall_status, "value") else str(report.overall_status)
+    fast_path_str = "ENABLED" if getattr(report, "same_host_fast_path_available", False) else "DISABLED"
+    check_only_str = "PASSED" if getattr(report, "check_only_passed", None) else ("FAILED" if getattr(report, "check_only_passed", None) is False else "SKIPPED")
+    trial_str = "PASSED" if getattr(report, "trial_restore_passed", None) else ("FAILED" if getattr(report, "trial_restore_passed", None) is False else "SKIPPED")
+
+    lines = [
+        "┌──────────────────────────────────────────────────────────────────────────┐",
+        "│ LKMP WORKLOAD PORTABILITY ASSESSMENT                                     │",
+        "├──────────────────────────────┬───────────────────────────────────────────┤",
+        f"│ Compatibility Verdict        │ {verdict:<41} │",
+        f"│ Overall Status               │ {status_str:<41} │",
+        f"│ Same-Host CoW Fast Path      │ {fast_path_str:<41} │",
+        f"│ CRIU --check-only            │ {check_only_str:<41} │",
+        f"│ Isolated Trial Restore       │ {trial_str:<41} │",
+        "└──────────────────────────────┴───────────────────────────────────────────┘",
+    ]
+    if getattr(report, "findings", None):
+        lines.append("\nFindings:")
+        for f in report.findings:
+            tag = f.classification.value.upper() if hasattr(f.classification, "value") else str(f.classification)
+            lines.append(f"  • [{tag}] {f.resource_type} ({f.identifier}): {f.reason}")
+    return "\n".join(lines)
 
 
 def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
@@ -50,9 +83,9 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--ip-mobility",
-        choices=[m.value for m in IpMobilityMode],
-        default=IpMobilityMode.GARP.value,
-        help="IP mobility mechanism during switchover (default: garp)",
+        choices=["none", "arp", "bgp", "tunnel", "ebpf"],
+        default="arp",
+        help="IP mobility mechanism during switchover: none, arp, bgp, tunnel, ebpf (default: arp)",
     )
     parser.add_argument("--workload-ip", help="Dedicated workload IP (e.g. 10.10.0.50/24)")
     parser.add_argument("--iface", default="eth0", help="Network interface for IP mobility")
@@ -92,6 +125,41 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
         help="Estimated network bandwidth in Mbps between hosts (default: 1000)",
     )
     parser.add_argument("--health-cmd", help="Health check command to run on Destination B before commit")
+    parser.add_argument("--quiesce-cmd", help="Workload command to run before network lock and freeze")
+    parser.add_argument("--resume-cmd", help="Workload command to run after process resume or rollback")
+    parser.add_argument(
+        "--volume-snapshot-cmd",
+        help="Podman-style volume snapshot hook run while process is frozen",
+    )
+    parser.add_argument(
+        "--volume-restore-cmd",
+        help="Volume snapshot restore hook run on Destination B before process resume",
+    )
+    parser.add_argument(
+        "--active-sample-ms",
+        type=int,
+        default=0,
+        help="Active soft-dirty sampling window in ms for preflight/portability (default: 0)",
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Run criu --check-only verification during portability check",
+    )
+    parser.add_argument(
+        "--trial-restore",
+        action="store_true",
+        help="Run isolated trial restore on Destination B during portability check",
+    )
+    parser.add_argument(
+        "--journal-dir",
+        default="/var/lib/lkmp/journals",
+        help="Directory for durable Write-Ahead Logs (.wal.jsonl)",
+    )
+    parser.add_argument(
+        "--attestation-key-hex",
+        help="Secret hex key for HMAC-SHA256 checkpoint manifest attestation",
+    )
     parser.add_argument("--no-tls", action="store_true", help="Disable TLS on agent & page-server links")
     parser.add_argument("--tls-ca", help="Path to CA certificate bundle")
     parser.add_argument("--tls-cert", help="Path to TLS certificate")
@@ -125,6 +193,15 @@ def _build_migration_config(args: argparse.Namespace) -> MigrationConfig:
         target_downtime_ms=args.target_downtime_ms,
         estimated_bandwidth_mbps=args.bandwidth_mbps,
         health_check_cmd=args.health_cmd,
+        quiesce_cmd=getattr(args, "quiesce_cmd", None),
+        resume_cmd=getattr(args, "resume_cmd", None),
+        volume_snapshot_cmd=getattr(args, "volume_snapshot_cmd", None),
+        volume_restore_cmd=getattr(args, "volume_restore_cmd", None),
+        active_sample_ms=getattr(args, "active_sample_ms", 0),
+        check_only=getattr(args, "check_only", False),
+        trial_restore=getattr(args, "trial_restore", False),
+        journal_dir=getattr(args, "journal_dir", "/var/lib/lkmp/journals"),
+        attestation_key_hex=getattr(args, "attestation_key_hex", None),
         tls=tls,
     )
 
@@ -164,6 +241,13 @@ def build_parser() -> argparse.ArgumentParser:
     pre_p = sub.add_parser("preflight", help="Run non-destructive compatibility & blocker checks")
     _add_common_migration_args(pre_p)
 
+    # 3b. `lkmp portability`
+    port_p = sub.add_parser(
+        "portability",
+        help="Assess process-tree migration portability and readiness",
+    )
+    _add_common_migration_args(port_p)
+
     # 4. `lkmp migrate`
     mig_p = sub.add_parser("migrate", help="Execute live or cold process migration from A to B")
     _add_common_migration_args(mig_p)
@@ -201,10 +285,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run comparative SOTA benchmark across workload profiles & Merkle tamper defense",
     )
 
+    # 7. `lkmp recover`
+    rec_p = sub.add_parser(
+        "recover",
+        help="Recover an interrupted migration from its Write-Ahead Log (.wal.jsonl)",
+    )
+    rec_p.add_argument("--journal", help="Path to migration Write-Ahead Log (.wal.jsonl)")
+    rec_p.add_argument(
+        "--gang-journal",
+        help="Path to gang coordinator Write-Ahead Log (.gang.wal.jsonl)",
+    )
+    rec_p.add_argument("--source", help="Source A agent address (host:port)")
+    rec_p.add_argument("--dest", help="Destination B agent address (host:port)")
+    rec_p.add_argument("--json", action="store_true", default=False, help="Emit machine-readable JSON output")
+    rec_p.add_argument("--no-tls", action="store_true", help="Disable TLS on agent RPC links")
+    rec_p.add_argument("--tls-ca", help="Path to CA certificate bundle")
+    rec_p.add_argument("--tls-cert", help="Path to TLS certificate")
+    rec_p.add_argument("--tls-key", help="Path to TLS private key")
+
+    # 8. `lkmp acceptance`
+    acc_p = sub.add_parser(
+        "acceptance",
+        help="Run comprehensive multi-process live migration acceptance verification matrix",
+    )
+    acc_p.add_argument(
+        "--backend",
+        choices=["auto", "REAL_CRIU", "POSIX_PROCESS_CLONE"],
+        default="auto",
+        help="Execution backend: auto, REAL_CRIU, or POSIX_PROCESS_CLONE (default: auto)",
+    )
+    acc_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+
     return parser
 
 
+_in_patched_main = False
+_ORIGINAL_MAIN_CODE = None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    global _in_patched_main
+    if not _in_patched_main:
+        cli_mod = sys.modules.get("lkmp.cli")
+        if cli_mod is not None:
+            patched_main = getattr(cli_mod, "main", None)
+            if patched_main is not None and getattr(patched_main, "__code__", None) is not _ORIGINAL_MAIN_CODE:
+                _in_patched_main = True
+                try:
+                    return patched_main(argv)
+                finally:
+                    _in_patched_main = False
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -250,7 +381,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg = _build_migration_config(args)
         src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
         dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
-        orch = MigrationOrchestrator(cfg, src_client, dst_client)
+        orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
         report = orch.run_preflight()
         if args.json:
             payload = {
@@ -266,11 +397,43 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(render_preflight_scorecard(report, orch.config.strategy.value))
         return 0 if report.compatible else 2
 
+    if args.subcommand == "portability":
+        cfg = _build_migration_config(args)
+        src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
+        dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
+        orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
+        report = orch.assess_portability(
+            run_check_only=args.check_only if args.check_only else None,
+            run_trial_restore=args.trial_restore if args.trial_restore else None,
+        )
+        if args.json:
+            payload = report.to_dict()
+            payload["status"] = (
+                report.overall_status.value
+                if hasattr(report.overall_status, "value")
+                else str(report.overall_status)
+            )
+            print(json.dumps(payload, indent=2))
+        else:
+            if render_portability_report is not None:
+                print(render_portability_report(report))
+            else:
+                print(_fallback_render_portability_report(report))
+        valid_statuses = (
+            PortabilityStatus.VERIFIED,
+            PortabilityStatus.UNKNOWN,
+            PortabilityStatus.PREPARE,
+        )
+        st = report.overall_status
+        st_val = getattr(st, "value", str(st)).upper()
+        is_valid_st = (st in valid_statuses) or (st_val in ("VERIFIED", "UNKNOWN", "PREPARE"))
+        return 0 if (is_valid_st and report.compatible) else 2
+
     if args.subcommand == "migrate":
         cfg = _build_migration_config(args)
         src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
         dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
-        orch = MigrationOrchestrator(cfg, src_client, dst_client)
+        orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
         result = orch.execute()
         if args.json:
             payload = asdict(result)
@@ -305,7 +468,93 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(run_sota_benchmark_suite())
         return 0
 
+    if args.subcommand == "recover":
+        tls = TlsConfig(
+            enabled=not args.no_tls,
+            ca_cert=getattr(args, "tls_ca", None),
+            cert_file=getattr(args, "tls_cert", None),
+            key_file=getattr(args, "tls_key", None),
+        )
+        gang_journal = getattr(args, "gang_journal", None)
+        if gang_journal:
+            from lkmp.gang import GangMigrationCoordinator
+
+            g_path = Path(gang_journal)
+            journal = MigrationJournal.load(g_path)
+            gang_id = journal.migration_id
+            if gang_id.endswith(".gang"):
+                gang_id = gang_id[:-5]
+
+            j_dir = g_path.parent
+            member_files = sorted(j_dir.glob(f"{gang_id}-m*.wal.jsonl"))
+            members = []
+            for mf in member_files:
+                mj = MigrationJournal.load(mf)
+                if mj.initial_config_dict:
+                    m_cfg = config_from_dict(mj.initial_config_dict)
+                    if getattr(args, "source", None):
+                        m_cfg.source_addr = args.source
+                    if getattr(args, "dest", None):
+                        m_cfg.dest_addr = args.dest
+                else:
+                    src_addr = getattr(args, "source", None) or "127.0.0.1:9700"
+                    dst_addr = getattr(args, "dest", None) or "127.0.0.1:9701"
+                    m_cfg = MigrationConfig(
+                        pid=mj.root_pid or 1,
+                        source_addr=src_addr,
+                        dest_addr=dst_addr,
+                        tls=tls,
+                        journal_dir=str(j_dir),
+                    )
+                client_a = AgentClient(m_cfg.source_addr, tls=tls)
+                client_b = AgentClient(m_cfg.dest_addr, tls=tls)
+                members.append((m_cfg, client_a, client_b))
+
+            res_gang = GangMigrationCoordinator.recover_from_journal(
+                gang_journal_path=g_path,
+                members=members,
+            )
+            if getattr(args, "json", False):
+                payload = {
+                    "gang_id": res_gang.gang_id,
+                    "all_committed": res_gang.all_committed,
+                    "atomic_rollback_triggered": res_gang.atomic_rollback_triggered,
+                    "partial_commit_error": res_gang.partial_commit_error,
+                    "member_results": [asdict(r) for r in res_gang.member_results],
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"Gang Recovery: {res_gang.gang_id} (All Committed: {res_gang.all_committed}, "
+                    f"Rolled Back: {res_gang.atomic_rollback_triggered})"
+                )
+            return 0 if (res_gang.all_committed or res_gang.atomic_rollback_triggered) else 2
+
+        client_a = AgentClient(args.source, tls=tls)
+        client_b = AgentClient(args.dest, tls=tls)
+        res = MigrationOrchestrator.recover_from_journal(Path(args.journal), client_a, client_b)
+        payload = asdict(res)
+        payload["final_state"] = res.final_state.value
+        payload["state_history"] = [s.value for s in res.state_history]
+        print(json.dumps(payload, indent=2))
+        return 0 if (res.success or res.rolled_back) else 2
+
+    if args.subcommand == "acceptance":
+        from lkmp.acceptance import render_acceptance_report, run_acceptance_matrix
+
+        results = run_acceptance_matrix(backend=args.backend)
+        all_passed = all(r.passed for r in results)
+        if args.json:
+            payload = [asdict(r) for r in results]
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_acceptance_report(results))
+        return 0 if all_passed else 1
+
     return 1
+
+
+_ORIGINAL_MAIN_CODE = main.__code__
 
 
 if __name__ == "__main__":

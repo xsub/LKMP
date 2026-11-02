@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from lkmp.config import GpuPlugin, MigrationConfig, MigrationStrategy, TlsConfig
 
@@ -28,6 +29,7 @@ class CriuDriver:
         self.criu_bin = criu_bin
         self.cuda_checkpoint_bin = cuda_checkpoint_bin
         self.runner = runner or _default_runner
+        self._daemons: Dict[str, subprocess.Popen] = {}
 
     @staticmethod
     def _tls_args(tls: TlsConfig) -> List[str]:
@@ -50,6 +52,15 @@ class CriuDriver:
             cmd.append("--all")
         return cmd
 
+    def build_check_extra_cmd(self) -> List[str]:
+        return [self.criu_bin, "check", "--extra"]
+
+    def build_check_feature_cmd(self, feature: str) -> List[str]:
+        return [self.criu_bin, "check", "--feature", feature]
+
+    def build_check_only_cmd(self, pid: int, images_dir: str) -> List[str]:
+        return [self.criu_bin, "pre-dump", "-t", str(pid), "--images-dir", str(images_dir), "--check-only"]
+
     def build_cpuinfo_dump_cmd(self, images_dir: str) -> List[str]:
         return [self.criu_bin, "cpuinfo", "dump", "--images-dir", images_dir]
 
@@ -62,10 +73,19 @@ class CriuDriver:
         port: int,
         tls: TlsConfig,
         prev_images_dir: Optional[str] = None,
+        pidfile: Optional[str] = None,
     ) -> List[str]:
+        """
+        Build `criu page-server --daemon` command so the RPC call returns immediately
+        while the page-server listens in the background for incoming pages from Source A.
+        """
+        resolved_pidfile = pidfile or str(Path(images_dir) / "page-server.pid")
         cmd = [
             self.criu_bin,
             "page-server",
+            "--daemon",
+            "--pidfile",
+            resolved_pidfile,
             "--images-dir",
             images_dir,
             "--port",
@@ -170,6 +190,11 @@ class CriuDriver:
         images_dir: str,
         source_host: str,
     ) -> List[str]:
+        """
+        Build `criu lazy-pages` command for background userfaultfd service.
+        Note: --daemon and --pidfile are omitted as CRIU only supports --daemon on page-server and service;
+        the orchestrator/agent supervises lazy-pages via run_background_daemon.
+        """
         cmd = [
             self.criu_bin,
             "lazy-pages",
@@ -183,6 +208,76 @@ class CriuDriver:
         ]
         cmd.extend(self._tls_args(config.tls))
         return cmd
+
+    def run_background_daemon(
+        self,
+        cmd: List[str],
+        pidfile: str | Path,
+        log_file: Optional[str | Path] = None,
+    ) -> int:
+        """
+        Supervise and launch a background daemon (such as CRIU dump with --lazy-pages or lazy-pages daemon).
+        If runner is not _default_runner, calls runner(cmd) and writes synthetic PID.
+        Otherwise spawns via subprocess.Popen, verifies it did not exit immediately with error, writes pidfile,
+        and tracks proc in self._daemons.
+        """
+        pidfile_path = Path(pidfile)
+        pidfile_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.runner is not _default_runner:
+            self.runner(cmd)
+            if not pidfile_path.exists():
+                pidfile_path.write_text("9001\n", encoding="utf-8")
+            try:
+                return int(pidfile_path.read_text(encoding="utf-8").strip())
+            except ValueError:
+                return 9001
+
+        stdout_dest = subprocess.DEVNULL
+        stderr_dest = subprocess.DEVNULL
+        if log_file:
+            log_p = Path(log_file)
+            log_p.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = open(log_p, "a", encoding="utf-8")
+            stdout_dest = log_handle
+            stderr_dest = log_handle
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_dest,
+            stderr=stderr_dest,
+            start_new_session=True,
+        )
+        time.sleep(0.05)
+        rc = proc.poll()
+        if rc is not None and rc != 0:
+            raise RuntimeError(
+                f"Background daemon {' '.join(cmd)} failed immediately with returncode {rc}"
+            )
+
+        pidfile_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+        self._daemons[str(pidfile_path)] = proc
+        return proc.pid
+
+    def stop_daemon(self, pidfile: str | Path) -> None:
+        """Terminate and clean up a supervised background daemon."""
+        p_str = str(pidfile)
+        proc = self._daemons.pop(p_str, None)
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        p_path = Path(pidfile)
+        if p_path.exists():
+            try:
+                p_path.unlink()
+            except OSError:
+                pass
 
     def build_restore_cmd(
         self,

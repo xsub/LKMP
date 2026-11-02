@@ -222,6 +222,7 @@ flags       : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr avx avx2 bmi1 bmi
                 cpu_vendor="GenuineIntel",
                 cpu_flags={"avx2"},
                 has_soft_dirty=True,
+                criu_available=True,
             )
 
             cfg_no_gpu = MigrationConfig(

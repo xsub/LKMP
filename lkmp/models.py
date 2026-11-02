@@ -25,12 +25,23 @@ class MigrationState(str, Enum):
     ROLLBACK = "ROLLBACK"
 
 
+class PortabilityStatus(str, Enum):
+    """Four-state portability confidence level across migration domains."""
+
+    BLOCKED = "BLOCKED"
+    PREPARE = "PREPARE"
+    NEEDS_PREPARATION = "PREPARE"  # Alias
+    UNKNOWN = "UNKNOWN"
+    VERIFIED = "VERIFIED"
+
+
 class ResourceClassification(str, Enum):
     """Classification of a process resource discovered during preflight."""
 
     OK = "ok"
     NEEDS_FLAG = "needs_flag"
     BLOCKER = "blocker"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -88,6 +99,9 @@ class HostCapabilities:
     has_soft_dirty: bool = False
     has_time_ns: bool = False
     has_cgroup_v2: bool = False
+    criu_check_extra_ok: Optional[bool] = None
+    criu_checked_features: Dict[str, bool] = field(default_factory=dict)
+    host_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -98,6 +112,7 @@ class HostCapabilities:
     def from_dict(cls, data: Dict[str, Any]) -> HostCapabilities:
         d = dict(data)
         d["cpu_flags"] = set(d.get("cpu_flags", []))
+        d["criu_checked_features"] = dict(d.get("criu_checked_features", {}))
         return cls(**d)
 
 
@@ -113,6 +128,7 @@ class ProcessSnapshotInfo:
     findings: List[ResourceFinding] = field(default_factory=list)
     in_envelope: bool = False
     cgroup_path: Optional[str] = None
+    dirty_rate_actively_sampled: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -124,6 +140,7 @@ class ProcessSnapshotInfo:
             "findings": [f.to_dict() for f in self.findings],
             "in_envelope": self.in_envelope,
             "cgroup_path": self.cgroup_path,
+            "dirty_rate_actively_sampled": self.dirty_rate_actively_sampled,
         }
 
     @classmethod
@@ -137,7 +154,108 @@ class ProcessSnapshotInfo:
             findings=[ResourceFinding.from_dict(f) for f in data.get("findings", [])],
             in_envelope=bool(data.get("in_envelope", False)),
             cgroup_path=data.get("cgroup_path"),
+            dirty_rate_actively_sampled=bool(data.get("dirty_rate_actively_sampled", False)),
         )
+
+
+@dataclass
+class DomainPortabilityAssessment:
+    """Portability evaluation for one of the 5 migration domains."""
+
+    domain: str  # "memory_and_cpu" | "files" | "network" | "devices" | "external_resources"
+    status: PortabilityStatus
+    summary: str
+    findings: List[ResourceFinding] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "domain": self.domain,
+            "status": self.status.value,
+            "summary": self.summary,
+            "findings": [f.to_dict() for f in self.findings],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> DomainPortabilityAssessment:
+        return cls(
+            domain=data["domain"],
+            status=PortabilityStatus(data["status"]),
+            summary=data.get("summary", ""),
+            findings=[ResourceFinding.from_dict(f) for f in data.get("findings", [])],
+        )
+
+
+@dataclass
+class PortabilityReport:
+    """Comprehensive 4-state portability report across all 5 domains."""
+
+    overall_status: PortabilityStatus
+    compatible: bool
+    domains: Dict[str, DomainPortabilityAssessment] = field(default_factory=dict)
+    estimated_cold_downtime_ms: float = 0.0
+    estimated_live_downtime_ms: float = 0.0
+    required_criu_flags: List[str] = field(default_factory=list)
+    findings: List[ResourceFinding] = field(default_factory=list)
+    check_only_executed: bool = False
+    trial_restore_executed: bool = False
+    same_host_fast_path_available: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "overall_status": self.overall_status.value,
+            "compatible": self.compatible,
+            "domains": {k: v.to_dict() for k, v in self.domains.items()},
+            "estimated_cold_downtime_ms": self.estimated_cold_downtime_ms,
+            "estimated_live_downtime_ms": self.estimated_live_downtime_ms,
+            "required_criu_flags": list(self.required_criu_flags),
+            "findings": [f.to_dict() for f in self.findings],
+            "check_only_executed": self.check_only_executed,
+            "trial_restore_executed": self.trial_restore_executed,
+            "same_host_fast_path_available": self.same_host_fast_path_available,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> PortabilityReport:
+        return cls(
+            overall_status=PortabilityStatus(data["overall_status"]),
+            compatible=bool(data["compatible"]),
+            domains={
+                k: DomainPortabilityAssessment.from_dict(v)
+                for k, v in data.get("domains", {}).items()
+            },
+            estimated_cold_downtime_ms=float(data.get("estimated_cold_downtime_ms", 0.0)),
+            estimated_live_downtime_ms=float(data.get("estimated_live_downtime_ms", 0.0)),
+            required_criu_flags=list(data.get("required_criu_flags", [])),
+            findings=[ResourceFinding.from_dict(f) for f in data.get("findings", [])],
+            check_only_executed=bool(data.get("check_only_executed", False)),
+            trial_restore_executed=bool(data.get("trial_restore_executed", False)),
+            same_host_fast_path_available=bool(data.get("same_host_fast_path_available", False)),
+        )
+
+    @property
+    def blockers(self) -> List[ResourceFinding]:
+        return [
+            f for f in self.findings
+            if f.classification == ResourceClassification.BLOCKER
+        ]
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, (PortabilityStatus, str)):
+            return self.overall_status.value == (other.value if isinstance(other, PortabilityStatus) else other)
+        if isinstance(other, PortabilityReport):
+            return (
+                self.overall_status == other.overall_status
+                and self.compatible == other.compatible
+                and self.domains == other.domains
+                and self.estimated_cold_downtime_ms == other.estimated_cold_downtime_ms
+                and self.estimated_live_downtime_ms == other.estimated_live_downtime_ms
+                and self.required_criu_flags == other.required_criu_flags
+                and self.findings == other.findings
+                and self.check_only_executed == other.check_only_executed
+                and self.trial_restore_executed == other.trial_restore_executed
+                and self.same_host_fast_path_available == other.same_host_fast_path_available
+            )
+        return False
 
 
 @dataclass
@@ -149,6 +267,8 @@ class PreflightReport:
     estimated_live_downtime_ms: float
     required_criu_flags: List[str] = field(default_factory=list)
     findings: List[ResourceFinding] = field(default_factory=list)
+    portability_status: PortabilityStatus = PortabilityStatus.UNKNOWN
+    domains: Dict[str, DomainPortabilityAssessment] = field(default_factory=dict)
 
     @property
     def blockers(self) -> List[ResourceFinding]:

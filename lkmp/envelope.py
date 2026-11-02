@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -61,17 +62,46 @@ class EnvelopeManager:
             procs_file.write_text(f"{pid}\n", encoding="utf-8")
         return cg_path
 
-    def freeze_cgroup(self, workload_id: str) -> None:
+    def freeze_cgroup(self, workload_id: str, timeout_sec: float = 5.0) -> Optional[Path]:
         """Atomically freeze all processes in the workload's cgroup v2 (`cgroup.freeze = 1`)."""
-        freeze_file = self.cgroup_root / workload_id / "cgroup.freeze"
-        if freeze_file.parent.exists():
-            freeze_file.write_text("1\n", encoding="utf-8")
+        cg_dir = self.cgroup_root / workload_id
+        freeze_file = cg_dir / "cgroup.freeze"
+        if not freeze_file.parent.exists():
+            return None
+        freeze_file.write_text("1\n", encoding="utf-8")
+        events_file = cg_dir / "cgroup.events"
+        if events_file.exists():
+            deadline = time.monotonic() + timeout_sec
+            while time.monotonic() < deadline:
+                try:
+                    for line in events_file.read_text(encoding="utf-8").splitlines():
+                        if line.strip() == "frozen 1":
+                            return cg_dir
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            raise TimeoutError(f"cgroup v2 for workload {workload_id} did not freeze within {timeout_sec}s")
+        return cg_dir if freeze_file.exists() else None
 
-    def unfreeze_cgroup(self, workload_id: str) -> None:
+    def unfreeze_cgroup(self, workload_id: str, timeout_sec: float = 5.0) -> None:
         """Atomically thaw all processes in the workload's cgroup v2 (`cgroup.freeze = 0`)."""
-        freeze_file = self.cgroup_root / workload_id / "cgroup.freeze"
-        if freeze_file.parent.exists():
-            freeze_file.write_text("0\n", encoding="utf-8")
+        cg_dir = self.cgroup_root / workload_id
+        freeze_file = cg_dir / "cgroup.freeze"
+        if not freeze_file.parent.exists():
+            return
+        freeze_file.write_text("0\n", encoding="utf-8")
+        events_file = cg_dir / "cgroup.events"
+        if events_file.exists():
+            deadline = time.monotonic() + timeout_sec
+            while time.monotonic() < deadline:
+                try:
+                    for line in events_file.read_text(encoding="utf-8").splitlines():
+                        if line.strip() == "frozen 0":
+                            return
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            raise TimeoutError(f"cgroup v2 for workload {workload_id} did not unfreeze within {timeout_sec}s")
 
     def is_cgroup_frozen(self, workload_id: str) -> bool:
         """Return True if the workload cgroup is currently frozen."""
