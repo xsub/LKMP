@@ -33,7 +33,7 @@ from lkmp.envelope import EnvelopeManager
 from lkmp.fs_sync import FilesystemSyncManager
 from lkmp.journal import validate_safe_identifier
 from lkmp.models import FileArtifact, HostCapabilities, ProcessSnapshotInfo
-from lkmp.network import NetworkMobilityManager
+from lkmp.network import NetworkMobilityManager, set_pid_tcp_repair
 from lkmp.preflight import (
     collect_host_capabilities,
     compute_file_sha256,
@@ -613,7 +613,7 @@ class AgentService:
         self.fs.final_delta_sync(
             config,
             dest_host,
-            snapshot_dir=snap_dir if snap_dir.exists() else None,
+            snapshot_dir=snap_dir,
         )
         return {
             "transferred": True,
@@ -933,6 +933,9 @@ class AgentService:
             self.criu.stop_daemon(lazy_pidfile)
 
         if restored_pid is not None:
+            if self.proc_root == Path("/proc").resolve():
+                for tp in list(tree_pids or [int(restored_pid)]):
+                    set_pid_tcp_repair(int(tp), enable=True)
             try:
                 self._signal_process_tree(
                     int(restored_pid),
@@ -999,6 +1002,10 @@ class AgentService:
                 quiesced = bool(st_data.get("quiesced", False))
             except Exception:
                 pass
+
+        if self.proc_root == Path("/proc").resolve():
+            for sp in list(tree_pids or [config.pid]):
+                set_pid_tcp_repair(int(sp), enable=False)
 
         try:
             self._signal_process_tree(

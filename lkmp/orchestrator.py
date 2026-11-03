@@ -14,7 +14,7 @@ from lkmp.attestation import generate_ephemeral_key_hex
 from lkmp.config import FilesystemMode, IpMobilityMode, MigrationConfig, MigrationStrategy
 from lkmp.convergence import PreCopyConvergenceTracker
 from lkmp.fs_sync import is_same_host_or_shared_storage
-from lkmp.journal import MigrationJournal, validate_safe_identifier
+from lkmp.journal import MigrationJournal, open_migration_journal, validate_safe_identifier
 from lkmp.models import (
     FileArtifact,
     HostCapabilities,
@@ -100,13 +100,7 @@ class MigrationOrchestrator:
         j_dir = journal_dir if journal_dir is not None else getattr(self.config, "journal_dir", None)
         self.journal: Optional[MigrationJournal] = None
         if j_dir:
-            try:
-                Path(j_dir).mkdir(parents=True, exist_ok=True)
-                self.journal = MigrationJournal(j_dir, self.migration_id)
-            except OSError:
-                fallback_jdir = Path(tempfile.gettempdir()) / "lkmp-journals"
-                fallback_jdir.mkdir(parents=True, exist_ok=True)
-                self.journal = MigrationJournal(fallback_jdir, self.migration_id)
+            self.journal = open_migration_journal(j_dir, self.migration_id)
 
         # Ensure an ephemeral per-migration attestation key is set if not already provided
         if (

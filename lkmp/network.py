@@ -3,12 +3,76 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import shlex
+import socket
 import subprocess
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from lkmp.config import IpMobilityMode, MigrationConfig
+
+SYS_PIDFD_GETFD: int = 438
+SOL_TCP_REPAIR: int = getattr(socket, "TCP_REPAIR", 19)
+
+
+def set_pid_tcp_repair(pid: int, enable: bool) -> int:
+    """
+    Toggle Linux kernel TCP_REPAIR (1 = ON, 0 = OFF) on all open TCP sockets of `pid`
+    via `pidfd_open` + `pidfd_getfd`.
+    - `enable=True` before SIGKILL on an aborted destination prevents kernel FIN/RST emission.
+    - `enable=False` before SIGCONT on a `--leave-stopped` source clears the TCP_REPAIR state
+      left behind by `criu dump --tcp-established --leave-stopped`.
+    Returns the number of sockets updated.
+    """
+    if not hasattr(os, "pidfd_open"):
+        return 0
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        pfd = os.pidfd_open(pid, 0)
+    except Exception:
+        return 0
+
+    updated = 0
+    val = 1 if enable else 0
+    try:
+        fd_dir = Path(f"/proc/{pid}/fd")
+        if not fd_dir.exists():
+            return 0
+        for entry in list(fd_dir.iterdir()):
+            if not entry.name.isdigit():
+                continue
+            try:
+                target = os.readlink(entry)
+            except OSError:
+                continue
+            if not target.startswith("socket:["):
+                continue
+            sfd = int(libc.syscall(SYS_PIDFD_GETFD, pfd, int(entry.name), 0))
+            if sfd < 0:
+                continue
+            try:
+                sock = socket.socket(fileno=sfd)
+                try:
+                    sock.setsockopt(socket.SOL_TCP, SOL_TCP_REPAIR, val)
+                    updated += 1
+                except OSError:
+                    pass
+                sock.close()
+            except Exception:
+                try:
+                    os.close(sfd)
+                except OSError:
+                    pass
+    finally:
+        try:
+            os.close(pfd)
+        except OSError:
+            pass
+    return updated
 
 
 CommandRunner = Callable[[List[str]], subprocess.CompletedProcess]
@@ -123,8 +187,16 @@ class NetworkMobilityManager:
             ],
         ]
         try:
-            for cmd in cmds:
-                self.runner(cmd)
+            for idx, cmd in enumerate(cmds):
+                try:
+                    self.runner(cmd)
+                except subprocess.CalledProcessError:
+                    # Tolerate pre-existing table on repeated lock_network calls;
+                    # the subsequent 'nft flush table' verifies the table is usable
+                    # and clears any prior rules idempotently.
+                    if idx == 0 and cmd[:3] == ["nft", "add", "table"]:
+                        continue
+                    raise
         except Exception:
             try:
                 self.unlock_network(workload_ip, migration_id)

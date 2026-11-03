@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from lkmp.models import MigrationState
 
+DEFAULT_JOURNAL_DIR = "/var/lib/lkmp/journals"
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -65,7 +67,7 @@ class MigrationJournal:
         note: Optional[str] = None,
     ) -> JournalEntry:
         """Append and fsync a state transition record to the WAL."""
-        self.journal_dir.mkdir(parents=True, exist_ok=True)
+        self.journal_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._seq += 1
         entry = JournalEntry(
             seq=self._seq,
@@ -121,3 +123,54 @@ class MigrationJournal:
             if e.config_dict is not None:
                 return e.config_dict
         return None
+
+
+def _probe_journal_writable(journal: MigrationJournal) -> None:
+    """Verify that both journal_dir and journal.path are writable by the current UID."""
+    journal.journal_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if journal.path.exists():
+        fd = os.open(str(journal.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(fd)
+    else:
+        uid_tag = str(os.geteuid()) if hasattr(os, "geteuid") else "default"
+        probe_path = (
+            journal.journal_dir
+            / f".lkmp-probe-{os.getpid()}-{uid_tag}-{time.time_ns()}"
+        )
+        fd = os.open(str(probe_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.close(fd)
+        finally:
+            try:
+                probe_path.unlink()
+            except OSError:
+                pass
+
+
+def open_migration_journal(
+    journal_dir: str | Path,
+    migration_id: str,
+    extra_ids: Sequence[str] = (),
+) -> MigrationJournal:
+    """
+    Create a MigrationJournal and verify write access for migration_id (and any coupled extra_ids).
+    Falls back to a per-UID 0700 temp directory only when using DEFAULT_JOURNAL_DIR.
+    """
+    target_dir = Path(journal_dir)
+    journal = MigrationJournal(target_dir, migration_id)
+    try:
+        _probe_journal_writable(journal)
+        for extra_id in extra_ids:
+            _probe_journal_writable(MigrationJournal(target_dir, extra_id))
+        return journal
+    except OSError:
+        if target_dir != Path(DEFAULT_JOURNAL_DIR):
+            raise
+        uid_tag = str(os.geteuid()) if hasattr(os, "geteuid") else "default"
+        fallback_dir = Path(tempfile.gettempdir()) / f"lkmp-journals-{uid_tag}"
+        fallback_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fallback_journal = MigrationJournal(fallback_dir, migration_id)
+        _probe_journal_writable(fallback_journal)
+        for extra_id in extra_ids:
+            _probe_journal_writable(MigrationJournal(fallback_dir, extra_id))
+        return fallback_journal

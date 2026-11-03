@@ -9,7 +9,12 @@ from typing import Dict, List, Optional, Tuple
 
 from lkmp.agent import AgentClient, config_to_dict
 from lkmp.config import MigrationConfig
-from lkmp.journal import MigrationJournal, validate_safe_identifier
+from lkmp.journal import (
+    DEFAULT_JOURNAL_DIR,
+    MigrationJournal,
+    open_migration_journal,
+    validate_safe_identifier,
+)
 from lkmp.models import MigrationResult, MigrationState
 from lkmp.orchestrator import MigrationOrchestrator
 
@@ -47,14 +52,17 @@ class GangMigrationCoordinator:
         journal_dir: Optional[str | Path] = None,
     ) -> None:
         self.gang_id = validate_safe_identifier(gang_id, "gang_id")
-        j_dir = journal_dir or (members[0][0].journal_dir if members else None) or "/var/lib/lkmp/journals"
-        try:
-            Path(j_dir).mkdir(parents=True, exist_ok=True)
-            self.journal = MigrationJournal(j_dir, f"{self.gang_id}.gang")
-        except OSError:
-            fallback = Path(tempfile.gettempdir()) / "lkmp-journals"
-            fallback.mkdir(parents=True, exist_ok=True)
-            self.journal = MigrationJournal(fallback, f"{self.gang_id}.gang")
+        j_dir = (
+            journal_dir
+            or (members[0][0].journal_dir if members else None)
+            or DEFAULT_JOURNAL_DIR
+        )
+        member_ids = [f"{self.gang_id}-m{idx}" for idx in range(1, len(members) + 1)]
+        self.journal = open_migration_journal(
+            j_dir,
+            f"{self.gang_id}.gang",
+            extra_ids=member_ids,
+        )
 
         self.orchestrators: List[MigrationOrchestrator] = [
             MigrationOrchestrator(

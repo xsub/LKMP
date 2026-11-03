@@ -162,7 +162,9 @@ class FilesystemSyncManager:
             for wp in config.writable_paths:
                 wp_path = Path(wp)
                 if not wp_path.exists():
-                    continue
+                    raise FileNotFoundError(
+                        f"Cannot create frozen snapshot: writable path {wp!r} does not exist"
+                    )
                 target = snap_p / wp.lstrip("/") if wp.startswith("/") else snap_p / wp_path.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if wp_path.is_dir():
@@ -230,19 +232,26 @@ class FilesystemSyncManager:
     ) -> List[List[str]]:
         """
         Run final rsync delta pass while the source process tree is frozen.
-        When `snapshot_dir` is provided and contains a frozen snapshot of a writable path,
-        reads from the frozen snapshot so destination disk state matches the memory checkpoint.
+        Requires a frozen point-in-time `snapshot_dir` containing a snapshot of every
+        configured `writable_path` so destination disk state matches the memory checkpoint.
+        Never falls back to reading live mutable paths.
         """
-        if config.fs_mode != FilesystemMode.RSYNC:
+        if config.fs_mode != FilesystemMode.RSYNC or not config.writable_paths:
             return []
+        if snapshot_dir is None:
+            raise FileNotFoundError(
+                "final_delta_sync requires a frozen snapshot_dir; refusing to fall back to live writable_paths"
+            )
+        snap_root = Path(snapshot_dir)
         cmds: List[List[str]] = []
         for path in config.writable_paths:
-            src_path = path
-            if snapshot_dir is not None:
-                snap_candidate = self.resolve_snapshot_path(snapshot_dir, path)
-                if snap_candidate.exists():
-                    src_path = str(snap_candidate)
-            cmd = self.build_rsync_cmd(src_path, dest_host, path)
+            snap_candidate = self.resolve_snapshot_path(snap_root, path)
+            if not snap_candidate.exists():
+                raise FileNotFoundError(
+                    f"Frozen snapshot missing for writable_path {path!r} at {snap_candidate}; "
+                    "refusing to fall back to live filesystem read"
+                )
+            cmd = self.build_rsync_cmd(str(snap_candidate), dest_host, path)
             self.runner(cmd)
             cmds.append(cmd)
         return cmds

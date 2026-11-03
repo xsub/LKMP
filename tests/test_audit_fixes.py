@@ -1579,6 +1579,95 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
             self.assertTrue((Path(dst_prep["images_dir"]) / "core-1.img").exists())
             self.assertTrue((Path(dst_prep["images_dir"]) / "pages-1.img").exists())
 
+    def test_p1_followup_acceptance_uses_af_inet_tcp_not_unix_socket(self) -> None:
+        """P1 follow-up: acceptance harness uses real AF_INET SOCK_STREAM TCP sockets, never AF_UNIX."""
+        import socket
+        from lkmp.acceptance import _create_tcp_socketpair
+
+        csock, ssock = _create_tcp_socketpair()
+        try:
+            self.assertEqual(csock.family, socket.AF_INET)
+            self.assertEqual(ssock.family, socket.AF_INET)
+            self.assertEqual(csock.type & socket.SOCK_STREAM, socket.SOCK_STREAM)
+            self.assertEqual(ssock.type & socket.SOCK_STREAM, socket.SOCK_STREAM)
+            csock.sendall(b"ping")
+            self.assertEqual(ssock.recv(4), b"ping")
+        finally:
+            csock.close()
+            ssock.close()
+
+        acc_src = (Path(__file__).resolve().parent.parent / "lkmp" / "acceptance.py").read_text(encoding="utf-8")
+        self.assertNotIn("AF_UNIX", acc_src)
+        self.assertNotIn("--ext-unix-sk", acc_src)
+        self.assertIn("--tcp-established", acc_src)
+
+    def test_p1_followup_final_delta_sync_refuses_live_fallback_when_snapshot_missing(self) -> None:
+        """P1 follow-up: final_delta_sync fails closed (FileNotFoundError) if snapshot_dir or path snapshot is missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live_file = root / "live.db"
+            live_file.write_text("LIVE_MUTATING_STATE\n", encoding="utf-8")
+            empty_snap = root / "empty_snap"
+            empty_snap.mkdir(parents=True, exist_ok=True)
+
+            executed: List[List[str]] = []
+
+            def rec_runner(cmd: List[str]) -> subprocess.CompletedProcess:
+                executed.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            fs = FilesystemSyncManager(runner=rec_runner)
+
+            cfg = MigrationConfig(
+                pid=1111,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                fs_mode=FilesystemMode.RSYNC,
+                writable_paths=[str(live_file)],
+            )
+
+            with self.assertRaises(FileNotFoundError):
+                fs.final_delta_sync(cfg, "10.0.0.2", snapshot_dir=None)
+
+            with self.assertRaises(FileNotFoundError):
+                fs.final_delta_sync(cfg, "10.0.0.2", snapshot_dir=empty_snap)
+
+            self.assertEqual(executed, [])
+
+            cfg_missing = MigrationConfig(
+                pid=1111,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                fs_mode=FilesystemMode.RSYNC,
+                writable_paths=[str(root / "does_not_exist.db")],
+            )
+            with self.assertRaises(FileNotFoundError):
+                fs.snapshot_writable_paths_while_frozen(cfg_missing, root / "snap2")
+
+    def test_p1_followup_lock_network_idempotent_when_table_already_exists(self) -> None:
+        """P1 follow-up: repeated lock_network tolerates CalledProcessError on 'nft add table' and still flushes + installs drop rules."""
+        executed: List[List[str]] = []
+        call_count = [0]
+
+        def runner(cmd: List[str]) -> subprocess.CompletedProcess:
+            executed.append(list(cmd))
+            if cmd[:3] == ["nft", "add", "table"]:
+                call_count[0] += 1
+                if call_count[0] >= 2:
+                    raise subprocess.CalledProcessError(1, cmd, stderr="Error: File exists")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        net = NetworkMobilityManager(runner=runner)
+        net.lock_network("10.0.0.50", migration_id="mig-idem")
+        executed.clear()
+
+        # Second call where 'nft add table' raises CalledProcessError("File exists")
+        net.lock_network("10.0.0.50", migration_id="mig-idem")
+        self.assertEqual(len(executed), 6)
+        self.assertEqual(executed[1][:3], ["nft", "flush", "table"])
+        self.assertEqual(sum(1 for c in executed if "drop" in c), 2)
+        self.assertFalse(any(c[:3] == ["nft", "delete", "table"] for c in executed))
+
 
 if __name__ == "__main__":
     unittest.main()
