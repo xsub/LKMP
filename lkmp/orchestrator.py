@@ -251,8 +251,15 @@ class MigrationOrchestrator:
         trial_restore_passed: Optional[bool] = None
         if do_trial_restore and not has_blockers and (check_only_passed is not False):
             orig_ip_mobility = self.config.ip_mobility
+            orig_tcp_est = self.config.tcp_established
+            has_net_sockets = any(
+                getattr(f, "resource_type", "") == "socket" and "TCP" in str(getattr(f, "identifier", "")).upper()
+                for f in getattr(snapshot, "findings", [])
+            )
             try:
                 self.config.ip_mobility = IpMobilityMode.NONE
+                if not self.config.workload_ip and not has_net_sockets:
+                    self.config.tcp_established = False
                 prep_res = self.execute_prepare_phase(keep_stopped_on_prepare=True)
                 rb_res = self.rollback("Completed isolated trial restore verification")
                 trial_restore_passed = bool(prep_res.success and rb_res.rolled_back)
@@ -264,6 +271,7 @@ class MigrationOrchestrator:
                     pass
             finally:
                 self.config.ip_mobility = orig_ip_mobility
+                self.config.tcp_established = orig_tcp_est
 
         # Evaluate final portability state
         report = None

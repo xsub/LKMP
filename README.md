@@ -20,7 +20,7 @@
 
 ### 1. Coordinated Two-Phase Cutover with Stopped-Readiness Barrier & WAL Roll-Forward
 - **Strict Phase Isolation (`lkmp/orchestrator.py`, `lkmp/gang.py`)**:
-  - **Phase 1 (`execute_prepare_phase`)**: Executes preflight, incremental filesystem and memory pre-dumps, host freeze, final dump, transfer, pre-restore IP assignment, CRIU restore, and stopped readiness barrier up through `VERIFY` on Destination B. Throughout Phase 1, the source process tree on Host A remains frozen via `--leave-stopped` (`SIGSTOP` / `cgroup v2` freezer)—it is **never** terminated during Phase 1.
+  - **Phase 1 (`execute_prepare_phase`)**: Executes preflight, incremental filesystem and memory pre-dumps, host freeze, final dump, transfer, pre-restore IP assignment, CRIU restore, and stopped readiness barrier (`verify_restored_stopped`, confirming both kernel `T`/`t` stopped state across every restored PID/thread via `/proc/<pid>/stat` and active `nftables` `input`/`output` `drop` rules via `nft list table`) up through `VERIFY` on Destination B. Throughout Phase 1, the source process tree on Host A remains frozen via `--leave-stopped` (`SIGSTOP` / `cgroup v2` freezer)—it is **never** terminated during Phase 1.
   - **Phase 2 (`commit` / `rollback`)**: Only after Destination B (or *all* members of a gang migration) successfully passes health verification does the coordinator issue an irrevocable `commit()`: `commit_source` first confirms `TCP_REPAIR = 1` across the source process tree (`set_tree_tcp_repair` with kernel `getsockopt(SOL_TCP, TCP_REPAIR)` read-back verification) before sending `SIGKILL`, followed by unfreezing Destination B and cryptographic zero-wiping of checkpoint images. `commit_source` persists `"committed": True` to `source_state.json` strictly **after** `SIGKILL` succeeds across the source process tree, and `_signal_process_tree` propagates any non-`ESRCH` `OSError` (such as `EPERM`).
   - If any failure occurs in Phase 1 (restore failure, network timeout, failed `--health-cmd`, or image tamper), the coordinator executes a deterministic `rollback()`: `rollback_dest` confirms `TCP_REPAIR = 1` (`set_tree_tcp_repair` via `pidfd_open` + `pidfd_getfd` + `getsockopt` read-back) and sends `SIGKILL` to any partial process on B without emitting spurious `FIN`/`RST` packets; if `TCP_REPAIR` confirmation fails (`TcpRepairError`), `rollback_dest` fails closed without sending `SIGKILL` so no unconfirmed `FIN`/`RST` can escape. Only when `rollback_dest` succeeds (`rolled_back_dest == True`) does `rollback_source` confirm `TCP_REPAIR = 0` on source sockets, drop packet isolation rules, reclaim IP on A, and resume the original process tree on Host A in-place via `SIGCONT` with zero state loss. If Destination B cleanup or `TCP_REPAIR` confirmation fails, Source A remains frozen and network-fenced.
 - **Process-Tree-Wide Lifecycle & PID-Reuse Protection (`lkmp/preflight.py`, `lkmp/agent.py`)**:
@@ -30,7 +30,7 @@
   - **Default Syscall-Boundary Crash Consistency**: The process tree is frozen via the `cgroup v2` freezer controller, actively polling `/sys/fs/cgroup/<workload>/cgroup.events` until `frozen 1` is observed before invoking CRIU dump.
   - **Application-Quiesced Consistency (`--quiesce-cmd` / `--resume-cmd`)**: For database engines and stateful network services, `--quiesce-cmd` executes prior to packet locking and cgroup freezing to allow the application to drain in-flight requests, flush memory buffers, and run `fsync`. If the migration commits or rolls back, `--resume-cmd` is invoked to resume background application timers and processing loops.
 - **Write-Ahead Log (`.wal.jsonl`, `lkmp/journal.py`)**:
-  - Every state transition and decision (`PREPARING`, `COMMITTED`, `ABORTING`, `ROLLED_BACK`) is recorded to an append-only JSONL log with explicit `os.fsync` barriers on both the `.wal.jsonl` descriptor and its parent directory descriptor before remote RPC dispatch. `open_migration_journal` operates strictly fail-closed: it never falls back to volatile `/tmp` directories on `OSError`/`PermissionError`, and rejects volatile `tmpfs`/`ramfs` backing mounts on `/var/lib/lkmp/journals` so commit/abort decisions survive host reboots.
+  - Every state transition and decision (`PREPARING`, `COMMITTED`, `ABORTING`, `ROLLED_BACK`) is recorded to an append-only JSONL log with mandatory `os.fsync` barriers on both the `.wal.jsonl` descriptor and its parent directory descriptor before remote RPC dispatch (propagating any `OSError` on file or directory `fsync` without advancing journal state). `open_migration_journal` and `MigrationJournal` operate strictly fail-closed: they never fall back to volatile `/tmp` directories on `OSError`/`PermissionError`, and enforce persistent backing-storage verification (`require_persistent=True`) **by default across every `journal_dir`** (both `/var/lib/lkmp/journals` and custom `--journal-dir` paths), rejecting volatile `tmpfs`/`ramfs`/`devtmpfs`/`rootfs` mounts so commit/abort decisions survive host reboots.
   - If the migration controller crashes mid-flight, the state is deterministically recovered via:
     ```bash
     lkmp recover --journal /var/lib/lkmp/migrations/<id>/.wal.jsonl --source 10.0.1.10:9440 --dest 10.0.1.11:9440
@@ -245,7 +245,7 @@ sequenceDiagram
 ```
 
 #### Gang Migration Invariants
-1. **Stopped-Readiness Barrier**: During Phase 1 (`execute_prepare_phase(keep_stopped_on_prepare=True)`), every member process restored on Destination B remains stopped (`--leave-stopped`) and network-fenced. Meanwhile, all corresponding source processes on Host A remain alive and frozen. No source process is terminated during Phase 1.
+1. **Stopped-Readiness Barrier**: During Phase 1 (`execute_prepare_phase(keep_stopped_on_prepare=True)`), every member process restored on Destination B remains stopped (`--leave-stopped`) and network-fenced, with `verify_restored_stopped` explicitly confirming kernel stopped state (`T`/`t`) across all restored PIDs/threads and active `nftables` `input`/`output` `drop` rules (`nft list table`) before Phase 1 completes. Meanwhile, all corresponding source processes on Host A remain alive and frozen. No source process is terminated during Phase 1.
 2. **Safe Coordinated Rollback**: If any member fails during Phase 1 (restore failure, network timeout, failed `--health-cmd`, or image tamper), the coordinator fsyncs `ABORTING` to `GangJournal` and rolls back all prepared members, resuming all original processes on Source A via `SIGCONT` with zero data loss.
 3. **Irrevocable Commit Order & WAL Roll-Forward**: Only when all members successfully verify in stopped state does the coordinator fsync `COMMITTED` to `GangJournal`. It then terminates all Source A processes (`commit_source`) before unfreezing Destination B members. If an unexpected fault or network split occurs mid-commit after `COMMITTED` has been fsynced, rollback is NOT possible (since source processes are being or have been killed); instead, `lkmp recover` performs idempotent roll-forward to complete member activation on Destination B.
 
@@ -452,7 +452,7 @@ sudo python3 scripts/linux_criu_e2e.py
 
 To maintain rigorous transparency, the verification scope is divided into automated test assertions and real Linux CRIU kernel testbed runs:
 
-### Proven in CI & Verified on Linux 7.0 + CRIU 4.2.1 (`90 unittest` Cases + `12/12 REAL_CRIU lkmp acceptance` + `4/4 REAL_CRIU E2E`)
+### Proven in CI & Verified on Linux 7.0 + CRIU 4.2.1 (`92 unittest` Cases + `12/12 REAL_CRIU lkmp acceptance` + `4/4 REAL_CRIU E2E`)
 - **Real Linux CRIU 4.2.1 E2E (`scripts/linux_criu_e2e.py`, Verified `4/4 PASS` on Linux `7.0.0-42-generic` x86_64 with CRIU `4.2.1 GitID: f192861`, strict non-zero exit gate)**:
   1. **CRIU CLI Flag Verification (`PASS`)**: Verifies `criu page-server --daemon --pidfile` immediate detachment, passive `/proc/net/tcp` port listening detection, and `--lazy-pages` flag compatibility.
   2. **Scenario A — `REAL_CRIU COLD` Dump & Detached Restore (`PASS`)**: Checkpoints a live multi-process workload (`pstree.img`, `3 core-*.img`, `3 pages-*.img`), terminates the source tree, restores via `criu restore --restore-detached --shell-job`, and verifies continuous `state.log` record advancement (`5 -> 13` records).
@@ -505,7 +505,7 @@ To maintain rigorous transparency, the verification scope is divided into automa
 ├── deploy/
 │   ├── Dockerfile.node           # Hardened Ubuntu 24.04 node image (CRIU, nftables, iproute2, mTLS)
 │   └── docker-compose.test.yml   # Multi-node privileged test cluster on shared L2 bridge
-└── tests/                        # 90 unit, portability, WAL crash recovery & 12-scenario acceptance tests
+└── tests/                        # 92 unit, portability, WAL crash recovery & 12-scenario acceptance tests
 ```
 
 ---

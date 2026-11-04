@@ -42,6 +42,8 @@ class _FakeClusterHarness:
         self.signals_b: List[Tuple[int, int]] = []
         self.commands_a: List[List[str]] = []
         self.commands_b: List[List[str]] = []
+        self._nft_a: dict = {}
+        self._nft_b: dict = {}
 
         self.fail_on_restore = False
         self.dest_pid_alive = True
@@ -67,9 +69,65 @@ class _FakeClusterHarness:
             net_manager=NetworkMobilityManager(runner=self._run_b),
             fs_manager=FilesystemSyncManager(runner=self._run_b),
             envelope_manager=EnvelopeManager(cgroup_root=str(self.cgroup_b), runner=self._run_b),
-            signal_sender=lambda pid, sig: self.signals_b.append((pid, sig)),
+            signal_sender=self._signal_b,
             pid_alive_checker=lambda _pid: self.dest_pid_alive,
         )
+
+    def _signal_b(self, pid: int, sig: int) -> None:
+        self.signals_b.append((pid, sig))
+        if sig == signal.SIGCONT:
+            st_file = self.proc_b / str(pid) / "status"
+            if st_file.exists():
+                txt = st_file.read_text(encoding="utf-8")
+                st_file.write_text(txt.replace("State:\tT (stopped)", "State:\tS (sleeping)"), encoding="utf-8")
+
+    @staticmethod
+    def _eval_nft(tables: dict, cmd: List[str]) -> subprocess.CompletedProcess:
+        if len(cmd) >= 5 and cmd[1:4] == ["add", "table", "inet"]:
+            tname = cmd[4]
+            if tname in tables:
+                raise subprocess.CalledProcessError(1, cmd, stderr="File exists")
+            tables[tname] = {"chains": {}, "rules": {}}
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if len(cmd) >= 5 and cmd[1:4] == ["flush", "table", "inet"]:
+            tname = cmd[4]
+            if tname not in tables:
+                raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+            tables[tname] = {"chains": {}, "rules": {}}
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if len(cmd) >= 7 and cmd[1:4] == ["add", "chain", "inet"]:
+            tname, cname, spec = cmd[4], cmd[5], cmd[6]
+            if tname not in tables:
+                raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+            tables[tname]["chains"][cname] = spec.strip("{} ").rstrip(" ;")
+            tables[tname]["rules"].setdefault(cname, [])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if len(cmd) >= 7 and cmd[1:4] == ["add", "rule", "inet"]:
+            tname, cname = cmd[4], cmd[5]
+            if tname not in tables or cname not in tables[tname]["chains"]:
+                raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+            tables[tname]["rules"][cname].append(" ".join(cmd[6:]))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if len(cmd) >= 5 and cmd[1:4] == ["delete", "table", "inet"]:
+            tname = cmd[4]
+            if tname not in tables:
+                raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+            del tables[tname]
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if len(cmd) >= 5 and cmd[1:4] == ["list", "table", "inet"]:
+            tname = cmd[4]
+            if tname not in tables:
+                raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+            lines = [f"table inet {tname} {{"]
+            for cname, spec in tables[tname]["chains"].items():
+                lines.append(f"\tchain {cname} {{")
+                lines.append(f"\t\t{spec}; policy accept;")
+                for r in tables[tname]["rules"].get(cname, []):
+                    lines.append(f"\t\t{r}")
+                lines.append("\t}")
+            lines.append("}")
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(lines) + "\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
     def _setup_proc_trees(self) -> None:
         for proc in (self.proc_a, self.proc_b):
@@ -89,6 +147,8 @@ class _FakeClusterHarness:
 
     def _run_a(self, cmd: List[str]) -> subprocess.CompletedProcess:
         self.commands_a.append(cmd)
+        if cmd and cmd[0] == "nft":
+            return self._eval_nft(self._nft_a, cmd)
         if len(cmd) >= 2 and cmd[0] == "criu":
             if cmd[1] == "pre-dump":
                 idx = cmd.index("--images-dir")
@@ -146,12 +206,21 @@ class _FakeClusterHarness:
 
     def _run_b(self, cmd: List[str]) -> subprocess.CompletedProcess:
         self.commands_b.append(cmd)
+        if cmd and cmd[0] == "nft":
+            return self._eval_nft(self._nft_b, cmd)
         if len(cmd) >= 2 and cmd[0] == "criu" and cmd[1] == "restore":
             if self.fail_on_restore:
                 raise RuntimeError("Simulated CRIU restore failure on Destination B")
             if "--pidfile" in cmd:
                 idx = cmd.index("--pidfile")
                 Path(cmd[idx + 1]).write_text("5678\n", encoding="utf-8")
+            p5678 = self.proc_b / "5678"
+            p5678.mkdir(parents=True, exist_ok=True)
+            state_line = "State:\tT (stopped)\n" if "--leave-stopped" in cmd else "State:\tS (sleeping)\n"
+            (p5678 / "status").write_text(
+                f"Name:\tserver\n{state_line}VmRSS:\t65536 kB\nTracerPid:\t0\nNSpid:\t5678\t1\n",
+                encoding="utf-8",
+            )
         return subprocess.CompletedProcess(cmd, 0, "CRIU 4.3\n", "")
 
 

@@ -265,6 +265,74 @@ def read_proc_starttime(pid: int, proc_root: str = "/proc") -> Optional[int]:
     return None
 
 
+def _parse_stat_file_state(stat_file: Path) -> Optional[str]:
+    """Extract single-character task state (field 3) from a /proc/.../stat file."""
+    try:
+        content = stat_file.read_text(encoding="utf-8", errors="ignore")
+        rparen = content.rfind(")")
+        if rparen != -1:
+            fields = content[rparen + 1 :].strip().split()
+            if fields:
+                return fields[0]
+    except OSError:
+        pass
+    return None
+
+
+def _parse_status_file_state(status_file: Path) -> Optional[str]:
+    """Extract single-character task state from the 'State:' line of a /proc/.../status file."""
+    try:
+        for line in status_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("State:"):
+                parts = line.split(":", 1)[1].strip().split()
+                if parts and parts[0]:
+                    return parts[0][0]
+    except OSError:
+        pass
+    return None
+
+
+def read_proc_state(pid: int, proc_root: str = "/proc") -> Optional[str]:
+    """Read single-character task state ('T', 't', 'S', 'R', 'Z', ...) from <proc_root>/<pid>/stat or status."""
+    pid_dir = Path(proc_root) / str(pid)
+    state = _parse_stat_file_state(pid_dir / "stat")
+    if state is not None:
+        return state
+    return _parse_status_file_state(pid_dir / "status")
+
+
+def is_pid_stopped(pid: int, proc_root: str = "/proc") -> Tuple[bool, str]:
+    """
+    Confirm that `pid` (and all threads in `<proc_root>/<pid>/task/*` that expose stat/status)
+    is in kernel stopped state ('T' or 't'). Fails closed if state cannot be read.
+    """
+    state = read_proc_state(pid, proc_root)
+    if state is None:
+        return False, f"task state unavailable in {proc_root}/{pid}/stat or status"
+    if state not in ("T", "t"):
+        return False, f"task state is {state!r}, expected stopped ('T' or 't')"
+
+    task_dir = Path(proc_root) / str(pid) / "task"
+    if task_dir.is_dir():
+        try:
+            for tid_dir in task_dir.iterdir():
+                if not tid_dir.is_dir() or not tid_dir.name.isdigit():
+                    continue
+                tid_stat = tid_dir / "stat"
+                tid_status = tid_dir / "status"
+                if not tid_stat.is_file() and not tid_status.is_file():
+                    continue
+                t_state = _parse_stat_file_state(tid_stat) or _parse_status_file_state(tid_status)
+                if t_state is None:
+                    return False, f"thread {tid_dir.name} state unavailable"
+                if t_state not in ("T", "t"):
+                    return False, f"thread {tid_dir.name} state is {t_state!r}, expected stopped ('T' or 't')"
+        except OSError as exc:
+            return False, f"unable to inspect threads under {task_dir}: {exc}"
+
+    return True, state
+
+
 def discover_process_tree_pids(root_pid: int, proc_root: str = "/proc") -> List[int]:
     """
     Recursively discover all PIDs belonging to the process tree of root_pid.

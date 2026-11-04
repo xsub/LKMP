@@ -156,6 +156,7 @@ class TestSotaCapabilities(unittest.TestCase):
                 source_addr="a1:9700",
                 dest_addr="b1:9700",
                 strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.51/24",
                 tls=TlsConfig(enabled=False),
             )
             cfg2 = MigrationConfig(
@@ -164,6 +165,7 @@ class TestSotaCapabilities(unittest.TestCase):
                 source_addr="a2:9700",
                 dest_addr="b2:9700",
                 strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.52/24",
                 tls=TlsConfig(enabled=False),
             )
 

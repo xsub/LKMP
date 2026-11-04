@@ -45,6 +45,7 @@ from lkmp.preflight import (
     compute_file_sha256,
     discover_process_tree_pids,
     inspect_process_tree,
+    is_pid_stopped,
     parse_elf_build_id,
     read_proc_starttime,
 )
@@ -735,6 +736,8 @@ class AgentService:
             "restored_pid": restored_pid,
             "tree_pids": tree_pids,
             "starttimes": starttimes,
+            "workload_ip": config.workload_ip,
+            "tcp_established": config.tcp_established,
         }
         (img_dir / "restore_state.json").write_text(json.dumps(restore_state, indent=2), encoding="utf-8")
 
@@ -859,12 +862,17 @@ class AgentService:
         self,
         restored_pid: int,
         migration_id: Optional[str] = None,
+        workload_ip: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Verify that restored_pid and all restored process tree PIDs are alive while stopped
-        (--leave-stopped) and network-fenced on Destination B.
+        Verify that restored_pid and all restored process tree PIDs are alive, explicitly
+        in stopped state ('T'/'t' via --leave-stopped), and protected by an active nftables
+        network drop lock on Destination B before the 2PC coordinator may commit.
         """
         tree_pids: List[int] = [int(restored_pid)]
+        resolved_ip: Optional[str] = workload_ip
+        tcp_established: bool = True
+
         if migration_id:
             state_file = self._round_dir(migration_id, "final") / "restore_state.json"
             if state_file.exists():
@@ -875,8 +883,15 @@ class AgentService:
                         for p in rec_pids:
                             if int(p) not in tree_pids:
                                 tree_pids.append(int(p))
-                except Exception:
-                    pass
+                    if resolved_ip is None:
+                        resolved_ip = data.get("workload_ip")
+                    if "tcp_established" in data:
+                        tcp_established = bool(data.get("tcp_established"))
+                except Exception as exc:
+                    return {
+                        "healthy": False,
+                        "reason": f"Failed to parse restore_state.json on destination: {exc}",
+                    }
         # Discover any additional descendants
         discovered = discover_process_tree_pids(int(restored_pid), self.proc_root)
         for p in discovered:
@@ -887,9 +902,41 @@ class AgentService:
             if not self._check_pid_alive(p):
                 return {
                     "healthy": False,
-                    "reason": f"Restored process {p} is not alive (stopped) on destination",
+                    "reason": f"Restored process {p} is not alive on destination",
                 }
-        return {"healthy": True, "checked_pids": tree_pids}
+            stopped_ok, stopped_detail = is_pid_stopped(p, self.proc_root)
+            if not stopped_ok:
+                return {
+                    "healthy": False,
+                    "reason": f"Restored process {p} is not stopped on destination ({stopped_detail})",
+                }
+
+        network_lock_required = bool(tcp_established or resolved_ip)
+        if network_lock_required:
+            if not resolved_ip:
+                return {
+                    "healthy": False,
+                    "reason": (
+                        "Active nftables network lock required for stopped-readiness barrier, "
+                        "but workload_ip is not configured"
+                    ),
+                }
+            if not self.net.verify_network_locked(resolved_ip, migration_id=migration_id):
+                table = self.net.table_name_for(resolved_ip, migration_id)
+                return {
+                    "healthy": False,
+                    "reason": (
+                        f"Active nftables network lock not confirmed on destination "
+                        f"(table {table} missing or lacking drop rules for {resolved_ip})"
+                    ),
+                }
+
+        return {
+            "healthy": True,
+            "checked_pids": tree_pids,
+            "stopped_confirmed": True,
+            "network_lock_confirmed": network_lock_required,
+        }
 
     def commit_source(self, migration_id: str, config_dict: Dict[str, Any]) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)

@@ -405,6 +405,53 @@ class NetworkMobilityManager:
             pass
         return [cmd]
 
+    def verify_network_locked(
+        self,
+        workload_ip: Optional[str],
+        migration_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Confirm via `nft list table inet <table>` that the per-migration packet lock table
+        exists in the kernel and actively enforces both `input` (`daddr <ip> drop`) and
+        `output` (`saddr <ip> drop`) filter chains for `workload_ip`.
+        """
+        if not workload_ip:
+            return False
+        bare_ip = self._strip_cidr(workload_ip)
+        try:
+            addr = ipaddress.ip_address(bare_ip)
+        except ValueError:
+            return False
+        norm_ip = str(addr)
+        addr_family = "ip6" if addr.version == 6 else "ip"
+        table = self.table_name_for(workload_ip, migration_id)
+        try:
+            res = self.runner(["nft", "list", "table", "inet", table])
+        except (subprocess.CalledProcessError, OSError):
+            return False
+        if res.returncode != 0:
+            return False
+
+        stdout = res.stdout or ""
+        if f"table inet {table}" not in stdout:
+            return False
+
+        m_in = re.search(r"chain\s+input\s*\{([^}]*)\}", stdout, re.DOTALL)
+        m_out = re.search(r"chain\s+output\s*\{([^}]*)\}", stdout, re.DOTALL)
+        if not m_in or not m_out:
+            return False
+
+        in_body = m_in.group(1)
+        out_body = m_out.group(1)
+        if "hook input" not in in_body or "hook output" not in out_body:
+            return False
+
+        ip_candidates = {re.escape(bare_ip), re.escape(norm_ip)}
+        ip_pat = "(?:" + "|".join(sorted(ip_candidates)) + ")"
+        in_rule_ok = bool(re.search(rf"\b{addr_family}\s+daddr\s+{ip_pat}\s+drop\b", in_body))
+        out_rule_ok = bool(re.search(rf"\b{addr_family}\s+saddr\s+{ip_pat}\s+drop\b", out_body))
+        return in_rule_ok and out_rule_ok
+
     def assign_ip_for_restore(self, config: MigrationConfig) -> List[List[str]]:
         """
         Assign `workload_ip` on the target interface BEFORE `criu restore --tcp-established`

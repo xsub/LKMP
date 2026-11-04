@@ -220,6 +220,7 @@ class TestAuditFixesP0(unittest.TestCase):
                 source_addr="a1:9700",
                 dest_addr="b1:9700",
                 strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.51/24",
                 tls=TlsConfig(enabled=False),
             )
             cfg2 = MigrationConfig(
@@ -228,6 +229,7 @@ class TestAuditFixesP0(unittest.TestCase):
                 source_addr="a2:9700",
                 dest_addr="b2:9700",
                 strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.52/24",
                 tls=TlsConfig(enabled=False),
             )
 
@@ -1103,6 +1105,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
                 source_addr="10.0.0.1:9700",
                 dest_addr="10.0.0.2:9700",
                 strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.51/24",
                 tls=TlsConfig(enabled=False),
             )
             cfg2 = MigrationConfig(
@@ -1111,6 +1114,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
                 source_addr="10.0.0.3:9700",
                 dest_addr="10.0.0.4:9700",
                 strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.52/24",
                 tls=TlsConfig(enabled=False),
             )
 
@@ -1834,6 +1838,176 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
             )
             with patch("lkmp.journal.sys.platform", "linux"):
                 _verify_persistent_filesystem(wal_dir, mounts_file=fake_mounts)
+
+    def test_p1_round3_custom_journal_dir_rejects_tmpfs_and_propagates_dir_fsync_error(self) -> None:
+        """
+        P1 round-3:
+        1. Custom journal_dir (not only DEFAULT_JOURNAL_DIR) enforces persistent backing storage by default,
+           rejecting tmpfs/ramfs in both open_migration_journal() and MigrationJournal.append().
+        2. Unreadable/missing /proc/mounts on Linux fails closed with OSError instead of being ignored.
+        3. OSError during directory entry fsync on newly created WAL files propagates and leaves seq/entries unadvanced.
+        """
+        import errno
+        from unittest.mock import patch
+        from lkmp.journal import (
+            DEFAULT_JOURNAL_DIR,
+            MigrationJournal,
+            _verify_persistent_filesystem,
+            open_migration_journal,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            custom_wal_dir = root / "custom_wal_on_tmpfs"
+            self.assertNotEqual(custom_wal_dir.resolve(), Path(DEFAULT_JOURNAL_DIR).resolve())
+
+            fake_mounts = root / "proc_mounts"
+            resolved_root = str(root.resolve())
+            fake_mounts.write_text(
+                f"/dev/nvme0n1p1 / ext4 rw,relatime 0 0\n"
+                f"tmpfs {resolved_root} tmpfs rw,nosuid,nodev 0 0\n",
+                encoding="utf-8",
+            )
+
+            orig_verify = _verify_persistent_filesystem
+
+            def verify_with_fake_mounts(target_dir: Path, mounts_file: Path = fake_mounts) -> None:
+                return orig_verify(target_dir, mounts_file=fake_mounts)
+
+            # 1a. open_migration_journal(custom_dir, ...) rejects tmpfs by default (require_persistent omitted -> True)
+            with patch("lkmp.journal.sys.platform", "linux"), patch(
+                "lkmp.journal._verify_persistent_filesystem", side_effect=verify_with_fake_mounts
+            ):
+                with self.assertRaisesRegex(RuntimeError, "volatile tmpfs mount"):
+                    open_migration_journal(custom_wal_dir, "mig-custom-tmpfs")
+
+                # 1b. Direct MigrationJournal(custom_dir, ...).append() also enforces persistent storage by default
+                direct_journal = MigrationJournal(root / "direct_wal_on_tmpfs", "mig-direct-tmpfs")
+                with self.assertRaisesRegex(RuntimeError, "volatile tmpfs mount"):
+                    direct_journal.append(MigrationState.INIT, MigrationState.PREFLIGHT)
+
+            # 2. Missing /proc/mounts on Linux fails closed instead of silently passing
+            with patch("lkmp.journal.sys.platform", "linux"):
+                with self.assertRaisesRegex(RuntimeError, "Cannot verify persistent filesystem"):
+                    _verify_persistent_filesystem(root, mounts_file=root / "nonexistent_mounts")
+
+            # 3. Directory entry fsync failure on new WAL file propagates OSError and does not advance journal state
+            durable_dir = root / "durable_wal"
+            durable_dir.mkdir(parents=True, exist_ok=True)
+            journal = MigrationJournal(durable_dir, "mig-dir-fsync-fail", require_persistent=False)
+
+            real_fsync = os.fsync
+            fsync_calls = [0]
+
+            def fail_on_second_fsync(fd: int) -> None:
+                fsync_calls[0] += 1
+                if fsync_calls[0] == 2:
+                    # 1st fsync is the WAL file fd; 2nd fsync is the parent directory fd
+                    raise OSError(errno.EIO, "Simulated parent directory fsync I/O failure")
+                real_fsync(fd)
+
+            with patch("lkmp.journal.os.fsync", side_effect=fail_on_second_fsync):
+                with self.assertRaisesRegex(OSError, "Simulated parent directory fsync I/O failure"):
+                    journal.append(MigrationState.INIT, MigrationState.PREFLIGHT)
+
+            self.assertEqual(journal._seq, 0)
+            self.assertEqual(journal.entries, [])
+
+    def test_p1_round3_verify_restored_stopped_confirms_stopped_state_and_active_nft_lock(self) -> None:
+        """
+        P1 round-3:
+        verify_restored_stopped must confirm BOTH:
+        1. Every process and thread in the restored tree is in kernel stopped state ('T' or 't').
+        2. Active per-migration nftables input/output drop rules are present on Destination B when network lock applies.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = _FakeClusterHarness(tmp)
+            mig_id = "mig-barrier-r3"
+            vip = "10.0.0.88/24"
+            cfg = MigrationConfig(
+                pid=1234,
+                workload_id="srv-barrier",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=MigrationStrategy.COLD,
+                workload_ip=vip,
+                tcp_established=True,
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+
+            # Prepare checkpoint and restore on Destination B with --leave-stopped
+            ckpt_b = harness.work_b / mig_id / "final"
+            ckpt_b.mkdir(parents=True, exist_ok=True)
+            (ckpt_b / "inventory.img").write_bytes(b"IMG")
+            res_restore = harness.service_b.restore_process(mig_id, "10.0.0.1", config_to_dict(cfg))
+            restored_pid = res_restore["restored_pid"]
+            self.assertEqual(restored_pid, 5678)
+
+            # Case 1: Immediately after restore_process, stopped PIDs + active input/output drop lock -> healthy=True
+            res_ok = harness.service_b.verify_restored_stopped(restored_pid, migration_id=mig_id)
+            self.assertTrue(res_ok["healthy"], msg=f"Expected healthy barrier, got: {res_ok}")
+            self.assertTrue(res_ok["stopped_confirmed"])
+            self.assertTrue(res_ok["network_lock_confirmed"])
+
+            # Case 2: If nftables lock is removed prematurely on B -> must fail closed
+            harness.service_b.net.unlock_network(vip, migration_id=mig_id)
+            res_unlocked = harness.service_b.verify_restored_stopped(restored_pid, migration_id=mig_id)
+            self.assertFalse(res_unlocked["healthy"])
+            self.assertIn("Active nftables network lock not confirmed", res_unlocked["reason"])
+
+            # Case 3: Table + chain exist on B WITHOUT drop rules -> must still fail closed
+            from lkmp.network import NetworkMobilityManager
+
+            table_name = NetworkMobilityManager.table_name_for(vip, migration_id=mig_id)
+            harness.service_b.net.runner(["nft", "add", "table", "inet", table_name])
+            harness.service_b.net.runner(
+                ["nft", "add", "chain", "inet", table_name, "input", "{ type filter hook input priority -100 ; policy accept ; }"]
+            )
+            res_empty_table = harness.service_b.verify_restored_stopped(restored_pid, migration_id=mig_id)
+            self.assertFalse(res_empty_table["healthy"])
+            self.assertIn("Active nftables network lock not confirmed", res_empty_table["reason"])
+
+            # Re-install full lock_network on B -> barrier passes again
+            harness.service_b.net.lock_network(vip, migration_id=mig_id)
+            self.assertTrue(harness.service_b.verify_restored_stopped(restored_pid, migration_id=mig_id)["healthy"])
+
+            # Case 4: Child thread/task transitions to 'S (sleeping)' prematurely -> must fail closed
+            tid_dir = harness.proc_b / str(restored_pid) / "task" / "5679"
+            tid_dir.mkdir(parents=True, exist_ok=True)
+            (tid_dir / "stat").write_text("5679 (worker_thr) S 1 5678 5678 0 -1 4194560 0 0 0 0 1 1 0 0 20 0 2 0 100 1024 10 18446744073709551615 0\n", encoding="utf-8")
+            (tid_dir / "status").write_text("Name:\tworker_thr\nState:\tS (sleeping)\nPid:\t5679\n", encoding="utf-8")
+
+            res_thread_running = harness.service_b.verify_restored_stopped(restored_pid, migration_id=mig_id)
+            self.assertFalse(res_thread_running["healthy"])
+            self.assertIn("is not stopped on destination", res_thread_running["reason"])
+            self.assertIn("thread 5679 state is 'S'", res_thread_running["reason"])
+
+            # Once worker thread is also stopped ('T'), barrier passes again
+            (tid_dir / "stat").write_text("5679 (worker_thr) T 1 5678 5678 0 -1 4194560 0 0 0 0 1 1 0 0 20 0 2 0 100 1024 10 18446744073709551615 0\n", encoding="utf-8")
+            (tid_dir / "status").write_text("Name:\tworker_thr\nState:\tT (stopped)\nPid:\t5679\n", encoding="utf-8")
+            self.assertTrue(harness.service_b.verify_restored_stopped(restored_pid, migration_id=mig_id)["healthy"])
+
+            # Case 5: tcp_established=True with missing workload_ip fails closed instead of skipping lock check
+            mig_no_ip = "mig-no-ip-r3"
+            ckpt_no_ip = harness.work_b / mig_no_ip / "final"
+            ckpt_no_ip.mkdir(parents=True, exist_ok=True)
+            (ckpt_no_ip / "inventory.img").write_bytes(b"IMG")
+            cfg_no_ip = MigrationConfig(
+                pid=1234,
+                workload_id="srv-no-ip",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=MigrationStrategy.COLD,
+                workload_ip=None,
+                tcp_established=True,
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            harness.service_b.restore_process(mig_no_ip, "10.0.0.1", config_to_dict(cfg_no_ip))
+            res_no_ip = harness.service_b.verify_restored_stopped(5678, migration_id=mig_no_ip)
+            self.assertFalse(res_no_ip["healthy"])
+            self.assertIn("workload_ip is not configured", res_no_ip["reason"])
 
 
 if __name__ == "__main__":

@@ -878,10 +878,63 @@ class AcceptanceAgentService(AgentService):
         self,
         restored_pid: int,
         migration_id: Optional[str] = None,
+        workload_ip: Optional[str] = None,
     ) -> Dict[str, Any]:
         if self._fail_verify_restored_stopped and migration_id and ("m2" in migration_id or "-2" in migration_id):
             return {"healthy": False, "reason": "Injected verify_restored_stopped failure on Member 2"}
-        return super().verify_restored_stopped(restored_pid, migration_id)
+        return super().verify_restored_stopped(restored_pid, migration_id, workload_ip=workload_ip)
+
+
+def _simulate_nft_cmd(
+    tables: Dict[str, Dict[str, Any]],
+    cmd: List[str],
+) -> subprocess.CompletedProcess:
+    """In-memory nftables ruleset emulator for non-Linux POSIX_PROCESS_CLONE acceptance runs."""
+    if len(cmd) >= 5 and cmd[1:4] == ["add", "table", "inet"]:
+        tname = cmd[4]
+        if tname in tables:
+            raise subprocess.CalledProcessError(1, cmd, stderr="File exists")
+        tables[tname] = {"chains": {}, "rules": {}}
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    if len(cmd) >= 5 and cmd[1:4] == ["flush", "table", "inet"]:
+        tname = cmd[4]
+        if tname not in tables:
+            raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+        tables[tname] = {"chains": {}, "rules": {}}
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    if len(cmd) >= 7 and cmd[1:4] == ["add", "chain", "inet"]:
+        tname, cname, spec = cmd[4], cmd[5], cmd[6]
+        if tname not in tables:
+            raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+        tables[tname]["chains"][cname] = spec.strip("{} ").rstrip(" ;")
+        tables[tname]["rules"].setdefault(cname, [])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    if len(cmd) >= 7 and cmd[1:4] == ["add", "rule", "inet"]:
+        tname, cname = cmd[4], cmd[5]
+        if tname not in tables or cname not in tables[tname]["chains"]:
+            raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+        tables[tname]["rules"][cname].append(" ".join(cmd[6:]))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    if len(cmd) >= 5 and cmd[1:4] == ["delete", "table", "inet"]:
+        tname = cmd[4]
+        if tname not in tables:
+            raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+        del tables[tname]
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    if len(cmd) >= 5 and cmd[1:4] == ["list", "table", "inet"]:
+        tname = cmd[4]
+        if tname not in tables:
+            raise subprocess.CalledProcessError(1, cmd, stderr="No such file or directory")
+        lines = [f"table inet {tname} {{"]
+        for cname, spec in tables[tname]["chains"].items():
+            lines.append(f"\tchain {cname} {{")
+            lines.append(f"\t\t{spec}; policy accept;")
+            for r in tables[tname]["rules"].get(cname, []):
+                lines.append(f"\t\t{r}")
+            lines.append("\t}")
+        lines.append("}")
+        return subprocess.CompletedProcess(cmd, 0, "\n".join(lines) + "\n", "")
+    return subprocess.CompletedProcess(cmd, 0, "", "")
 
 
 def _can_run_real_criu() -> bool:
@@ -957,6 +1010,8 @@ class AcceptanceClusterHarness:
         self._unshare_by_restored_pid: Dict[int, Tuple[Optional[int], Optional[subprocess.Popen]]] = {}
         self._vip_by_workload_id: Dict[str, str] = {}
         self._next_vip_octet: int = 10
+        self._sim_nft_a: Dict[str, Dict[str, Any]] = {}
+        self._sim_nft_b: Dict[str, Dict[str, Any]] = {}
         self._netns_fabric: Optional[RealNetnsL2Fabric] = (
             RealNetnsL2Fabric()
             if (self.backend == "REAL_CRIU" and _can_run_real_criu())
@@ -1006,14 +1061,18 @@ class AcceptanceClusterHarness:
         return self._netns_fabric.ns_b if self._netns_fabric is not None else None
 
     def create_workload_tcp_pair(self, workload_id: str) -> Tuple[socket.socket, socket.socket]:
+        vip = self._vip_by_workload_id.get(workload_id)
+        if vip is None:
+            vip = f"10.200.0.{self._next_vip_octet}"
+            self._next_vip_octet += 1
+            self._vip_by_workload_id[workload_id] = vip
         if self._netns_fabric is not None:
-            vip = self._vip_by_workload_id.get(workload_id)
-            if vip is None:
-                vip = f"10.200.0.{self._next_vip_octet}"
-                self._next_vip_octet += 1
-                self._vip_by_workload_id[workload_id] = vip
             return self._netns_fabric.allocate_tcp_socketpair(vip)
         return _create_tcp_socketpair()
+
+    def vip_for(self, workload_id: str) -> str:
+        vip = self._vip_by_workload_id.get(workload_id, "10.200.0.10")
+        return f"{vip}/24"
 
     def teardown(self) -> None:
         for _pid, (init_pid, unshare_proc) in list(self._unshare_by_restored_pid.items()):
@@ -1273,6 +1332,14 @@ class AcceptanceClusterHarness:
         if sig == signal.SIGCONT and self._netns_fabric is not None and vip and is_root:
             self._netns_fabric.unfence_vip(self._netns_fabric.ns_b, vip)
             self._netns_fabric.route_vip_to_b(vip)
+        elif sig == signal.SIGCONT and self._netns_fabric is None:
+            st_path = self.proc_b / str(pid) / "status"
+            if st_path.exists():
+                try:
+                    txt = st_path.read_text(encoding="utf-8")
+                    st_path.write_text(txt.replace("State:\tT (stopped)", "State:\tS (sleeping)"), encoding="utf-8")
+                except OSError:
+                    pass
 
         if sig == signal.SIGKILL and self._netns_fabric is not None and vip and is_root:
             self._netns_fabric.fence_vip(self._netns_fabric.ns_b, vip)
@@ -1357,6 +1424,17 @@ class AcceptanceClusterHarness:
 
             cmd_str = " ".join(cmd)
             self.commands_executed.append(cmd_str)
+
+            if cmd[0] == "nft":
+                if self._netns_fabric is not None:
+                    target_ns = self._netns_fabric.ns_a if is_source else self._netns_fabric.ns_b
+                    return subprocess.run(
+                        ["nsenter", f"--net=/var/run/netns/{target_ns}", *cmd],
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    )
+                return _simulate_nft_cmd(self._sim_nft_a if is_source else self._sim_nft_b, cmd)
 
             if is_source:
                 if len(cmd) >= 2 and cmd[0] == "criu":
@@ -1613,8 +1691,12 @@ class AcceptanceClusterHarness:
 
                             pid_dir = self.proc_b / str(restored_host_pid)
                             pid_dir.mkdir(parents=True, exist_ok=True)
+                            stat_link = pid_dir / "stat"
+                            if stat_link.exists() or stat_link.is_symlink():
+                                stat_link.unlink()
+                            os.symlink(f"/proc/{restored_host_pid}/stat", stat_link)
                             (pid_dir / "status").write_text(
-                                f"Name:\tstateful-srv\nVmRSS:\t32768 kB\nNSpid:\t{restored_host_pid}\t{ns_root_pid}\n",
+                                f"Name:\tstateful-srv\nState:\tT (stopped)\nVmRSS:\t32768 kB\nNSpid:\t{restored_host_pid}\t{ns_root_pid}\n",
                                 encoding="utf-8",
                             )
                             task_dir = pid_dir / "task" / str(restored_host_pid)
@@ -1626,8 +1708,12 @@ class AcceptanceClusterHarness:
                             for cp in restored_children_host_pids:
                                 cp_dir = self.proc_b / str(cp)
                                 cp_dir.mkdir(parents=True, exist_ok=True)
+                                cp_stat_link = cp_dir / "stat"
+                                if cp_stat_link.exists() or cp_stat_link.is_symlink():
+                                    cp_stat_link.unlink()
+                                os.symlink(f"/proc/{cp}/stat", cp_stat_link)
                                 (cp_dir / "status").write_text(
-                                    f"Name:\tstateful-worker\nVmRSS:\t4096 kB\nNSpid:\t{cp}\t2\n",
+                                    f"Name:\tstateful-worker\nState:\tT (stopped)\nVmRSS:\t4096 kB\nNSpid:\t{cp}\t2\n",
                                     encoding="utf-8",
                                 )
                         elif sock_for_restore is not None:
@@ -1639,12 +1725,28 @@ class AcceptanceClusterHarness:
                             if wl_id == "acc-workload":
                                 self.dest_workload = dw
                             self.dest_workloads[wl_id] = dw
-                            # Update proc_b for restored pid
+                            # Update proc_b for restored pid and child workers
                             pid = dw.root_pid
                             if pid:
                                 pid_dir = self.proc_b / str(pid)
                                 pid_dir.mkdir(parents=True, exist_ok=True)
-                                (pid_dir / "status").write_text(f"Name:\tstateful-srv\nVmRSS:\t32768 kB\nNSpid:\t{pid}\t1\n", encoding="utf-8")
+                                (pid_dir / "status").write_text(
+                                    f"Name:\tstateful-srv\nState:\tT (stopped)\nVmRSS:\t32768 kB\nNSpid:\t{pid}\t1\n",
+                                    encoding="utf-8",
+                                )
+                                task_dir = pid_dir / "task" / str(pid)
+                                task_dir.mkdir(parents=True, exist_ok=True)
+                                (task_dir / "children").write_text(
+                                    " ".join(str(cp) for cp in dw.children_pids),
+                                    encoding="utf-8",
+                                )
+                                for cp in dw.children_pids:
+                                    cp_dir = self.proc_b / str(cp)
+                                    cp_dir.mkdir(parents=True, exist_ok=True)
+                                    (cp_dir / "status").write_text(
+                                        f"Name:\tstateful-worker\nState:\tT (stopped)\nVmRSS:\t4096 kB\nNSpid:\t{cp}\t2\n",
+                                        encoding="utf-8",
+                                    )
                         self.criu_restore_duration_ms = (time.monotonic() - t_rst_0) * 1000.0
 
             return subprocess.CompletedProcess(cmd, 0, f"{self.criu_version}\n", "")
@@ -1745,6 +1847,7 @@ def run_acceptance_scenario(
                 strategy=strategy,
                 fs_mode=FilesystemMode.SHARED,
                 ip_mobility=IpMobilityMode.NONE,
+                workload_ip=harness.vip_for("acc-workload"),
                 verify_attestation=True,
                 attestation_key_hex=attest_key,
                 wipe_images_on_commit=False,
@@ -1829,6 +1932,8 @@ def run_acceptance_scenario(
                         source_addr="10.0.0.1:9700",
                         dest_addr="10.0.0.2:9700",
                         strategy=strategy,
+                        ip_mobility=IpMobilityMode.NONE,
+                        workload_ip=harness.vip_for("acc-workload-2"),
                         journal_dir=str(wal_root),
                         tls=TlsConfig(enabled=False),
                     )
@@ -1882,6 +1987,8 @@ def run_acceptance_scenario(
                         source_addr="10.0.0.1:9700",
                         dest_addr="10.0.0.2:9700",
                         strategy=strategy,
+                        ip_mobility=IpMobilityMode.NONE,
+                        workload_ip=harness.vip_for("acc-workload-2"),
                         journal_dir=str(wal_root),
                         tls=TlsConfig(enabled=False),
                     )
