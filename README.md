@@ -33,7 +33,7 @@
   - Every state transition and decision (`PREPARING`, `COMMITTED`, `ABORTING`, `ROLLED_BACK`) is recorded to an append-only JSONL log with mandatory `os.fsync` barriers on both the `.wal.jsonl` descriptor and its parent directory descriptor before remote RPC dispatch (propagating any `OSError` on file or directory `fsync` without advancing journal state). `open_migration_journal` and `MigrationJournal` operate strictly fail-closed: they never fall back to volatile `/tmp` directories on `OSError`/`PermissionError`, and enforce persistent backing-storage verification (`require_persistent=True`) **by default across every `journal_dir`** (both `/var/lib/lkmp/journals` and custom `--journal-dir` paths), rejecting volatile `tmpfs`/`ramfs`/`devtmpfs`/`rootfs` mounts so commit/abort decisions survive host reboots.
   - If the migration controller crashes mid-flight, the state is deterministically recovered via:
     ```bash
-    lkmp recover --journal /var/lib/lkmp/migrations/<id>/.wal.jsonl --source 10.0.1.10:9440 --dest 10.0.1.11:9440
+    lkmp recover --journal /var/lib/lkmp/journals/<id>.wal.jsonl --source 10.0.1.10:9700 --dest 10.0.1.11:9700
     ```
     If `COMMITTED` was fsynced, recovery performs idempotent roll-forward; otherwise, it guarantees an automated, safe rollback to Source A.
 
@@ -125,7 +125,9 @@ sequenceDiagram
     Note over A: Attest manifest.sig.json (metadata + dest pages root) + rsync metadata .img
     CLI->>A: release_ip(workload_ip) (Setup IPIP hairpin tunnel dev lkmp<id>)
     CLI->>B: restore_process()
-    Note over B: 1. ip addr replace <ip>/32 (BEFORE criu restore so TCP_REPAIR succeeds)<br/>2. Verify HMAC & Merkle attestation<br/>3. criu restore --tcp-established --leave-stopped
+    Note over B: 1. Verify HMAC & Merkle attestation<br/>2. nftables lock on B (lkmp_lock_<id>_<ip>)<br/>3. ip addr replace <ip>/32 (BEFORE criu restore so TCP_REPAIR succeeds)<br/>4. criu restore --tcp-established --leave-stopped
+    CLI->>B: verify_restored_stopped(restored_pid)
+    Note over B: Confirm /proc/<pid>/stat 'T'/'t' across tree + active nft list table drop rules
     CLI->>B: claim_ip_and_resume(restored_pid)
     B->>NET: Broadcast Gratuitous ARP / BGP /32 route + SIGCONT to restored process
     end
@@ -262,7 +264,7 @@ Every phase transition is persisted to an append-only `.wal.jsonl` log using `os
 If the controller host crashes or loses power, the operator simply re-executes recovery:
 ```bash
 lkmp recover \
-  --journal /var/lib/lkmp/migrations/mig-9a2c/.wal.jsonl \
+  --journal /var/lib/lkmp/journals/mig-9a2c.wal.jsonl \
   --source 10.0.1.10:9700 \
   --dest 10.0.1.11:9700
 ```
@@ -398,7 +400,7 @@ sudo ./bin/lkmp run \
 
 ```bash
 ./bin/lkmp recover \
-  --journal /var/lib/lkmp/migrations/mig-srv-1/.wal.jsonl \
+  --journal /var/lib/lkmp/journals/mig-srv-1.wal.jsonl \
   --source 10.0.0.1:9700 \
   --dest 10.0.0.2:9700 \
   --tls-ca /etc/lkmp/ca.pem \
@@ -464,7 +466,8 @@ To maintain rigorous transparency, the verification scope is divided into automa
   - **Scenario 11 (Milestone)**: Active `AF_INET` TCP request-response loop + `state.log` file writer surviving a **forced controller restart** mid-cutover via `recover_from_journal()`, measuring both `client_observed_blackout_ms` and `criu_restore_duration_ms` with zero lost/duplicated records and zero dual execution.
   - **Scenario 12**: Same-Host Two-VM CoW Snapshot Fast Path (`SAME_HOST_COW`) executing through `MigrationOrchestrator.execute()` and verifying production `transfer_final_state` invokes CoW reflink cloning (`cp --reflink=auto` / `cp -c`) without `rsync`.
 - **4-State Portability Assessment (`lkmp portability`)**: Evaluates `BLOCKED` / `PREPARE` / `UNKNOWN` / `VERIFIED` across `memory_and_cpu`, `files`, `network`, `devices`, and `external_resources` for all child PIDs in the process tree.
-- **Crash Recovery WAL (`.wal.jsonl` & `.gang.wal.jsonl`)**: Enabled by default in `MigrationOrchestrator` and `lkmp migrate`, with orphaned `restore_state.json` / `restored.pid` discovery so controller crashes between `restore_process` and WAL recording still deterministically terminate any target process on rollback.
+- **Crash Recovery WAL (`<id>.wal.jsonl` & `<gang_id>.gang.wal.jsonl`)**: Enabled by default in `MigrationOrchestrator` and `lkmp migrate`, enforcing persistent backing-storage checks (`require_persistent=True`) across *all* `journal_dir` paths (rejecting `tmpfs`/`ramfs`), fail-closed file and parent-directory `os.fsync` barriers, and orphaned `restore_state.json` / `restored.pid` discovery so controller crashes between `restore_process` and WAL recording still deterministically terminate any target process on rollback.
+- **2PC Stopped-Readiness & Network Lock Barrier (`verify_restored_stopped`)**: Confirms across every PID and thread in the restored process tree that the kernel state in `/proc/<pid>/stat` is stopped (`T`/`t`) and confirms via `nft list table inet <table>` that both `input` (`daddr <ip> drop`) and `output` (`saddr <ip> drop`) filter chains are active on Destination B before Phase 1 completes.
 - **Fail-Closed mTLS & Path Traversal Defenses**: Mandatory `ca_cert` + `cert_file` + `key_file` with `ssl.CERT_REQUIRED` when `tls.enabled=True`, and strict `is_relative_to(work_dir)` path validation.
 
 ### Requires Dual-Host Physical Network Fabric (`CAP_SYS_ADMIN` + `CAP_NET_ADMIN` + CRIU >= 3.19)
