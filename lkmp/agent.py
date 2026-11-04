@@ -6,6 +6,7 @@ import dataclasses
 import errno
 import json
 import os
+import secrets
 import shlex
 import signal
 import socket
@@ -31,7 +32,7 @@ from lkmp.config import (
 from lkmp.convergence import measure_predump_dirty_bytes
 from lkmp.criu_driver import CriuDriver
 from lkmp.envelope import EnvelopeManager
-from lkmp.fs_sync import FilesystemSyncManager
+from lkmp.fs_sync import STORAGE_PROBE_FILENAME, FilesystemSyncManager
 from lkmp.journal import validate_safe_identifier
 from lkmp.models import FileArtifact, HostCapabilities, ProcessSnapshotInfo
 from lkmp.network import (
@@ -157,6 +158,7 @@ class AgentService:
         self._send_signal = signal_sender or os.kill
         self._check_pid_alive = pid_alive_checker or self._default_pid_alive
         self._tcp_repair_handler = tcp_repair_handler
+        self._instance_id = secrets.token_hex(16)
 
     def _uses_real_linux_proc(self) -> bool:
         if not sys.platform.startswith("linux"):
@@ -386,7 +388,22 @@ class AgentService:
         mig_dir = self._migration_dir(migration_id)
         mig_dir.mkdir(parents=True, exist_ok=True)
         final_dir = self._round_dir(migration_id, "final")
-        return {"migration_dir": str(mig_dir), "images_dir": str(final_dir)}
+        final_dir.mkdir(parents=True, exist_ok=True)
+        probe_token = secrets.token_hex(16)
+        probe_payload = {
+            "agent_id": self._instance_id,
+            "migration_id": migration_id,
+            "token": probe_token,
+        }
+        (mig_dir / STORAGE_PROBE_FILENAME).write_text(
+            json.dumps(probe_payload), encoding="utf-8"
+        )
+        return {
+            "migration_dir": str(mig_dir),
+            "images_dir": str(final_dir),
+            "dest_agent_id": self._instance_id,
+            "storage_probe_token": probe_token,
+        }
 
     def pre_sync_fs(self, config_dict: Dict[str, Any], dest_host: str) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
@@ -600,23 +617,37 @@ class AgentService:
         dest_host: str,
         config: MigrationConfig,
         dest_images_dir: Optional[str],
+        dest_probe_token: Optional[str] = None,
     ) -> Optional[str]:
-        if dest_images_dir:
-            return dest_images_dir
-        if not self.fs.is_same_host_or_shared_storage(config.source_addr, dest_host):
+        if not config.same_host_cow:
             return None
-        dest_port = 9700
-        if ":" in config.dest_addr:
-            try:
-                dest_port = int(config.dest_addr.rsplit(":", 1)[1])
-            except ValueError:
-                dest_port = 9700
-        srv = _ACTIVE_SERVERS.get((dest_host, dest_port)) or _ACTIVE_SERVERS.get(("127.0.0.1", dest_port))
-        if srv is not None and srv.service is not self:
-            return str(srv.service._round_dir(migration_id, "final"))
-        if self.work_dir.name == "work_a" and (self.work_dir.parent / "work_b").exists():
-            return str((self.work_dir.parent / "work_b" / migration_id / "final").resolve())
-        return str(self._round_dir(migration_id, "final"))
+        img_dir = self._round_dir(migration_id, "final")
+        candidates: List[str] = []
+        if dest_images_dir:
+            candidates.append(dest_images_dir)
+        else:
+            dest_port = 9700
+            if ":" in config.dest_addr:
+                try:
+                    dest_port = int(config.dest_addr.rsplit(":", 1)[1])
+                except ValueError:
+                    dest_port = 9700
+            srv = _ACTIVE_SERVERS.get((dest_host, dest_port)) or _ACTIVE_SERVERS.get(("127.0.0.1", dest_port))
+            if srv is not None and srv.service is not self:
+                candidates.append(str(srv.service._round_dir(migration_id, "final")))
+
+        for candidate in candidates:
+            if self.fs.is_same_host_or_shared_storage(
+                config.source_addr,
+                dest_host,
+                source_dir=img_dir,
+                dest_dir=candidate,
+                expected_probe_token=dest_probe_token,
+                source_agent_id=self._instance_id,
+                expected_migration_id=migration_id,
+            ):
+                return candidate
+        return None
 
     def transfer_final_state(
         self,
@@ -625,6 +656,7 @@ class AgentService:
         config_dict: Dict[str, Any],
         dest_pages_merkle_root: Optional[str] = None,
         dest_images_dir: Optional[str] = None,
+        dest_probe_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
         img_dir = self._round_dir(migration_id, "final")
@@ -653,6 +685,7 @@ class AgentService:
             dest_host=dest_host,
             config=config,
             dest_images_dir=dest_images_dir,
+            dest_probe_token=dest_probe_token,
         )
         used_cow = resolved_dest_img_dir is not None
         self.fs.sync_checkpoint_images(
@@ -661,6 +694,9 @@ class AgentService:
             include_pages=include_pages,
             source_host=config.source_addr,
             dest_images_dir=resolved_dest_img_dir,
+            dest_probe_token=dest_probe_token,
+            source_agent_id=self._instance_id,
+            migration_id=migration_id,
         )
         snap_dir = img_dir / "vol_snap"
         self.fs.final_delta_sync(
@@ -761,12 +797,6 @@ class AgentService:
         migration_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
-        cmds = self.net.announce_ip_on_host(config, target_host=target_host, ensure_assigned=True)
-        self.net.unlock_network(config.workload_ip, migration_id=migration_id)
-        if config.workload_id:
-            validate_safe_identifier(config.workload_id, "workload_id")
-            self.envelope.unfreeze_cgroup(config.workload_id)
-
         tree_pids: Optional[List[int]] = None
         starttimes: Optional[Dict[str, int]] = None
         if migration_id:
@@ -788,13 +818,21 @@ class AgentService:
                     except Exception:
                         pass
 
-        if restored_pid is not None:
-            self._signal_process_tree(
-                int(restored_pid),
-                signal.SIGCONT,
-                recorded_pids=tree_pids,
-                expected_starttimes=starttimes,
-            )
+        if restored_pid is None or int(restored_pid) <= 0:
+            raise RuntimeError("No restored PID found on destination; refusing to claim IP or resume")
+
+        cmds = self.net.announce_ip_on_host(config, target_host=target_host, ensure_assigned=True)
+        self.net.unlock_network(config.workload_ip, migration_id=migration_id)
+        if config.workload_id:
+            validate_safe_identifier(config.workload_id, "workload_id")
+            self.envelope.unfreeze_cgroup(config.workload_id)
+
+        self._signal_process_tree(
+            int(restored_pid),
+            signal.SIGCONT,
+            recorded_pids=tree_pids,
+            expected_starttimes=starttimes,
+        )
 
         if config.resume_cmd:
             subprocess.run(
@@ -830,10 +868,14 @@ class AgentService:
                     except Exception:
                         pass
 
-        if restored_pid is None:
-            return {"healthy": True, "reason": "No restored PID found"}
+        try:
+            pid_int = int(restored_pid) if restored_pid is not None else 0
+        except (TypeError, ValueError):
+            pid_int = 0
+        if pid_int <= 0:
+            return {"healthy": False, "reason": "No restored PID found on destination"}
 
-        tree_pids = discover_process_tree_pids(int(restored_pid), self.proc_root)
+        tree_pids = discover_process_tree_pids(pid_int, self.proc_root)
         for p in tree_pids:
             if not self._check_pid_alive(p):
                 return {

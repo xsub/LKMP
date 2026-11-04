@@ -831,13 +831,15 @@ class TestPortabilityAndRecovery(unittest.TestCase):
                     "volume_snapshot_cmd",
                 ]
                 self.assertEqual(execution_order, expected_order)
-                self.assertEqual(len(nft_cmds), 6)
-                self.assertEqual(sum(1 for c in nft_cmds if "drop" in c), 2)
+                self.assertEqual(len(nft_cmds), 1)
+                self.assertIn("flush table inet", nft_cmds[0][1])
+                self.assertEqual(nft_cmds[0][1].count(" drop;"), 2)
 
     def test_05_same_host_cow_fast_path(self) -> None:
         """
         Verify FilesystemSyncManager.cow_clone_directory clones .img files respecting include_pages,
-        and FilesystemSyncManager.is_same_host_or_shared_storage detects same-host endpoints.
+        and FilesystemSyncManager.is_same_host_or_shared_storage rejects address/loopback heuristics
+        and requires cryptographic storage-probe verification.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -869,11 +871,31 @@ class TestPortabilityAndRecovery(unittest.TestCase):
             self.assertTrue((dst_dir_all / "pages-1.img").exists())
             self.assertEqual(len(cloned_all), 3)
 
-            # 3. Verify same-host / shared storage detection
-            self.assertTrue(FilesystemSyncManager.is_same_host_or_shared_storage("10.0.0.1:9700", "10.0.0.1:9701"))
-            self.assertTrue(FilesystemSyncManager.is_same_host_or_shared_storage("127.0.0.1:9700", "127.0.0.1:9701"))
-            self.assertTrue(FilesystemSyncManager.is_same_host_or_shared_storage("localhost:9700", "127.0.0.1:9700"))
+            # 3. Address/loopback equality NEVER suffices without verified shared storage probe
+            self.assertFalse(FilesystemSyncManager.is_same_host_or_shared_storage("10.0.0.1:9700", "10.0.0.1:9701"))
+            self.assertFalse(FilesystemSyncManager.is_same_host_or_shared_storage("127.0.0.1:9700", "127.0.0.1:9701"))
+            self.assertFalse(FilesystemSyncManager.is_same_host_or_shared_storage("localhost:9700", "127.0.0.1:9700"))
             self.assertFalse(FilesystemSyncManager.is_same_host_or_shared_storage("10.0.0.1:9700", "10.0.0.2:9700"))
+            self.assertFalse(
+                FilesystemSyncManager.is_same_host_or_shared_storage(
+                    "127.0.0.1:9700", "127.0.0.1:9701", source_dir=src_dir, dest_dir=dst_dir_all
+                )
+            )
+            (dst_dir_all / ".lkmp_storage_probe.json").write_text(
+                json.dumps({"agent_id": "agent-b", "migration_id": "m1", "token": "tok-123"}),
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                FilesystemSyncManager.is_same_host_or_shared_storage(
+                    "10.0.0.1:9700",
+                    "10.0.0.2:9700",
+                    source_dir=src_dir,
+                    dest_dir=dst_dir_all,
+                    expected_probe_token="tok-123",
+                    source_agent_id="agent-a",
+                    expected_migration_id="m1",
+                )
+            )
 
     def test_06_cli_migrate_enables_wal_by_default_and_cli_portability_command(self) -> None:
         """

@@ -30,12 +30,12 @@
   - **Default Syscall-Boundary Crash Consistency**: The process tree is frozen via the `cgroup v2` freezer controller, actively polling `/sys/fs/cgroup/<workload>/cgroup.events` until `frozen 1` is observed before invoking CRIU dump.
   - **Application-Quiesced Consistency (`--quiesce-cmd` / `--resume-cmd`)**: For database engines and stateful network services, `--quiesce-cmd` executes prior to packet locking and cgroup freezing to allow the application to drain in-flight requests, flush memory buffers, and run `fsync`. If the migration commits or rolls back, `--resume-cmd` is invoked to resume background application timers and processing loops.
 - **Write-Ahead Log (`.wal.jsonl`, `lkmp/journal.py`)**:
-  - Every state transition and decision (`PREPARING`, `COMMITTED`, `ABORTING`, `ROLLED_BACK`) is recorded to an append-only JSONL log with mandatory `os.fsync` barriers on both the `.wal.jsonl` descriptor and its parent directory descriptor before remote RPC dispatch (propagating any `OSError` on file or directory `fsync` without advancing journal state). `open_migration_journal` and `MigrationJournal` operate strictly fail-closed: they never fall back to volatile `/tmp` directories on `OSError`/`PermissionError`, and enforce persistent backing-storage verification (`require_persistent=True`) **by default across every `journal_dir`** (both `/var/lib/lkmp/journals` and custom `--journal-dir` paths), rejecting volatile `tmpfs`/`ramfs`/`devtmpfs`/`rootfs` mounts so commit/abort decisions survive host reboots.
+  - Every state transition and decision (`PREPARING`, `PREPARED_STOPPED`, `COMMITTED`, `ABORTING`, `ROLLED_BACK`) is recorded to an append-only JSONL log with per-entry canonical SHA-256 checksums and mandatory `os.fsync` barriers on both the `.wal.jsonl` descriptor and its parent directory descriptor before remote RPC dispatch (propagating any `OSError` on file or directory `fsync` without advancing journal state). `open_migration_journal` and `MigrationJournal` operate strictly fail-closed: they never fall back to volatile `/tmp` directories on `OSError`/`PermissionError`, enforce persistent backing-storage verification (`require_persistent=True`) **by default across every `journal_dir`** (rejecting `tmpfs`/`ramfs`/`devtmpfs`/`rootfs`), raise `ValueError` on any mid-file JSON/checksum tampering, and cleanly discard an un-fsynced torn trailing line at EOF (`discarded_torn_tail=True`) when a valid committed prefix exists.
   - If the migration controller crashes mid-flight, the state is deterministically recovered via:
     ```bash
     lkmp recover --journal /var/lib/lkmp/journals/<id>.wal.jsonl --source 10.0.1.10:9700 --dest 10.0.1.11:9700
     ```
-    If `COMMITTED` was fsynced, recovery performs idempotent roll-forward; otherwise, it guarantees an automated, safe rollback to Source A.
+    If the journal belongs to a 2PC gang (`gang_id`), `recover_from_journal` consults the authoritative `<gang_id>.gang.wal.jsonl` **first** (failing closed if missing) so a crash between gang `COMMITTED` and member `COMMITTED` never triggers a conflicting member rollback. Before executing `commit_source` (`SIGKILL` on Source A), recovery verifies Destination B holds a live restored PID (`verify_process` rejects missing/invalid PIDs).
 
 ### 2. Supervised CRIU Daemons & Complete Memory Page Movement
 - **Non-Blocking RPC Orchestration (`lkmp/criu_driver.py`, `lkmp/agent.py`)**:
@@ -49,8 +49,8 @@
 ### 3. Pre-Restore IP Assignment & Per-Migration `nftables` Isolation
 - **Pre-Restore Socket Binding (`lkmp/network.py`)**:
   - Destination B assigns the workload IP (`ip addr replace <ip>/32 dev <iface>`) **before** invoking `criu restore --tcp-established`. This guarantees that kernel `TCP_REPAIR` socket `bind()` operations succeed immediately during descriptor reconstitution without `EADDRNOTAVAIL` errors.
-- **Isolated & Idempotent Per-Migration Fencing**:
-  - During the freeze window, Source A is fenced using an isolated, per-migration table: `lkmp_lock_<migration_id>_<ip>`, executing the full 6-command `nftables` sequence (`add table`, `flush table`, `input`/`output` filter chains, and `ip daddr`/`ip saddr` `drop` rules). Repeated `lock_network` invocations are genuinely idempotent—if the table already exists, `lock_network` proceeds directly to `nft flush table` and re-installs the chains and `drop` rules rather than tearing down the existing table. This prevents the host TCP stack from emitting spurious `RST` packets without conflicting with or deleting locks from concurrent migrations on the same physical host.
+- **Isolated & Atomic Per-Migration Fencing**:
+  - During the freeze window, Source A is fenced using an isolated, per-migration table: `lkmp_lock_<migration_id>_<ip>`, committing table creation, flush, `input`/`output` filter chains, and `ip daddr`/`ip saddr` `drop` rules in a **single atomic `nft` batch transaction**. Repeated `lock_network` invocations atomically replace the ruleset inside one kernel `nf_tables` transaction with zero packet-leak window between `flush table` and `drop` rule installation, preventing spurious `RST` packets without conflicting with concurrent migrations on the same physical host.
 - **Bounded-Downtime Packet Locking & IPIP Tunnel Forwarding (`--ip-mobility tunnel|garp|bgp|cloud`)**:
   - The default **Bounded-Downtime Packet Locking & IPIP Tunnel Forwarding** mode establishes an on-demand IPIP tunnel device (`lkmp<id>`) on Source A forwarding in-flight packets to Destination B until network fabric convergence completes. (`--ip-mobility ebpf` is retained as a fully backward-compatible CLI alias for `tunnel`).
   - Announces the relocated IP via Gratuitous ARP (`garp`), BGP `/32` host routes (`bgp`), or cloud VPC API webhooks (`cloud`).
@@ -74,7 +74,7 @@
   - Rather than outputting a misleading percentage score, LKMP reports `UNKNOWN` whenever static read-only inspection cannot prove safety, and reaches `VERIFIED` only when isolated `--check-only` and `--trial-restore` validation succeed.
 - **Podman-Style Consistent Frozen Data Snapshot & Same-Host CoW Fast Path (`lkmp/fs_sync.py`, `lkmp/agent.py`, `lkmp/orchestrator.py`)**:
   - During `freeze_and_final_dump`, LKMP enforces strict Podman-style ordering: `quiesce_cmd` -> `nftables` packet lock -> `cgroup.freeze = 1` (polling `cgroup.events` until `frozen 1`) -> `criu dump --leave-stopped` -> `snapshot_writable_paths_while_frozen` (`--volume-snapshot-cmd` or CoW snapshot into `vol_snap` while the process tree is still frozen). Both `snapshot_writable_paths_while_frozen` and `final_delta_sync` operate strictly fail-closed (`FileNotFoundError`), refusing to fall back to live mutable paths when any configured `writable_path` or its `vol_snap` entry is missing, guaranteeing memory pages and transferred on-disk files correspond to the exact same point in time.
-  - When Source A and Destination B share an underlying host/filesystem (`is_same_host_or_shared_storage`), the production migration pipeline (`execute_prepare_phase` -> `transfer_final_state` -> `sync_checkpoint_images`) automatically invokes Copy-on-Write reflinks (`cow_clone_directory` via `cp --reflink=auto` / `cp -c`) instead of `rsync` for sub-millisecond checkpoint cloning.
+  - When Source A and Destination B genuinely share an underlying host/filesystem (`is_same_host_or_shared_storage`), proven via a per-migration cryptographic probe file (`.lkmp_storage_probe.json` written by Destination B during `prepare_migration` and verified on Source A's local VFS—never inferred from equal IP or loopback addresses alone), the production migration pipeline (`execute_prepare_phase` -> `transfer_final_state` -> `sync_checkpoint_images`) automatically invokes Copy-on-Write reflinks (`cow_clone_directory` via `cp --reflink=auto` / `cp -c`) instead of `rsync`.
 
 ### 6. Adaptive Strategy Auto-Pilot & Knee-of-Curve Convergence
 - **VMA Locality Profiler (`--strategy auto`, `lkmp/pagemap.py`)**:
@@ -248,8 +248,8 @@ sequenceDiagram
 
 #### Gang Migration Invariants
 1. **Stopped-Readiness Barrier**: During Phase 1 (`execute_prepare_phase(keep_stopped_on_prepare=True)`), every member process restored on Destination B remains stopped (`--leave-stopped`) and network-fenced, with `verify_restored_stopped` explicitly confirming kernel stopped state (`T`/`t`) across all restored PIDs/threads and active `nftables` `input`/`output` `drop` rules (`nft list table`) before Phase 1 completes. Meanwhile, all corresponding source processes on Host A remain alive and frozen. No source process is terminated during Phase 1.
-2. **Safe Coordinated Rollback**: If any member fails during Phase 1 (restore failure, network timeout, failed `--health-cmd`, or image tamper), the coordinator fsyncs `ABORTING` to `GangJournal` and rolls back all prepared members, resuming all original processes on Source A via `SIGCONT` with zero data loss.
-3. **Irrevocable Commit Order & WAL Roll-Forward**: Only when all members successfully verify in stopped state does the coordinator fsync `COMMITTED` to `GangJournal`. It then terminates all Source A processes (`commit_source`) before unfreezing Destination B members. If an unexpected fault or network split occurs mid-commit after `COMMITTED` has been fsynced, rollback is NOT possible (since source processes are being or have been killed); instead, `lkmp recover` performs idempotent roll-forward to complete member activation on Destination B.
+2. **Safe Coordinated Rollback**: If any member fails during Phase 1 (restore failure, network timeout, failed `--health-cmd`, or image tamper), the coordinator fsyncs `ABORTING` to `GangJournal` and rolls back all prepared members. It records `ROLLED_BACK` and reports `atomic_rollback_triggered=True` **strictly if and only if** every member confirms `rolled_back=True` (otherwise preserving `ABORTING` and keeping any unconfirmed member fenced).
+3. **Irrevocable Commit Order & Gang-Authoritative WAL Roll-Forward**: Only when all members successfully verify in stopped state does the coordinator fsync `COMMITTED` to `GangJournal`. Each member's WAL embeds `gang_id`, and `MigrationOrchestrator.recover_from_journal` always consults `<gang_id>.gang.wal.jsonl` first so a crash before per-member `COMMITTED` propagation still rolls forward deterministically. Before killing any Source A process (`commit_source`), roll-forward recovery verifies Destination B holds a live restored PID (`verify_process` rejects `None`/dead PIDs).
 
 ### Durable Crash Recovery with Write-Ahead Log (WAL)
 Every phase transition is persisted to an append-only `.wal.jsonl` log using `os.fsync`:
@@ -454,7 +454,7 @@ sudo python3 scripts/linux_criu_e2e.py
 
 To maintain rigorous transparency, the verification scope is divided into automated test assertions and real Linux CRIU kernel testbed runs:
 
-### Proven in CI & Verified on Linux 7.0 + CRIU 4.2.1 (`92 unittest` Cases + `12/12 REAL_CRIU lkmp acceptance` + `4/4 REAL_CRIU E2E`)
+### Proven in CI & Verified on Linux 7.0 + CRIU 4.2.1 (`97 unittest` Cases + `12/12 REAL_CRIU lkmp acceptance` + `4/4 REAL_CRIU E2E`)
 - **Real Linux CRIU 4.2.1 E2E (`scripts/linux_criu_e2e.py`, Verified `4/4 PASS` on Linux `7.0.0-42-generic` x86_64 with CRIU `4.2.1 GitID: f192861`, strict non-zero exit gate)**:
   1. **CRIU CLI Flag Verification (`PASS`)**: Verifies `criu page-server --daemon --pidfile` immediate detachment, passive `/proc/net/tcp` port listening detection, and `--lazy-pages` flag compatibility.
   2. **Scenario A — `REAL_CRIU COLD` Dump & Detached Restore (`PASS`)**: Checkpoints a live multi-process workload (`pstree.img`, `3 core-*.img`, `3 pages-*.img`), terminates the source tree, restores via `criu restore --restore-detached --shell-job`, and verifies continuous `state.log` record advancement (`5 -> 13` records).
@@ -508,7 +508,7 @@ To maintain rigorous transparency, the verification scope is divided into automa
 ├── deploy/
 │   ├── Dockerfile.node           # Hardened Ubuntu 24.04 node image (CRIU, nftables, iproute2, mTLS)
 │   └── docker-compose.test.yml   # Multi-node privileged test cluster on shared L2 bridge
-└── tests/                        # 92 unit, portability, WAL crash recovery & 12-scenario acceptance tests
+└── tests/                        # 97 unit, portability, WAL crash recovery & 12-scenario acceptance tests
 ```
 
 ---

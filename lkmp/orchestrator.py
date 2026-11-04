@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -86,6 +87,7 @@ class MigrationOrchestrator:
         migration_id: Optional[str] = None,
         metrics: Optional[PrometheusMetricsCollector] = None,
         journal_dir: Optional[str | Path] = None,
+        gang_id: Optional[str] = None,
     ) -> None:
         self.config = config
         self.source = source_client
@@ -94,13 +96,18 @@ class MigrationOrchestrator:
             migration_id or f"mig-{uuid.uuid4().hex[:8]}",
             "migration_id",
         )
+        self.gang_id = validate_safe_identifier(gang_id, "gang_id") if gang_id else None
         self.metrics = metrics
         self.state = MigrationState.INIT
         self.state_history: List[MigrationState] = [MigrationState.INIT]
         j_dir = journal_dir if journal_dir is not None else getattr(self.config, "journal_dir", None)
         self.journal: Optional[MigrationJournal] = None
         if j_dir:
-            self.journal = open_migration_journal(j_dir, self.migration_id)
+            self.journal = open_migration_journal(
+                j_dir,
+                self.migration_id,
+                gang_id=self.gang_id,
+            )
 
         # Ensure an ephemeral per-migration attestation key is set if not already provided
         if (
@@ -392,8 +399,12 @@ class MigrationOrchestrator:
             dst_prep = self.dest.call("prepare_migration", migration_id=self.migration_id)
             dest_images_dir = (
                 dst_prep.get("images_dir")
-                if isinstance(dst_prep, dict)
-                and is_same_host_or_shared_storage(self.config.source_addr, self.dest.host)
+                if isinstance(dst_prep, dict) and self.config.same_host_cow
+                else None
+            )
+            dest_probe_token = (
+                dst_prep.get("storage_probe_token")
+                if isinstance(dst_prep, dict) and self.config.same_host_cow
                 else None
             )
 
@@ -507,6 +518,8 @@ class MigrationOrchestrator:
             }
             if dest_images_dir:
                 transfer_kwargs["dest_images_dir"] = dest_images_dir
+            if dest_probe_token:
+                transfer_kwargs["dest_probe_token"] = dest_probe_token
             self.source.call("transfer_final_state", **transfer_kwargs)
 
             # Phase 6: Release IP on Source A (while locked) & Restore on Destination B
@@ -574,6 +587,7 @@ class MigrationOrchestrator:
                 restored_pid=self._restored_pid,
                 health_check_cmd=self.config.health_check_cmd,
                 timeout_sec=self.config.health_check_timeout_sec,
+                migration_id=self.migration_id,
             )
             if not verify_res.get("healthy"):
                 raise RuntimeError(
@@ -749,29 +763,94 @@ class MigrationOrchestrator:
     ) -> MigrationResult:
         """
         Recover an interrupted migration from its durable Write-Ahead Log (`.wal.jsonl`):
-        - If a `COMMITTED` decision was logged prior to the controller crash, completes `commit()`.
+        - If this member belongs to a 2PC gang (`gang_id` recorded in WAL or matching sibling
+          `<gang_id>.gang.wal.jsonl`), consults the authoritative gang WAL FIRST so a crash
+          between `GangJournal` `COMMITTED` and member WAL `COMMITTED` never rolls back a
+          committed gang member (fails closed if the referenced gang WAL is missing).
+        - Before executing `commit_source` (killing Source A), verifies Destination B has a
+          live restored process (`verify_process` fails on missing/dead PID).
         - Otherwise, deterministically executes `rollback()` so Source A resumes safely.
         """
-        journal = MigrationJournal.load(journal_path)
+        j_path = Path(journal_path)
+        journal = MigrationJournal.load(j_path)
         cfg_dict = journal.initial_config_dict
         if cfg_dict is None:
             raise ValueError(f"Journal {journal_path} does not contain migration configuration")
+
+        coupled_gang_id = journal.coupled_gang_id
+        if coupled_gang_id is None:
+            m_gang = re.match(r"^(.+)-m\d+$", journal.migration_id)
+            if m_gang:
+                candidate_gang = m_gang.group(1)
+                if (j_path.parent / f"{candidate_gang}.gang.wal.jsonl").exists():
+                    coupled_gang_id = candidate_gang
+
+        should_commit = journal.has_committed_decision
+        if coupled_gang_id is not None:
+            gang_wal_path = j_path.parent / f"{coupled_gang_id}.gang.wal.jsonl"
+            if not gang_wal_path.exists():
+                raise FileNotFoundError(
+                    f"Cannot recover gang member {journal.migration_id!r}: authoritative gang WAL "
+                    f"is missing at {gang_wal_path} (refusing independent decision)"
+                )
+            gang_journal = MigrationJournal.load(gang_wal_path)
+            should_commit = gang_journal.has_committed_decision
+
         config = config_from_dict(cfg_dict)
         orch = cls(
             config=config,
             source_client=source_client,
             dest_client=dest_client,
             migration_id=journal.migration_id,
-            journal_dir=Path(journal_path).parent,
+            journal_dir=j_path.parent,
+            gang_id=coupled_gang_id,
         )
         orch._t_start = time.monotonic()
-        last = journal.last_entry
-        if last and last.restored_pid is not None:
-            orch._restored_pid = last.restored_pid
+        for entry in reversed(journal.entries):
+            if entry.restored_pid is not None:
+                orch._restored_pid = entry.restored_pid
+                break
         orch.state_history = [MigrationState(e.state) for e in journal.entries]
         if orch.state_history:
             orch.state = orch.state_history[-1]
 
-        if journal.has_committed_decision:
+        if should_commit:
+            pre_verify = dest_client.call(
+                "verify_process",
+                restored_pid=orch._restored_pid,
+                health_check_cmd=None,
+                migration_id=orch.migration_id,
+            )
+            if not pre_verify.get("healthy"):
+                return MigrationResult(
+                    migration_id=orch.migration_id,
+                    success=False,
+                    final_state=MigrationState.ABORTED,
+                    rolled_back=False,
+                    error_message=(
+                        "Refusing roll-forward commit before killing source: "
+                        f"{pre_verify.get('reason')}"
+                    ),
+                    state_history=list(orch.state_history),
+                )
+
+            was_prepared_stopped = any(
+                e.commit_decision == "PREPARED_STOPPED" for e in journal.entries
+            )
+            already_switched_over = any(
+                e.state == MigrationState.SWITCHOVER.value and e.commit_decision == "COMMITTED"
+                for e in journal.entries
+            )
+            if was_prepared_stopped and not already_switched_over:
+                orch._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
+                orch.source.call(
+                    "commit_source",
+                    migration_id=orch.migration_id,
+                    config_dict=config_to_dict(orch.config),
+                )
+                orch.complete_switchover_and_verify()
+                return orch.commit()
+
             return orch.commit()
+
         return orch.rollback("Controller crash recovery: no COMMITTED record in WAL")

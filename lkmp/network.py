@@ -317,6 +317,8 @@ class NetworkMobilityManager:
         """
         Install an isolated, idempotent nftables drop rule for `workload_ip` so the kernel
         never sends TCP RST while the workload is frozen or mid-switchover.
+        Executes table creation, flush, chain setup, and drop rules in a single atomic
+        `nft` netlink transaction so repeated calls never open a packet-leak window.
         """
         if not workload_ip:
             return []
@@ -324,70 +326,24 @@ class NetworkMobilityManager:
         addr = ipaddress.ip_address(bare_ip)
         addr_family = "ip6" if addr.version == 6 else "ip"
         table = self.table_name_for(workload_ip, migration_id)
-        cmds = [
-            ["nft", "add", "table", "inet", table],
-            ["nft", "flush", "table", "inet", table],
-            [
-                "nft",
-                "add",
-                "chain",
-                "inet",
-                table,
-                "input",
-                "{ type filter hook input priority -100 ; }",
-            ],
-            [
-                "nft",
-                "add",
-                "chain",
-                "inet",
-                table,
-                "output",
-                "{ type filter hook output priority -100 ; }",
-            ],
-            [
-                "nft",
-                "add",
-                "rule",
-                "inet",
-                table,
-                "input",
-                addr_family,
-                "daddr",
-                bare_ip,
-                "drop",
-            ],
-            [
-                "nft",
-                "add",
-                "rule",
-                "inet",
-                table,
-                "output",
-                addr_family,
-                "saddr",
-                bare_ip,
-                "drop",
-            ],
-        ]
+        batch = (
+            f"add table inet {table}; "
+            f"flush table inet {table}; "
+            f"add chain inet {table} input {{ type filter hook input priority -100; policy accept; }}; "
+            f"add chain inet {table} output {{ type filter hook output priority -100; policy accept; }}; "
+            f"add rule inet {table} input {addr_family} daddr {bare_ip} drop; "
+            f"add rule inet {table} output {addr_family} saddr {bare_ip} drop;"
+        )
+        cmd = ["nft", batch]
         try:
-            for idx, cmd in enumerate(cmds):
-                try:
-                    self.runner(cmd)
-                except subprocess.CalledProcessError:
-                    # Tolerate pre-existing table on repeated lock_network calls;
-                    # the subsequent 'nft flush table' verifies the table is usable
-                    # and clears any prior rules idempotently.
-                    if idx == 0 and cmd[:3] == ["nft", "add", "table"]:
-                        continue
-                    raise
+            self.runner(cmd)
         except Exception:
             try:
                 self.unlock_network(workload_ip, migration_id)
             except Exception:
                 pass
             raise
-        return cmds
+        return [cmd]
 
     def unlock_network(
         self,
@@ -508,7 +464,13 @@ class NetworkMobilityManager:
             )
 
         for cmd in cmds:
-            self.runner(cmd)
+            try:
+                self.runner(cmd)
+            except subprocess.CalledProcessError as exc:
+                err_text = f"{exc.stderr or ''} {exc.stdout or ''}"
+                if cmd[:3] == ["ip", "addr", "del"] and "Cannot assign requested address" in err_text:
+                    continue
+                raise
         return cmds
 
     def announce_ip_on_host(
@@ -556,7 +518,13 @@ class NetworkMobilityManager:
             cmds.append(shlex.split(formatted))
 
         for cmd in cmds:
-            self.runner(cmd)
+            try:
+                self.runner(cmd)
+            except subprocess.CalledProcessError as exc:
+                err_text = f"{exc.stderr or ''} {exc.stdout or ''}"
+                if cmd[:3] == ["ip", "addr", "del"] and "Cannot assign requested address" in err_text:
+                    continue
+                raise
         return cmds
 
     def claim_ip_on_host(self, config: MigrationConfig, target_host: str) -> List[List[str]]:

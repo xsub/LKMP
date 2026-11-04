@@ -71,6 +71,7 @@ class GangMigrationCoordinator:
                 dest_client=dst,
                 migration_id=f"{self.gang_id}-m{idx}",
                 journal_dir=self.journal.journal_dir,
+                gang_id=self.gang_id,
             )
             for idx, (cfg, src, dst) in enumerate(members, start=1)
         ]
@@ -130,12 +131,31 @@ class GangMigrationCoordinator:
                 rb_res = orch.rollback("Rolled back by 2PC Gang Coordinator due to peer failure")
                 rolled_back_results.append(rb_res)
             rolled_back_results.append(failed_result)
-            self.journal.append(state=MigrationState.ROLLBACK, commit_decision="ROLLED_BACK")
+
+            all_rolled_back = bool(rolled_back_results) and all(
+                r.rolled_back for r in rolled_back_results
+            )
+            if all_rolled_back:
+                self.journal.append(state=MigrationState.ROLLBACK, commit_decision="ROLLED_BACK")
+                err_msg = None
+            else:
+                failed_rb_ids = [
+                    r.migration_id for r in rolled_back_results if not r.rolled_back
+                ]
+                err_msg = (
+                    f"Incomplete gang rollback: members {failed_rb_ids} did not confirm rolled_back=True"
+                )
+                self.journal.append(
+                    state=MigrationState.ROLLBACK,
+                    commit_decision="ABORTING",
+                    note=err_msg,
+                )
             return GangMigrationResult(
                 gang_id=self.gang_id,
                 all_committed=False,
-                atomic_rollback_triggered=True,
+                atomic_rollback_triggered=all_rolled_back,
                 member_results=rolled_back_results,
+                error_message=err_msg,
             )
 
         # 4. Phase 2b (Global Commit): All members prepared and verified stopped on B
@@ -209,6 +229,17 @@ class GangMigrationCoordinator:
                         pass
 
                 try:
+                    pre_verify = orch.dest.call(
+                        "verify_process",
+                        restored_pid=orch._restored_pid,
+                        health_check_cmd=None,
+                        migration_id=orch.migration_id,
+                    )
+                    if not pre_verify.get("healthy"):
+                        raise RuntimeError(
+                            "Refusing roll-forward commit_source: "
+                            f"{pre_verify.get('reason')}"
+                        )
                     orch.source.call(
                         "commit_source",
                         migration_id=orch.migration_id,
@@ -226,21 +257,45 @@ class GangMigrationCoordinator:
                             error_message=f"Roll-forward recovery failed: {exc}",
                         )
                     )
-            all_ok = all(r.success for r in results)
+            all_ok = bool(results) and all(r.success for r in results)
+            err_summary = (
+                "; ".join(r.error_message for r in results if not r.success and r.error_message)
+                if not all_ok
+                else None
+            )
             return GangMigrationResult(
                 gang_id=gang_id,
                 all_committed=all_ok,
                 atomic_rollback_triggered=False,
                 member_results=results,
                 partial_commit_error=not all_ok,
+                error_message=err_summary,
             )
         else:
             for orch in coordinator.orchestrators:
                 res = orch.rollback("Gang recovery: aborting uncommitted gang migration")
                 results.append(res)
+            all_rolled_back = bool(results) and all(r.rolled_back for r in results)
+            if all_rolled_back:
+                coordinator.journal.append(
+                    state=MigrationState.ROLLBACK,
+                    commit_decision="ROLLED_BACK",
+                )
+                err_msg = None
+            else:
+                failed_rb_ids = [r.migration_id for r in results if not r.rolled_back]
+                err_msg = (
+                    f"Incomplete gang recovery rollback: members {failed_rb_ids} did not confirm rolled_back=True"
+                )
+                coordinator.journal.append(
+                    state=MigrationState.ROLLBACK,
+                    commit_decision="ABORTING",
+                    note=err_msg,
+                )
             return GangMigrationResult(
                 gang_id=gang_id,
                 all_committed=False,
-                atomic_rollback_triggered=True,
+                atomic_rollback_triggered=all_rolled_back,
                 member_results=results,
+                error_message=err_msg,
             )

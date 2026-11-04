@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hmac
+import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -10,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 from lkmp.config import FilesystemMode, MigrationConfig, MigrationStrategy
+
+STORAGE_PROBE_FILENAME = ".lkmp_storage_probe.json"
 
 
 def _strip_endpoint(endpoint: str) -> str:
@@ -23,36 +28,92 @@ def _strip_endpoint(endpoint: str) -> str:
     return h
 
 
+def _locate_storage_probe_file(dir_path: Path) -> Optional[Path]:
+    """Locate `.lkmp_storage_probe.json` inside `dir_path` or its migration parent when `dir_path.name == 'final'`."""
+    direct = dir_path / STORAGE_PROBE_FILENAME
+    if direct.is_file():
+        return direct
+    if dir_path.name == "final":
+        parent_probe = dir_path.parent / STORAGE_PROBE_FILENAME
+        if parent_probe.is_file():
+            return parent_probe
+    return None
+
+
 def is_same_host_or_shared_storage(
-    source_host: str,
-    dest_host: str,
+    source_host: str = "",
+    dest_host: str = "",
     source_dir: Optional[str | Path] = None,
     dest_dir: Optional[str | Path] = None,
+    *,
+    expected_probe_token: Optional[str] = None,
+    source_agent_id: Optional[str] = None,
+    expected_migration_id: Optional[str] = None,
 ) -> bool:
     """
-    Determine whether Source A and Destination B are on the same host or share storage.
-    Returns True if:
-    - source_host == dest_host (ignoring ports)
-    - both source_host and dest_host are in ("127.0.0.1", "localhost", "::1")
-    - both source_dir and dest_dir are provided and exist on the local filesystem
-    """
-    s_h = _strip_endpoint(source_host)
-    d_h = _strip_endpoint(dest_host)
+    Verify whether Source A and Destination B genuinely share local/networked storage for
+    `source_dir` and `dest_dir`.
 
-    if s_h == d_h:
+    Never relies on IP addresses or loopback hostnames (`127.0.0.1`, `localhost`, `::1`),
+    because two distinct VMs or unshared containers may share a forwarded/NAT endpoint.
+    Requires both directories to exist on Source A's local VFS AND `dest_dir` (or its
+    migration root when `dest_dir.name == 'final'`) to contain a valid `.lkmp_storage_probe.json`
+    written by a distinct Destination B agent instance.
+    """
+    _ = (source_host, dest_host)
+    if source_dir is None or dest_dir is None:
+        return False
+
+    try:
+        s_path = Path(source_dir)
+        d_path = Path(dest_dir)
+        if not s_path.is_dir() or not d_path.is_dir():
+            return False
+
+        probe_file = _locate_storage_probe_file(d_path)
+        if probe_file is None:
+            return False
+
+        probe_data = json.loads(probe_file.read_text(encoding="utf-8"))
+        if not isinstance(probe_data, dict):
+            return False
+
+        dest_agent_id = probe_data.get("agent_id")
+        probe_token = probe_data.get("token")
+        probe_mig_id = probe_data.get("migration_id")
+        if (
+            not isinstance(dest_agent_id, str)
+            or not dest_agent_id
+            or not isinstance(probe_token, str)
+            or not probe_token
+        ):
+            return False
+
+        if expected_migration_id is not None and probe_mig_id != expected_migration_id:
+            return False
+        if probe_file.parent == d_path.parent and d_path.name == "final":
+            if probe_mig_id and probe_mig_id != d_path.parent.name:
+                return False
+
+        if source_agent_id is not None and dest_agent_id == source_agent_id:
+            return False
+
+        if expected_probe_token is not None:
+            if not hmac.compare_digest(probe_token, str(expected_probe_token)):
+                return False
+        else:
+            src_probe_file = _locate_storage_probe_file(s_path)
+            if src_probe_file is not None:
+                try:
+                    src_probe = json.loads(src_probe_file.read_text(encoding="utf-8"))
+                    if isinstance(src_probe, dict) and src_probe.get("agent_id") == dest_agent_id:
+                        return False
+                except Exception:
+                    return False
+
         return True
-    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
-    if s_h in loopback_hosts and d_h in loopback_hosts:
-        return True
-    if source_dir is not None and dest_dir is not None:
-        try:
-            s_path = Path(source_dir)
-            d_path = Path(dest_dir)
-            if s_path.exists() and d_path.exists():
-                return True
-        except Exception:
-            pass
-    return False
+    except Exception:
+        return False
 
 
 CommandRunner = Callable[[List[str]], subprocess.CompletedProcess]
@@ -101,6 +162,8 @@ class FilesystemSyncManager:
             return cloned
 
         for item in sorted(src.iterdir()):
+            if item.name.startswith(".lkmp_"):
+                continue
             if item.is_symlink():
                 dst_link = dst / item.name
                 if dst_link.exists() or dst_link.is_symlink():
@@ -263,31 +326,43 @@ class FilesystemSyncManager:
         include_pages: bool = False,
         source_host: Optional[str] = None,
         dest_images_dir: Optional[str] = None,
+        dest_probe_token: Optional[str] = None,
+        source_agent_id: Optional[str] = None,
+        migration_id: Optional[str] = None,
     ) -> List[str]:
         """
         Sync checkpoint `.img` and `manifest.sig.json` files from Source A to Destination B.
-        - When `source_host` and `dest_host` are on the same host (or `dest_images_dir` is provided),
-          uses the CoW reflink fast path (`cow_clone_directory`) instead of `rsync`.
+        - When `dest_images_dir` is proven via `.lkmp_storage_probe.json` to reside on shared/local
+          storage visible to Source A, uses the CoW reflink fast path (`cow_clone_directory`)
+          instead of `rsync`. Never relies on IP/loopback equality alone.
         - For COLD migration (`include_pages=True`), transfers all files including `pages-*.img`.
         - For PRE_COPY / LAZY / HYBRID (`include_pages=False`), `pages-*.img` are streamed via
           CRIU page-server / lazy-pages, so only metadata `.img` and `manifest.sig.json` are synced.
         """
         use_cow = bool(
             dest_images_dir is not None
-            or (source_host is not None and self.is_same_host_or_shared_storage(source_host, dest_host))
+            and self.is_same_host_or_shared_storage(
+                source_host or "",
+                dest_host,
+                source_dir=images_dir,
+                dest_dir=dest_images_dir,
+                expected_probe_token=dest_probe_token,
+                source_agent_id=source_agent_id,
+                expected_migration_id=migration_id,
+            )
         )
-        if use_cow:
-            target_dir = dest_images_dir or images_dir
-            if Path(target_dir).resolve() != Path(images_dir).resolve():
+        if use_cow and dest_images_dir is not None:
+            if Path(dest_images_dir).resolve() != Path(images_dir).resolve():
                 return self.cow_clone_directory(
                     images_dir,
-                    target_dir,
+                    dest_images_dir,
                     include_pages=include_pages,
                 )
             return [
                 str(p)
                 for p in sorted(Path(images_dir).iterdir())
                 if p.is_file()
+                and not p.name.startswith(".lkmp_")
                 and (include_pages or not (p.name.startswith("pages-") and p.name.endswith(".img")))
             ]
 

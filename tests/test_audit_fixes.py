@@ -135,6 +135,7 @@ class TestAuditFixesP0(unittest.TestCase):
                 source_addr="10.0.0.1:9700",
                 dest_addr="10.0.0.2:9700",
                 strategy=MigrationStrategy.COLD,
+                same_host_cow=False,
                 verify_attestation=True,
                 attestation_key_hex=attest_key,
                 wipe_images_on_commit=False,
@@ -813,9 +814,8 @@ class TestAuditFixesSecondReview(unittest.TestCase):
 
         def failing_runner(cmd: List[str]) -> subprocess.CompletedProcess:
             executed.append(cmd)
-            # Fail on chain add
-            if "chain" in cmd:
-                raise RuntimeError("nft command failed")
+            if len(cmd) == 2 and cmd[0] == "nft" and "add chain" in cmd[1]:
+                raise RuntimeError("nft batch command failed")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         net = NetworkMobilityManager(runner=failing_runner)
@@ -1235,16 +1235,15 @@ class TestAuditRound2Fixes(unittest.TestCase):
 
     def test_05_idempotent_lock_network_partial_failure_cleanup(self) -> None:
         """
-        Verify that if the 3rd nft command in lock_network raises CalledProcessError,
+        Verify that if the atomic nft batch command in lock_network raises CalledProcessError,
         lock_network automatically runs nft delete table inet <table> before re-raising.
         """
         executed: List[List[str]] = []
 
         def failing_runner(cmd: List[str]) -> subprocess.CompletedProcess:
             executed.append(list(cmd))
-            # 3rd command is the first chain add
-            if len(executed) == 3:
-                raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="nft chain creation failure")
+            if len(executed) == 1:
+                raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="nft batch failure")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         net = NetworkMobilityManager(runner=failing_runner)
@@ -1253,8 +1252,8 @@ class TestAuditRound2Fixes(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             net.lock_network("10.20.30.40", migration_id="mig-fail-clean")
 
-        # 3 commands tried + 1 cleanup command executed (nft delete table inet <table_name>)
-        self.assertEqual(len(executed), 4)
+        # 1 atomic batch command tried + 1 cleanup command executed (nft delete table inet <table_name>)
+        self.assertEqual(len(executed), 2)
         self.assertEqual(executed[-1], ["nft", "delete", "table", "inet", table_name])
 
     def test_06_strict_mtls_requiring_ca_cert(self) -> None:
@@ -1323,15 +1322,15 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
                 config_dict=config_to_dict(cfg),
             )
 
-            self.assertEqual(len(nft_cmds), 6)
-            self.assertEqual(nft_cmds[0][:3], ["nft", "add", "table"])
-            self.assertEqual(nft_cmds[1][:3], ["nft", "flush", "table"])
-            self.assertIn("input", nft_cmds[2])
-            self.assertIn("output", nft_cmds[3])
-            self.assertIn("drop", nft_cmds[4])
-            self.assertIn("daddr", nft_cmds[4])
-            self.assertIn("drop", nft_cmds[5])
-            self.assertIn("saddr", nft_cmds[5])
+            self.assertEqual(len(nft_cmds), 1)
+            self.assertEqual(nft_cmds[0][0], "nft")
+            batch_script = nft_cmds[0][1]
+            self.assertIn("add table inet", batch_script)
+            self.assertIn("flush table inet", batch_script)
+            self.assertIn("hook input", batch_script)
+            self.assertIn("hook output", batch_script)
+            self.assertIn("daddr 10.244.1.10 drop;", batch_script)
+            self.assertIn("saddr 10.244.1.10 drop;", batch_script)
 
     def test_p0_2_no_dual_active_instances_on_rollback_or_commit_errors(self) -> None:
         """
@@ -1652,28 +1651,29 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
                 fs.snapshot_writable_paths_while_frozen(cfg_missing, root / "snap2")
 
     def test_p1_followup_lock_network_idempotent_when_table_already_exists(self) -> None:
-        """P1 follow-up: repeated lock_network tolerates CalledProcessError on 'nft add table' and still flushes + installs drop rules."""
+        """P1/P2 follow-up: repeated lock_network executes a single atomic nft batch without packet-leak window."""
+        from lkmp.acceptance import _simulate_nft_cmd
+
         executed: List[List[str]] = []
-        call_count = [0]
+        tables: Dict[str, Dict[str, Any]] = {}
 
         def runner(cmd: List[str]) -> subprocess.CompletedProcess:
             executed.append(list(cmd))
-            if cmd[:3] == ["nft", "add", "table"]:
-                call_count[0] += 1
-                if call_count[0] >= 2:
-                    raise subprocess.CalledProcessError(1, cmd, stderr="Error: File exists")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+            return _simulate_nft_cmd(tables, cmd)
 
         net = NetworkMobilityManager(runner=runner)
         net.lock_network("10.0.0.50", migration_id="mig-idem")
+        self.assertTrue(net.verify_network_locked("10.0.0.50", migration_id="mig-idem"))
         executed.clear()
 
-        # Second call where 'nft add table' raises CalledProcessError("File exists")
+        # Second call on already-existing table commits atomically in 1 nft batch invocation
         net.lock_network("10.0.0.50", migration_id="mig-idem")
-        self.assertEqual(len(executed), 6)
-        self.assertEqual(executed[1][:3], ["nft", "flush", "table"])
-        self.assertEqual(sum(1 for c in executed if "drop" in c), 2)
-        self.assertFalse(any(c[:3] == ["nft", "delete", "table"] for c in executed))
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(executed[0][0], "nft")
+        self.assertIn("add table inet", executed[0][1])
+        self.assertIn("flush table inet", executed[0][1])
+        self.assertEqual(executed[0][1].count(" drop;"), 2)
+        self.assertTrue(net.verify_network_locked("10.0.0.50", migration_id="mig-idem"))
 
     def test_p1_round2_real_criu_never_kills_source_before_restore_or_restores_backup(self) -> None:
         """P1 round-2: REAL_CRIU acceptance uses isolated L2-bridged netns, never kills source before restore, and verifies starttime on rollback."""
@@ -2008,6 +2008,326 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
             res_no_ip = harness.service_b.verify_restored_stopped(5678, migration_id=mig_no_ip)
             self.assertFalse(res_no_ip["healthy"])
             self.assertIn("workload_ip is not configured", res_no_ip["reason"])
+
+    def test_r4_p0_member_recovery_consults_authoritative_gang_journal_decision(self) -> None:
+        """
+        P0 round-4: If a crash occurs after GangJournal records COMMITTED but before a member's
+        individual WAL appends COMMITTED (still in PREPARED_STOPPED), recovering that single
+        member via MigrationOrchestrator.recover_from_journal MUST consult `.gang.wal.jsonl`,
+        roll forward (killing Source A and resuming Destination B), and NEVER roll back Source A.
+        If the referenced gang WAL is missing, member recovery MUST fail closed.
+        """
+        with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2:
+            h1 = _FakeClusterHarness(tmp1)
+            h2 = _FakeClusterHarness(tmp2)
+            wal_dir = Path(tmp1) / "wal"
+
+            cfg1 = MigrationConfig(
+                pid=1234,
+                workload_id="srv-g1",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.10/24",
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            cfg2 = MigrationConfig(
+                pid=1234,
+                workload_id="srv-g2",
+                source_addr="10.0.0.3:9700",
+                dest_addr="10.0.0.4:9700",
+                strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.11/24",
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+
+            src1 = AgentClient("10.0.0.1:9700", direct_service=h1.service_a)
+            dst1 = AgentClient("10.0.0.2:9700", direct_service=h1.service_b)
+            src2 = AgentClient("10.0.0.3:9700", direct_service=h2.service_a)
+            dst2 = AgentClient("10.0.0.4:9700", direct_service=h2.service_b)
+
+            coordinator = GangMigrationCoordinator(
+                gang_id="gang-r4-gap",
+                journal_dir=str(wal_dir),
+                members=[(cfg1, src1, dst1), (cfg2, src2, dst2)],
+            )
+
+            # Run Phase 1 prepare on both members (stops at PREPARED_STOPPED)
+            for orch in coordinator.orchestrators:
+                prep_res = orch.execute_prepare_phase(keep_stopped_on_prepare=True)
+                self.assertTrue(prep_res.success)
+
+            # Simulate crash in the exact gap: GangJournal appends COMMITTED, member WALs do NOT yet have COMMITTED!
+            coordinator.journal.append(state=MigrationState.COMMIT, commit_decision="COMMITTED")
+            m2_wal = wal_dir / "gang-r4-gap-m2.wal.jsonl"
+            self.assertFalse(MigrationJournal.load(m2_wal).has_committed_decision)
+            self.assertEqual(MigrationJournal.load(m2_wal).coupled_gang_id, "gang-r4-gap")
+
+            # Recover ONLY Member 2 via MigrationOrchestrator.recover_from_journal:
+            # Must follow GangJournal COMMITTED -> roll forward, NEVER resume Source A!
+            rec_m2 = MigrationOrchestrator.recover_from_journal(m2_wal, src2, dst2)
+            self.assertTrue(rec_m2.success)
+            self.assertFalse(rec_m2.rolled_back)
+            self.assertEqual(rec_m2.final_state, MigrationState.COMMIT)
+            self.assertNotIn((1234, signal.SIGCONT), h2.signals_a)
+            self.assertIn((1234, signal.SIGKILL), h2.signals_a)
+            self.assertIn((5678, signal.SIGCONT), h2.signals_b)
+
+            # Now test fail-closed when gang WAL is missing for Member 1
+            (wal_dir / "gang-r4-gap.gang.wal.jsonl").unlink()
+            m1_wal = wal_dir / "gang-r4-gap-m1.wal.jsonl"
+            with self.assertRaises(FileNotFoundError):
+                MigrationOrchestrator.recover_from_journal(m1_wal, src1, dst1)
+
+    def test_r4_p1_gang_rollback_reports_false_when_member_rollback_fails(self) -> None:
+        """
+        P1 round-4: GangMigrationCoordinator.execute_atomic() and recover_from_journal() must
+        NOT write ROLLED_BACK or report atomic_rollback_triggered=True unless every member
+        confirmed rolled_back=True.
+        """
+        with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2:
+            h1 = _FakeClusterHarness(tmp1)
+            h2 = _FakeClusterHarness(tmp2)
+            h2.fail_on_restore = True  # Member 2 will fail Phase 1 restore -> triggers gang rollback!
+            wal_dir = Path(tmp1) / "wal"
+
+            # Force Member 1's rollback_dest to fail so Member 1 cannot safely roll back!
+            def broken_rollback_dest(migration_id: str, restored_pid: Optional[int], config_dict: Dict[str, Any]) -> Dict[str, Any]:
+                raise RuntimeError("Destination B1 unreachable during gang rollback")
+
+            h1.service_b.rollback_dest = broken_rollback_dest  # type: ignore[method-assign]
+
+            cfg1 = MigrationConfig(
+                pid=1234,
+                workload_id="srv-rb1",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.10/24",
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            cfg2 = MigrationConfig(
+                pid=1234,
+                workload_id="srv-rb2",
+                source_addr="10.0.0.3:9700",
+                dest_addr="10.0.0.4:9700",
+                strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.11/24",
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            members = [
+                (cfg1, AgentClient("10.0.0.1:9700", direct_service=h1.service_a), AgentClient("10.0.0.2:9700", direct_service=h1.service_b)),
+                (cfg2, AgentClient("10.0.0.3:9700", direct_service=h2.service_a), AgentClient("10.0.0.4:9700", direct_service=h2.service_b)),
+            ]
+
+            coordinator = GangMigrationCoordinator(
+                gang_id="gang-r4-rb-fail",
+                journal_dir=str(wal_dir),
+                members=members,
+            )
+            gang_res = coordinator.execute_atomic()
+            self.assertFalse(gang_res.all_committed)
+            self.assertFalse(gang_res.atomic_rollback_triggered)
+            self.assertIsNotNone(gang_res.error_message)
+            self.assertIn("gang-r4-rb-fail-m1", gang_res.error_message or "")
+
+            loaded_gang_wal = MigrationJournal.load(coordinator.journal.path)
+            self.assertFalse(
+                any(e.commit_decision == "ROLLED_BACK" for e in loaded_gang_wal.entries),
+                "Gang WAL must NOT claim ROLLED_BACK when a member rollback failed",
+            )
+
+            # Also verify GangMigrationCoordinator.recover_from_journal on uncommitted gang WAL
+            rec_res = GangMigrationCoordinator.recover_from_journal(
+                gang_journal_path=coordinator.journal.path,
+                members=members,
+            )
+            self.assertFalse(rec_res.all_committed)
+            self.assertFalse(rec_res.atomic_rollback_triggered)
+            self.assertIn("gang-r4-rb-fail-m1", rec_res.error_message or "")
+
+    def test_r4_p1_verify_process_none_fails_closed_and_blocks_commit_source(self) -> None:
+        """
+        P1 round-4: AgentService.verify_process(None, None) must return healthy=False, and
+        roll-forward recovery (both single-member and gang) must refuse to call commit_source
+        (SIGKILL on Source A) when Destination B has no verified restored PID.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = _FakeClusterHarness(tmp)
+
+            # 1. Direct verify_process(None, None) and invalid PID <= 0 MUST return healthy=False
+            res_none = harness.service_b.verify_process(None, None)
+            self.assertFalse(res_none["healthy"])
+            self.assertIn("No restored PID", res_none["reason"])
+            self.assertFalse(harness.service_b.verify_process(0, None)["healthy"])
+            self.assertFalse(harness.service_b.verify_process(-5, None)["healthy"])
+
+            # 2. Single-member roll-forward recovery with missing restored_pid must NOT kill Source A
+            wal_dir = Path(tmp) / "wal"
+            cfg = MigrationConfig(
+                pid=1234,
+                workload_id="srv-nopid",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=MigrationStrategy.COLD,
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            j_single = MigrationJournal(wal_dir, "mig-nopid-commit")
+            j_single.append(MigrationState.INIT, "PREPARING", config_dict=config_to_dict(cfg))
+            j_single.append(MigrationState.COMMIT, "COMMITTED", restored_pid=None)
+
+            src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
+            dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
+            rec_single = MigrationOrchestrator.recover_from_journal(j_single.path, src, dst)
+            self.assertFalse(rec_single.success)
+            self.assertIn("No restored PID", rec_single.error_message or "")
+            self.assertNotIn((1234, signal.SIGKILL), harness.signals_a)
+
+            # 3. Gang roll-forward recovery with missing restored_pid must NOT kill Source A
+            g_journal = MigrationJournal(wal_dir, "gang-nopid.gang")
+            g_journal.append(MigrationState.PREPARE, "PREPARING")
+            g_journal.append(MigrationState.COMMIT, "COMMITTED")
+            m_journal = MigrationJournal(wal_dir, "gang-nopid-m1", gang_id="gang-nopid")
+            m_journal.append(MigrationState.INIT, "PREPARING", config_dict=config_to_dict(cfg))
+
+            rec_gang = GangMigrationCoordinator.recover_from_journal(
+                gang_journal_path=g_journal.path,
+                members=[(cfg, src, dst)],
+            )
+            self.assertFalse(rec_gang.all_committed)
+            self.assertTrue(rec_gang.partial_commit_error)
+            self.assertNotIn((1234, signal.SIGKILL), harness.signals_a)
+
+    def test_r4_p1_cow_rejects_loopback_and_same_path_unshared_vms_requires_probe(self) -> None:
+        """
+        P1 round-4: Equal addresses or loopback (`127.0.0.1:9700` -> `127.0.0.1:9701`) must NOT
+        select local CoW copying when Source A and Destination B have unshared storage (e.g., two
+        separate VMs over SSH port-forwarding, even with identical `/migrations` path strings).
+        CoW is selected ONLY when Destination B's cryptographic `.lkmp_storage_probe.json` is
+        visible on Source A's local VFS.
+        """
+        with tempfile.TemporaryDirectory() as vm_a, tempfile.TemporaryDirectory() as vm_b:
+            proc_a = Path(vm_a) / "proc"
+            (proc_a / "4242" / "task" / "4242").mkdir(parents=True, exist_ok=True)
+            (proc_a / "4242" / "status").write_text("Name:\tsrv\nState:\tS (sleeping)\n", encoding="utf-8")
+            (proc_a / "4242" / "task" / "4242" / "children").write_text("", encoding="utf-8")
+
+            cmds_a: List[List[str]] = []
+
+            def runner_a(cmd: List[str]) -> subprocess.CompletedProcess:
+                cmds_a.append(list(cmd))
+                if cmd[0] == "criu" and len(cmd) >= 2 and cmd[1] == "dump":
+                    d_idx = cmd.index("--images-dir")
+                    out_d = Path(cmd[d_idx + 1])
+                    out_d.mkdir(parents=True, exist_ok=True)
+                    (out_d / "core-1.img").write_bytes(b"CORE")
+                    (out_d / "pages-1.img").write_bytes(b"PAGES")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            # Separate VMs with unshared filesystems reached over loopback port forwarding
+            svc_vm_a = AgentService(
+                work_dir=str(Path(vm_a) / "migrations"),
+                proc_root=str(proc_a),
+                criu_driver=CriuDriver(runner=runner_a),
+                fs_manager=FilesystemSyncManager(runner=runner_a),
+                pid_alive_checker=lambda _p: True,
+            )
+            svc_vm_b = AgentService(
+                work_dir=str(Path(vm_b) / "migrations"),
+                proc_root=str(proc_a),
+                pid_alive_checker=lambda _p: True,
+            )
+
+            svc_vm_a.prepare_migration("mig-unshared")
+            dst_prep_b = svc_vm_b.prepare_migration("mig-unshared")
+
+            cfg_loopback = MigrationConfig(
+                pid=4242,
+                source_addr="127.0.0.1:9700",
+                dest_addr="127.0.0.1:9701",
+                strategy=MigrationStrategy.COLD,
+                fs_mode=FilesystemMode.SHARED,
+                same_host_cow=True,
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            cfg_dict = config_to_dict(cfg_loopback)
+            svc_vm_a.freeze_and_final_dump("mig-unshared", None, "127.0.0.1", cfg_dict)
+
+            # Simulate identical path string across two separate VMs (pointing at VM A's own path
+            # while passing VM B's probe token -> token + agent_id mismatch MUST reject CoW and use rsync!)
+            own_a_final = str(Path(vm_a) / "migrations" / "mig-unshared" / "final")
+            cmds_a.clear()
+            res_unshared = svc_vm_a.transfer_final_state(
+                migration_id="mig-unshared",
+                dest_host="127.0.0.1",
+                config_dict=cfg_dict,
+                dest_images_dir=own_a_final,
+                dest_probe_token=dst_prep_b["storage_probe_token"],
+            )
+            self.assertFalse(res_unshared["cow_fast_path"])
+            self.assertTrue(any(c[0] == "rsync" for c in cmds_a))
+            self.assertFalse(any(c[0] == "cp" for c in cmds_a))
+
+            # Now pass VM B's directory visible on shared VFS with VM B's matching probe token -> CoW succeeds!
+            cmds_a.clear()
+            res_shared = svc_vm_a.transfer_final_state(
+                migration_id="mig-unshared",
+                dest_host="127.0.0.1",
+                config_dict=cfg_dict,
+                dest_images_dir=dst_prep_b["images_dir"],
+                dest_probe_token=dst_prep_b["storage_probe_token"],
+            )
+            self.assertTrue(res_shared["cow_fast_path"])
+            self.assertTrue(any(c[0] == "cp" for c in cmds_a))
+            self.assertFalse(any(c[0] == "rsync" for c in cmds_a))
+
+    def test_r4_wal_checksum_and_torn_trailing_record_recovery(self) -> None:
+        """
+        Round-4 WAL integrity:
+        1. Un-fsynced torn trailing line (truncated JSON, missing newline, NUL bytes, or bad checksum)
+           after >=1 valid entry is cleanly discarded (`discarded_torn_tail=True`).
+        2. Mid-file corruption or single-line corruption raises `ValueError` (fail-closed).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            wal_dir = Path(tmp) / "journals"
+            cfg = MigrationConfig(
+                pid=1234,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                tls=TlsConfig(enabled=False),
+            )
+            j = MigrationJournal(wal_dir, "mig-torn-wal")
+            j.append(MigrationState.INIT, "PREPARING", config_dict=config_to_dict(cfg))
+            j.append(MigrationState.VERIFY, "PREPARED_STOPPED", restored_pid=5678)
+
+            # Append a torn partial COMMITTED record (crash mid-write before newline/fsync)
+            with j.path.open("ab") as f:
+                f.write(b'{"seq": 3, "migration_id": "mig-torn-wal", "commit_decision": "COMMI')
+
+            loaded = MigrationJournal.load(j.path)
+            self.assertTrue(loaded.discarded_torn_tail)
+            self.assertEqual(len(loaded.entries), 2)
+            self.assertFalse(loaded.has_committed_decision)
+            self.assertEqual(loaded.last_entry.restored_pid, 5678)  # type: ignore[union-attr]
+
+            # Corrupting line 1 (mid-file checksum tampering) MUST fail closed with ValueError!
+            raw_lines = j.path.read_bytes().splitlines(keepends=True)
+            tampered_first = raw_lines[0].replace(b'"PREPARING"', b'"COMMITTED"')
+            j.path.write_bytes(tampered_first + raw_lines[1])
+            with self.assertRaises(ValueError):
+                MigrationJournal.load(j.path)
+
+            # Single torn line with zero valid committed entries MUST also fail closed with ValueError!
+            j_empty = wal_dir / "mig-only-torn.wal.jsonl"
+            j_empty.write_bytes(b'{"seq": 1, "migration_id": "mig-only-torn"')
+            with self.assertRaises(ValueError):
+                MigrationJournal.load(j_empty)
 
 
 if __name__ == "__main__":

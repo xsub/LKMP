@@ -501,14 +501,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if getattr(args, "dest", None):
                         m_cfg.dest_addr = args.dest
                 else:
-                    src_addr = getattr(args, "source", None) or "127.0.0.1:9700"
-                    dst_addr = getattr(args, "dest", None) or "127.0.0.1:9701"
-                    m_cfg = MigrationConfig(
-                        pid=mj.root_pid or 1,
-                        source_addr=src_addr,
-                        dest_addr=dst_addr,
-                        tls=tls,
-                        journal_dir=str(j_dir),
+                    raise ValueError(
+                        f"Member journal {mf} does not contain initial migration configuration"
                     )
                 client_a = AgentClient(m_cfg.source_addr, tls=tls)
                 client_b = AgentClient(m_cfg.dest_addr, tls=tls)

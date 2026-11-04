@@ -82,10 +82,27 @@ class _FakeClusterHarness:
                 st_file.write_text(txt.replace("State:\tT (stopped)", "State:\tS (sleeping)"), encoding="utf-8")
 
     @staticmethod
-    def _eval_nft(tables: dict, cmd: List[str]) -> subprocess.CompletedProcess:
+    def _eval_nft(tables: dict, cmd: List[str], *, _in_batch: bool = False) -> subprocess.CompletedProcess:
+        if len(cmd) == 2 and cmd[0] == "nft" and ";" in cmd[1]:
+            from lkmp.acceptance import _split_nft_batch
+
+            snapshot = {
+                t: {
+                    "chains": dict(v["chains"]),
+                    "rules": {ck: list(rv) for ck, rv in v["rules"].items()},
+                }
+                for t, v in tables.items()
+            }
+            for sub_cmd in _split_nft_batch(cmd[1]):
+                _FakeClusterHarness._eval_nft(snapshot, sub_cmd, _in_batch=True)
+            tables.clear()
+            tables.update(snapshot)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         if len(cmd) >= 5 and cmd[1:4] == ["add", "table", "inet"]:
             tname = cmd[4]
             if tname in tables:
+                if _in_batch:
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
                 raise subprocess.CalledProcessError(1, cmd, stderr="File exists")
             tables[tname] = {"chains": {}, "rules": {}}
             return subprocess.CompletedProcess(cmd, 0, "", "")

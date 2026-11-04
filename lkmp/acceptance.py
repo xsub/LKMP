@@ -885,14 +885,67 @@ class AcceptanceAgentService(AgentService):
         return super().verify_restored_stopped(restored_pid, migration_id, workload_ip=workload_ip)
 
 
+def _split_nft_batch(script: str) -> List[List[str]]:
+    """Parse a semicolon-delimited atomic `nft` batch script into sub-commands, preserving `{ ... }` blocks."""
+    stmts: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    for ch in script:
+        if ch == "{":
+            depth += 1
+            cur.append(ch)
+        elif ch == "}":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == ";" and depth == 0:
+            s = "".join(cur).strip()
+            if s:
+                stmts.append(s)
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        stmts.append(tail)
+
+    parsed: List[List[str]] = []
+    for st in stmts:
+        if "{" in st and "}" in st:
+            b_idx = st.index("{")
+            prefix = st[:b_idx].split()
+            brace_spec = st[b_idx:].strip()
+            parsed.append(["nft", *prefix, brace_spec])
+        else:
+            parsed.append(["nft", *st.split()])
+    return parsed
+
+
 def _simulate_nft_cmd(
     tables: Dict[str, Dict[str, Any]],
     cmd: List[str],
+    *,
+    _in_batch: bool = False,
 ) -> subprocess.CompletedProcess:
     """In-memory nftables ruleset emulator for non-Linux POSIX_PROCESS_CLONE acceptance runs."""
+    if len(cmd) == 2 and cmd[0] == "nft" and ";" in cmd[1]:
+        snapshot = {
+            t: {
+                "chains": dict(v["chains"]),
+                "rules": {ck: list(rv) for ck, rv in v["rules"].items()},
+            }
+            for t, v in tables.items()
+        }
+        for sub_cmd in _split_nft_batch(cmd[1]):
+            _simulate_nft_cmd(snapshot, sub_cmd, _in_batch=True)
+        tables.clear()
+        tables.update(snapshot)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
     if len(cmd) >= 5 and cmd[1:4] == ["add", "table", "inet"]:
         tname = cmd[4]
         if tname in tables:
+            if _in_batch:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             raise subprocess.CalledProcessError(1, cmd, stderr="File exists")
         tables[tname] = {"chains": {}, "rules": {}}
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -1848,6 +1901,7 @@ def run_acceptance_scenario(
                 fs_mode=FilesystemMode.SHARED,
                 ip_mobility=IpMobilityMode.NONE,
                 workload_ip=harness.vip_for("acc-workload"),
+                same_host_cow=(injected_fault == "SAME_HOST_COW"),
                 verify_attestation=True,
                 attestation_key_hex=attest_key,
                 wipe_images_on_commit=False,
@@ -1934,6 +1988,7 @@ def run_acceptance_scenario(
                         strategy=strategy,
                         ip_mobility=IpMobilityMode.NONE,
                         workload_ip=harness.vip_for("acc-workload-2"),
+                        same_host_cow=False,
                         journal_dir=str(wal_root),
                         tls=TlsConfig(enabled=False),
                     )
@@ -1989,6 +2044,7 @@ def run_acceptance_scenario(
                         strategy=strategy,
                         ip_mobility=IpMobilityMode.NONE,
                         workload_ip=harness.vip_for("acc-workload-2"),
+                        same_host_cow=False,
                         journal_dir=str(wal_root),
                         tls=TlsConfig(enabled=False),
                     )
