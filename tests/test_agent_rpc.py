@@ -66,6 +66,8 @@ class TestEndToEndAgentRpc(unittest.TestCase):
                             "pre-copy",
                             "--workload-ip",
                             "10.0.0.99/24",
+                            "--journal-dir",
+                            f"{tmp}/wal",
                             "--no-tls",
                             "--json",
                         ]

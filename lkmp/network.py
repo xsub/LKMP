@@ -2,77 +2,261 @@
 
 from __future__ import annotations
 
+import errno
 import ipaddress
 import os
 import re
 import shlex
 import socket
 import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 from lkmp.config import IpMobilityMode, MigrationConfig
 
 SYS_PIDFD_GETFD: int = 438
 SOL_TCP_REPAIR: int = getattr(socket, "TCP_REPAIR", 19)
+SO_ACCEPTCONN_OPT: int = getattr(socket, "SO_ACCEPTCONN", 30)
 
 
-def set_pid_tcp_repair(pid: int, enable: bool) -> int:
-    """
-    Toggle Linux kernel TCP_REPAIR (1 = ON, 0 = OFF) on all open TCP sockets of `pid`
-    via `pidfd_open` + `pidfd_getfd`.
-    - `enable=True` before SIGKILL on an aborted destination prevents kernel FIN/RST emission.
-    - `enable=False` before SIGCONT on a `--leave-stopped` source clears the TCP_REPAIR state
-      left behind by `criu dump --tcp-established --leave-stopped`.
-    Returns the number of sockets updated.
-    """
+class TcpRepairError(RuntimeError):
+    """Raised when kernel TCP_REPAIR state cannot be applied and confirmed on a target PID."""
+
+
+@dataclass(frozen=True)
+class TcpRepairResult:
+    """Verified outcome of applying and reading back TCP_REPAIR across a process's sockets."""
+
+    pid: int
+    process_alive: bool
+    sockets_inspected: int
+    tcp_sockets_found: int
+    tcp_sockets_confirmed: int
+
+
+def _default_pidfd_open(pid: int) -> int:
     if not hasattr(os, "pidfd_open"):
-        return 0
+        raise TcpRepairError(
+            f"os.pidfd_open is unavailable on platform {sys.platform}; cannot confirm TCP_REPAIR for PID {pid}"
+        )
+    return os.pidfd_open(pid, 0)
+
+
+def _default_pidfd_getfd(pfd: int, target_fd: int) -> int:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    ctypes.set_errno(0)
+    sfd = int(libc.syscall(SYS_PIDFD_GETFD, pfd, target_fd, 0))
+    if sfd < 0:
+        err = ctypes.get_errno() or errno.EPERM
+        raise OSError(err, os.strerror(err))
+    return sfd
+
+
+def set_pid_tcp_repair(
+    pid: int,
+    enable: bool,
+    *,
+    proc_root: Path = Path("/proc"),
+    pidfd_opener: Callable[[int], int] = _default_pidfd_open,
+    fd_duplicator: Callable[[int, int], int] = _default_pidfd_getfd,
+) -> TcpRepairResult:
+    """
+    Toggle Linux kernel TCP_REPAIR (1 = ON, 0 = OFF) on all active TCP stream sockets of `pid`
+    via `pidfd_open` + `pidfd_getfd`, and confirm via `getsockopt(SOL_TCP, TCP_REPAIR)`.
+
+    - `enable=True` before SIGKILL prevents kernel FIN/RST emission on connected TCP sockets.
+    - `enable=False` before SIGCONT clears TCP_REPAIR left behind by `criu dump --tcp-established --leave-stopped`.
+
+    Fails closed by raising `TcpRepairError` on any permission, syscall, or socket confirmation failure.
+    """
+    pid_dir = proc_root / str(pid)
+    if not pid_dir.exists():
+        return TcpRepairResult(
+            pid=pid,
+            process_alive=False,
+            sockets_inspected=0,
+            tcp_sockets_found=0,
+            tcp_sockets_confirmed=0,
+        )
+
     try:
-        import ctypes
+        pfd = pidfd_opener(pid)
+    except TcpRepairError:
+        raise
+    except OSError as exc:
+        if exc.errno in (errno.ESRCH, errno.ENOENT):
+            return TcpRepairResult(
+                pid=pid,
+                process_alive=False,
+                sockets_inspected=0,
+                tcp_sockets_found=0,
+                tcp_sockets_confirmed=0,
+            )
+        raise TcpRepairError(f"pidfd_open({pid}) failed: {exc}") from exc
 
-        libc = ctypes.CDLL(None, use_errno=True)
-        pfd = os.pidfd_open(pid, 0)
-    except Exception:
-        return 0
-
-    updated = 0
+    sockets_inspected = 0
+    tcp_sockets_found = 0
+    tcp_sockets_confirmed = 0
     val = 1 if enable else 0
+
     try:
-        fd_dir = Path(f"/proc/{pid}/fd")
-        if not fd_dir.exists():
-            return 0
-        for entry in list(fd_dir.iterdir()):
+        fd_dir = pid_dir / "fd"
+        try:
+            entries = list(fd_dir.iterdir())
+        except (FileNotFoundError, ProcessLookupError):
+            return TcpRepairResult(
+                pid=pid,
+                process_alive=False,
+                sockets_inspected=0,
+                tcp_sockets_found=0,
+                tcp_sockets_confirmed=0,
+            )
+        except OSError as exc:
+            raise TcpRepairError(f"Cannot inspect {fd_dir}: {exc}") from exc
+
+        for entry in entries:
             if not entry.name.isdigit():
                 continue
+            fd_num = int(entry.name)
             try:
                 target = os.readlink(entry)
-            except OSError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue
+            except OSError as exc:
+                if exc.errno in (errno.ESRCH, errno.ENOENT):
+                    continue
+                raise TcpRepairError(f"readlink({entry}) failed: {exc}") from exc
+
             if not target.startswith("socket:["):
                 continue
-            sfd = int(libc.syscall(SYS_PIDFD_GETFD, pfd, int(entry.name), 0))
-            if sfd < 0:
-                continue
+
+            sockets_inspected += 1
+            try:
+                sfd = fd_duplicator(pfd, fd_num)
+            except TcpRepairError:
+                raise
+            except OSError as exc:
+                if exc.errno in (errno.ESRCH, errno.EBADF, errno.ENOENT):
+                    continue
+                raise TcpRepairError(
+                    f"pidfd_getfd(pid={pid}, fd={fd_num}) failed: {exc}"
+                ) from exc
+
+            sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(fileno=sfd)
-                try:
-                    sock.setsockopt(socket.SOL_TCP, SOL_TCP_REPAIR, val)
-                    updated += 1
-                except OSError:
-                    pass
-                sock.close()
-            except Exception:
-                try:
-                    os.close(sfd)
-                except OSError:
-                    pass
+                if sock.family not in (socket.AF_INET, socket.AF_INET6):
+                    continue
+                if (sock.type & 0xFF) != socket.SOCK_STREAM:
+                    continue
+
+                if enable:
+                    try:
+                        is_listening = sock.getsockopt(socket.SOL_SOCKET, SO_ACCEPTCONN_OPT) != 0
+                    except OSError:
+                        is_listening = False
+                    if is_listening:
+                        continue
+                    try:
+                        sock.getpeername()
+                    except OSError as exc:
+                        if exc.errno == errno.ENOTCONN:
+                            continue
+                        raise TcpRepairError(
+                            f"getpeername(pid={pid}, fd={fd_num}) failed: {exc}"
+                        ) from exc
+
+                    tcp_sockets_found += 1
+                    try:
+                        sock.setsockopt(socket.SOL_TCP, SOL_TCP_REPAIR, val)
+                        readback = sock.getsockopt(socket.SOL_TCP, SOL_TCP_REPAIR)
+                    except OSError as exc:
+                        raise TcpRepairError(
+                            f"setsockopt/getsockopt TCP_REPAIR=1 failed on pid={pid} fd={fd_num}: {exc}"
+                        ) from exc
+                    if readback == 0:
+                        raise TcpRepairError(
+                            f"Kernel did not confirm TCP_REPAIR=1 on pid={pid} fd={fd_num} (readback={readback})"
+                        )
+                    tcp_sockets_confirmed += 1
+                else:
+                    try:
+                        cur_repair = sock.getsockopt(socket.SOL_TCP, SOL_TCP_REPAIR)
+                    except OSError as exc:
+                        raise TcpRepairError(
+                            f"getsockopt TCP_REPAIR failed on pid={pid} fd={fd_num}: {exc}"
+                        ) from exc
+                    if cur_repair != 0:
+                        tcp_sockets_found += 1
+                        try:
+                            sock.setsockopt(socket.SOL_TCP, SOL_TCP_REPAIR, 0)
+                            readback = sock.getsockopt(socket.SOL_TCP, SOL_TCP_REPAIR)
+                        except OSError as exc:
+                            raise TcpRepairError(
+                                f"setsockopt/getsockopt TCP_REPAIR=0 failed on pid={pid} fd={fd_num}: {exc}"
+                            ) from exc
+                        if readback != 0:
+                            raise TcpRepairError(
+                                f"Kernel did not confirm TCP_REPAIR=0 on pid={pid} fd={fd_num} (readback={readback})"
+                            )
+                        tcp_sockets_confirmed += 1
+            finally:
+                if sock is not None:
+                    sock.close()
+                else:
+                    try:
+                        os.close(sfd)
+                    except OSError:
+                        pass
     finally:
         try:
             os.close(pfd)
         except OSError:
             pass
-    return updated
+
+    if tcp_sockets_confirmed != tcp_sockets_found:
+        raise TcpRepairError(
+            f"Incomplete TCP_REPAIR confirmation for pid={pid}: {tcp_sockets_confirmed}/{tcp_sockets_found}"
+        )
+
+    return TcpRepairResult(
+        pid=pid,
+        process_alive=True,
+        sockets_inspected=sockets_inspected,
+        tcp_sockets_found=tcp_sockets_found,
+        tcp_sockets_confirmed=tcp_sockets_confirmed,
+    )
+
+
+def set_tree_tcp_repair(
+    pids: Sequence[int],
+    enable: bool,
+    *,
+    proc_root: Path = Path("/proc"),
+    pidfd_opener: Callable[[int], int] = _default_pidfd_open,
+    fd_duplicator: Callable[[int, int], int] = _default_pidfd_getfd,
+) -> List[TcpRepairResult]:
+    """Apply and verify TCP_REPAIR across every PID in a process tree, failing closed on any error."""
+    seen: set[int] = set()
+    results: List[TcpRepairResult] = []
+    for raw_pid in pids:
+        p = int(raw_pid)
+        if p in seen:
+            continue
+        seen.add(p)
+        res = set_pid_tcp_repair(
+            p,
+            enable=enable,
+            proc_root=proc_root,
+            pidfd_opener=pidfd_opener,
+            fd_duplicator=fd_duplicator,
+        )
+        results.append(res)
+    return results
 
 
 CommandRunner = Callable[[List[str]], subprocess.CompletedProcess]

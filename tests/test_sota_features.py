@@ -169,6 +169,7 @@ class TestSotaCapabilities(unittest.TestCase):
 
             gang = GangMigrationCoordinator(
                 gang_id="gang-test",
+                journal_dir=f"{tmp1}/wal",
                 members=[
                     (
                         cfg1,

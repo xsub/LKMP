@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -43,8 +44,9 @@ from lkmp.fs_sync import (
 from lkmp.gang import GangMigrationCoordinator
 from lkmp.journal import MigrationJournal
 from lkmp.models import MigrationResult, MigrationState
-from lkmp.network import NetworkMobilityManager, set_pid_tcp_repair
+from lkmp.network import NetworkMobilityManager, set_pid_tcp_repair, set_tree_tcp_repair
 from lkmp.orchestrator import MigrationOrchestrator
+from lkmp.preflight import read_proc_starttime
 
 
 def detect_criu_version() -> str:
@@ -61,8 +63,7 @@ def detect_criu_version() -> str:
 
 
 DEFAULT_PRNG_SEED: int = 0xCAFEBABE12345678
-SYS_PIDFD_GETFD: int = 438
-SOL_TCP_REPAIR: int = getattr(socket, "TCP_REPAIR", 19)
+CLONE_NEWNET: int = 0x40000000
 
 
 def _create_tcp_socketpair() -> Tuple[socket.socket, socket.socket]:
@@ -81,9 +82,153 @@ def _create_tcp_socketpair() -> Tuple[socket.socket, socket.socket]:
     return client_sock, server_sock
 
 
-def _silence_tcp_sockets_of_pid(pid: int) -> None:
-    """Put all open TCP sockets of `pid` into kernel TCP_REPAIR mode via pidfd_getfd."""
-    set_pid_tcp_repair(pid, enable=True)
+class RealNetnsL2Fabric:
+    """
+    Isolated three-namespace L2 virtual Ethernet fabric for REAL_CRIU acceptance tests:
+      - `ns_fab`: Client + Linux bridge `br0` (`10.200.0.1/24`)
+      - `ns_a`:   Source Host A (`eth0` MAC `02:42:ac:14:00:0a` -> `veth_fa` on `br0`)
+      - `ns_b`:   Destination Host B (`eth0` MAC `02:42:ac:14:00:0b` -> `veth_fb` on `br0`)
+
+    Because `ns_a` and `ns_b` are distinct Linux network namespaces (`struct net`), Source A's
+    stopped process tree (`--leave-stopped`) remains alive in `ns_a` while Destination B restores
+    the identical TCP 4-tuple in `ns_b`, and rollback resumes the original Source A process tree
+    in-place via `SIGCONT` without ever killing or re-creating it from backup.
+    """
+
+    MAC_A = "02:42:ac:14:00:0a"
+    MAC_B = "02:42:ac:14:00:0b"
+    CLIENT_IP = "10.200.0.1"
+
+    def __init__(self) -> None:
+        tag = f"lk_{os.getpid()}_{uuid.uuid4().hex[:5]}"
+        self.ns_fab = f"{tag}_f"
+        self.ns_a = f"{tag}_a"
+        self.ns_b = f"{tag}_b"
+        self._closed = False
+        self._setup()
+
+    @staticmethod
+    def _run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+    def _setup(self) -> None:
+        for ns in (self.ns_fab, self.ns_a, self.ns_b):
+            self._run(["ip", "netns", "add", ns])
+            self._run(["ip", "-n", ns, "link", "set", "lo", "up"])
+
+        self._run(["ip", "-n", self.ns_fab, "link", "add", "br0", "type", "bridge"])
+        self._run(["ip", "-n", self.ns_fab, "addr", "add", f"{self.CLIENT_IP}/24", "dev", "br0"])
+        self._run(["ip", "-n", self.ns_fab, "link", "set", "br0", "up"])
+
+        self._run(
+            ["ip", "-n", self.ns_fab, "link", "add", "veth_fa", "type", "veth", "peer", "name", "eth0", "netns", self.ns_a]
+        )
+        self._run(["ip", "-n", self.ns_fab, "link", "set", "veth_fa", "master", "br0", "up"])
+        self._run(["ip", "-n", self.ns_a, "link", "set", "eth0", "address", self.MAC_A, "up"])
+
+        self._run(
+            ["ip", "-n", self.ns_fab, "link", "add", "veth_fb", "type", "veth", "peer", "name", "eth0", "netns", self.ns_b]
+        )
+        self._run(["ip", "-n", self.ns_fab, "link", "set", "veth_fb", "master", "br0", "up"])
+        self._run(["ip", "-n", self.ns_b, "link", "set", "eth0", "address", self.MAC_B, "up"])
+
+        for ns in (self.ns_a, self.ns_b):
+            self._run(
+                [
+                    "nsenter",
+                    f"--net=/var/run/netns/{ns}",
+                    "sysctl",
+                    "-wq",
+                    "net.ipv4.conf.all.arp_ignore=1",
+                    "net.ipv4.conf.eth0.arp_ignore=1",
+                ],
+                check=False,
+            )
+
+    @staticmethod
+    def _nft_table_name(vip: str) -> str:
+        clean = vip.replace(".", "_")
+        return f"lkmp_acc_{clean}"
+
+    def fence_vip(self, ns_name: str, vip: str) -> None:
+        table = self._nft_table_name(vip)
+        ns_arg = f"--net=/var/run/netns/{ns_name}"
+        self._run(["nsenter", ns_arg, "nft", "add", "table", "inet", table], check=False)
+        self._run(["nsenter", ns_arg, "nft", "flush", "table", "inet", table])
+        self._run(
+            ["nsenter", ns_arg, "nft", "add", "chain", "inet", table, "input", "{ type filter hook input priority -150; }"]
+        )
+        self._run(
+            ["nsenter", ns_arg, "nft", "add", "chain", "inet", table, "output", "{ type filter hook output priority -150; }"]
+        )
+        self._run(["nsenter", ns_arg, "nft", "add", "rule", "inet", table, "input", "ip", "daddr", vip, "drop"])
+        self._run(["nsenter", ns_arg, "nft", "add", "rule", "inet", table, "output", "ip", "saddr", vip, "drop"])
+
+    def unfence_vip(self, ns_name: str, vip: str) -> None:
+        table = self._nft_table_name(vip)
+        self._run(["nsenter", f"--net=/var/run/netns/{ns_name}", "nft", "delete", "table", "inet", table], check=False)
+
+    def assign_vip(self, ns_name: str, vip: str) -> None:
+        self._run(["ip", "-n", ns_name, "addr", "replace", f"{vip}/24", "dev", "eth0"])
+
+    def remove_vip(self, ns_name: str, vip: str) -> None:
+        self._run(["ip", "-n", ns_name, "addr", "del", f"{vip}/24", "dev", "eth0"], check=False)
+
+    def route_vip_to_a(self, vip: str) -> None:
+        self._run(
+            ["ip", "-n", self.ns_fab, "neigh", "replace", vip, "lladdr", self.MAC_A, "dev", "br0", "nud", "permanent"]
+        )
+
+    def route_vip_to_b(self, vip: str) -> None:
+        self._run(
+            ["ip", "-n", self.ns_fab, "neigh", "replace", vip, "lladdr", self.MAC_B, "dev", "br0", "nud", "permanent"]
+        )
+
+    def allocate_tcp_socketpair(self, vip: str) -> Tuple[socket.socket, socket.socket]:
+        """Establish a real AF_INET TCP connection from `ns_fab` to `vip` on `ns_a`."""
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.assign_vip(self.ns_a, vip)
+        self.route_vip_to_a(vip)
+
+        orig_fd = os.open("/proc/self/ns/net", os.O_RDONLY)
+        a_fd = os.open(f"/var/run/netns/{self.ns_a}", os.O_RDONLY)
+        fab_fd = os.open(f"/var/run/netns/{self.ns_fab}", os.O_RDONLY)
+        lsock: Optional[socket.socket] = None
+        client_sock: Optional[socket.socket] = None
+        try:
+            if libc.setns(a_fd, CLONE_NEWNET) != 0:
+                raise OSError(ctypes.get_errno(), "setns(ns_a) failed")
+            lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            lsock.bind((vip, 0))
+            lsock.listen(1)
+            port = lsock.getsockname()[1]
+
+            if libc.setns(fab_fd, CLONE_NEWNET) != 0:
+                raise OSError(ctypes.get_errno(), "setns(ns_fab) failed")
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        finally:
+            libc.setns(orig_fd, CLONE_NEWNET)
+            os.close(orig_fd)
+            os.close(a_fd)
+            os.close(fab_fd)
+
+        assert lsock is not None and client_sock is not None
+        client_sock.connect((vip, port))
+        server_sock, _ = lsock.accept()
+        server_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        lsock.close()
+        return client_sock, server_sock
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for ns in (self.ns_fab, self.ns_a, self.ns_b):
+            self._run(["ip", "netns", "del", ns], check=False)
 
 
 def step_xorshift64star(state: int) -> int:
@@ -173,6 +318,7 @@ class DeterministicWorkloadService:
         initial_offset: int = 0,
         start_stopped: bool = False,
         use_real_criu: bool = False,
+        netns_name: Optional[str] = None,
     ) -> None:
         self.workload_id = workload_id
         self.state_log_path = Path(state_log_path).resolve()
@@ -184,6 +330,7 @@ class DeterministicWorkloadService:
         self.initial_offset = initial_offset
         self.start_stopped = start_stopped
         self.use_real_criu = use_real_criu
+        self.netns_name = netns_name
 
         self.root_pid: Optional[int] = None
         self.children_pids: List[int] = []
@@ -212,6 +359,16 @@ class DeterministicWorkloadService:
         root_pid = os.fork()
         if root_pid == 0:
             # Inside child (Root Process of the service tree)
+            if self.netns_name:
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                ns_fd = os.open(f"/var/run/netns/{self.netns_name}", os.O_RDONLY)
+                try:
+                    if libc.setns(ns_fd, CLONE_NEWNET) != 0:
+                        os._exit(2)
+                finally:
+                    os.close(ns_fd)
             if self._ctrl_p2c_w is not None:
                 os.close(self._ctrl_p2c_w)
             if self._ctrl_c2p_r is not None:
@@ -726,37 +883,6 @@ class AcceptanceAgentService(AgentService):
             return {"healthy": False, "reason": "Injected verify_restored_stopped failure on Member 2"}
         return super().verify_restored_stopped(restored_pid, migration_id)
 
-    def rollback_dest(
-        self,
-        migration_id: str,
-        restored_pid: Optional[int],
-        config_dict: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        mig_dir = self._migration_dir(migration_id)
-        if restored_pid is None:
-            # Check restore_state.json / restored.pid in final round directory
-            final_dir = self._round_dir(migration_id, "final")
-            state_file = final_dir / "restore_state.json"
-            pid_file = final_dir / "restored.pid"
-            if state_file.exists():
-                try:
-                    data = json.loads(state_file.read_text(encoding="utf-8"))
-                    restored_pid = int(data.get("restored_pid") or data.get("pid"))
-                    for cp in data.get("children", []):
-                        try:
-                            self._send_signal(int(cp), signal.SIGKILL)
-                        except OSError:
-                            pass
-                except Exception:
-                    pass
-            elif pid_file.exists():
-                try:
-                    restored_pid = int(pid_file.read_text(encoding="utf-8").strip())
-                except Exception:
-                    pass
-
-        return super().rollback_dest(migration_id, restored_pid, config_dict)
-
 
 def _can_run_real_criu() -> bool:
     """Return True iff the current host is Linux with root privileges and has the criu binary."""
@@ -829,15 +955,23 @@ class AcceptanceClusterHarness:
         self.stream_client_sock: Optional[socket.socket] = None
         self.stream_client_socks: Dict[str, socket.socket] = {}
         self._unshare_by_restored_pid: Dict[int, Tuple[Optional[int], Optional[subprocess.Popen]]] = {}
-        self._dumped_img_by_src_pid: Dict[int, Path] = {}
-        self._backup_source_by_pid: Dict[int, Tuple[Path, DeterministicWorkloadService, List[int]]] = {}
-        self._silenced_source_pids: set[int] = set()
-        self._virtual_to_actual_pid_a: Dict[int, int] = {}
+        self._vip_by_workload_id: Dict[str, str] = {}
+        self._next_vip_octet: int = 10
+        self._netns_fabric: Optional[RealNetnsL2Fabric] = (
+            RealNetnsL2Fabric()
+            if (self.backend == "REAL_CRIU" and _can_run_real_criu())
+            else None
+        )
 
         self._setup_synthetic_proc()
 
         runner_a = self._make_runner(is_source=True)
         runner_b = self._make_runner(is_source=False)
+        real_tcp_repair = (
+            (lambda pids, enable: set_tree_tcp_repair(pids, enable=enable, proc_root=Path("/proc")))
+            if self._netns_fabric is not None
+            else None
+        )
 
         self.service_a = AcceptanceAgentService(
             work_dir=str(self.work_a),
@@ -848,6 +982,7 @@ class AcceptanceClusterHarness:
             envelope_manager=EnvelopeManager(cgroup_root=str(self.cgroup_a), runner=runner_a),
             signal_sender=self._signal_sender_a,
             pid_alive_checker=self._check_pid_alive_a,
+            tcp_repair_handler=real_tcp_repair,
         )
 
         self.service_b = AcceptanceAgentService(
@@ -859,7 +994,48 @@ class AcceptanceClusterHarness:
             envelope_manager=EnvelopeManager(cgroup_root=str(self.cgroup_b), runner=runner_b),
             signal_sender=self._signal_sender_b,
             pid_alive_checker=self._check_pid_alive_b,
+            tcp_repair_handler=real_tcp_repair,
         )
+
+    @property
+    def netns_a(self) -> Optional[str]:
+        return self._netns_fabric.ns_a if self._netns_fabric is not None else None
+
+    @property
+    def netns_b(self) -> Optional[str]:
+        return self._netns_fabric.ns_b if self._netns_fabric is not None else None
+
+    def create_workload_tcp_pair(self, workload_id: str) -> Tuple[socket.socket, socket.socket]:
+        if self._netns_fabric is not None:
+            vip = self._vip_by_workload_id.get(workload_id)
+            if vip is None:
+                vip = f"10.200.0.{self._next_vip_octet}"
+                self._next_vip_octet += 1
+                self._vip_by_workload_id[workload_id] = vip
+            return self._netns_fabric.allocate_tcp_socketpair(vip)
+        return _create_tcp_socketpair()
+
+    def teardown(self) -> None:
+        for _pid, (init_pid, unshare_proc) in list(self._unshare_by_restored_pid.items()):
+            if init_pid is not None:
+                try:
+                    os.kill(init_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            if unshare_proc is not None:
+                try:
+                    unshare_proc.kill()
+                    unshare_proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+        self._unshare_by_restored_pid.clear()
+        for sock in list(self.stream_client_socks.values()) + list(self.stream_server_socks.values()):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if self._netns_fabric is not None:
+            self._netns_fabric.close()
 
     def _setup_synthetic_proc(self) -> None:
         for p in (self.proc_a, self.proc_b):
@@ -908,22 +1084,19 @@ class AcceptanceClusterHarness:
         self,
         img_dir: Path,
         target_srv: DeterministicWorkloadService,
-        eff_pid_override: Optional[int] = None,
     ) -> Tuple[int, List[int], int, subprocess.Popen, int]:
-        """Run real CRIU --tcp-established detached restore inside an isolated PID/mount namespace."""
+        """Run real CRIU --tcp-established detached restore inside Destination B's isolated net/PID/mount namespaces."""
         wl_id = target_srv.workload_id
-        if eff_pid_override is not None:
-            eff_file = self.work_a / f".eff_pid.rb.{wl_id}"
-            eff_file.parent.mkdir(parents=True, exist_ok=True)
-            eff_file.write_text(f"{eff_pid_override}\n", encoding="utf-8")
-        else:
-            eff_file = self.work_b / f".eff_pid.{wl_id}"
-            eff_file.parent.mkdir(parents=True, exist_ok=True)
-            eff_file.write_text("0\n", encoding="utf-8")
+        eff_file = self.work_b / f".eff_pid.{wl_id}"
+        eff_file.parent.mkdir(parents=True, exist_ok=True)
+        eff_file.write_text("0\n", encoding="utf-8")
 
         ns_pid_file = img_dir / "ns_restored.pid"
         if ns_pid_file.exists():
             ns_pid_file.unlink()
+        restore_done_file = img_dir / "ns_restore.done"
+        if restore_done_file.exists():
+            restore_done_file.unlink()
         restore_log = img_dir / "criu_restore.log"
 
         restore_script = (
@@ -933,17 +1106,23 @@ class AcceptanceClusterHarness:
             f"criu restore -D {img_dir} --restore-detached --leave-stopped --shell-job "
             f"--tcp-established --network-lock skip "
             f"--pidfile {ns_pid_file} -v4 -o {restore_log} && "
+            f"printf 'DONE\\n' > {restore_done_file} && "
             f"exec sleep 300"
         )
-        unshare_cmd = [
-            "unshare",
-            "--pid",
-            "--mount",
-            "--fork",
-            "sh",
-            "-c",
-            restore_script,
-        ]
+        unshare_cmd: List[str] = []
+        if self._netns_fabric is not None:
+            unshare_cmd.extend(["nsenter", f"--net=/var/run/netns/{self._netns_fabric.ns_b}"])
+        unshare_cmd.extend(
+            [
+                "unshare",
+                "--pid",
+                "--mount",
+                "--fork",
+                "sh",
+                "-c",
+                restore_script,
+            ]
+        )
         self.commands_executed.append(" ".join(unshare_cmd))
         unshare_proc = subprocess.Popen(
             unshare_cmd,
@@ -953,156 +1132,151 @@ class AcceptanceClusterHarness:
             start_new_session=True,
             close_fds=True,
         )
-        for _ in range(150):
-            if ns_pid_file.exists() and ns_pid_file.stat().st_size > 0:
-                break
-            if unshare_proc.poll() is not None:
-                break
-            time.sleep(0.02)
-
-        if not ns_pid_file.exists() or ns_pid_file.stat().st_size == 0:
-            log_txt = (
-                restore_log.read_text(encoding="utf-8", errors="ignore")[-500:]
-                if restore_log.exists()
-                else "missing ns_restored.pid"
-            )
-            unshare_proc.kill()
-            err_msg = f"Real CRIU restore failed: {log_txt.strip()}"
-            self.error_logs.append(err_msg)
-            raise RuntimeError(err_msg)
-
-        ns_root_pid = int(ns_pid_file.read_text(encoding="utf-8").strip())
-        init_children = (
-            Path(f"/proc/{unshare_proc.pid}/task/{unshare_proc.pid}/children")
-            .read_text(encoding="utf-8")
-            .split()
-        )
-        init_host_pid = int(init_children[0])
-        cand_pids = [
-            int(x)
-            for x in Path(f"/proc/{init_host_pid}/task/{init_host_pid}/children")
-            .read_text(encoding="utf-8")
-            .split()
-        ]
-        restored_host_pid: Optional[int] = None
-        for cand in cand_pids:
-            try:
-                status_txt = Path(f"/proc/{cand}/status").read_text(encoding="utf-8")
-                for line in status_txt.splitlines():
-                    if line.startswith("NSpid:") and line.split()[-1] == str(ns_root_pid):
-                        restored_host_pid = cand
-                        break
-            except OSError:
-                pass
-            if restored_host_pid is not None:
-                break
-        if restored_host_pid is None:
-            restored_host_pid = cand_pids[0]
-
-        restored_children_host_pids = [
-            int(x)
-            for x in Path(f"/proc/{restored_host_pid}/task/{restored_host_pid}/children")
-            .read_text(encoding="utf-8")
-            .split()
-        ]
-        if eff_pid_override is None:
-            eff_file.write_text(f"{restored_host_pid}\n", encoding="utf-8")
-        return restored_host_pid, restored_children_host_pids, init_host_pid, unshare_proc, ns_root_pid
-
-    def _silence_and_terminate_source_for_cutover(
-        self,
-        src_img_dir: Path,
-        target_srv: DeterministicWorkloadService,
-    ) -> None:
-        """
-        Release Source A's loopback TCP 4-tuple silently via TCP_REPAIR so Destination B
-        can restore the established TCP socket on the same host, while backing up Source A's
-        checkpoint directory so post-restore rollback can restore Source A if needed.
-        """
-        orig_pid = target_srv.root_pid
-        if orig_pid is None or orig_pid in self._silenced_source_pids:
-            return
-        orig_children = list(target_srv.children_pids)
-        backup_mig_dir = self.root / f"rb_backup_{orig_pid}"
-        if backup_mig_dir.exists():
-            shutil.rmtree(backup_mig_dir, ignore_errors=True)
-        shutil.copytree(src_img_dir.parent, backup_mig_dir, symlinks=True, dirs_exist_ok=True)
-        backup_final_dir = backup_mig_dir / src_img_dir.name
-        self._backup_source_by_pid[orig_pid] = (backup_final_dir, target_srv, orig_children)
-
-        _silence_tcp_sockets_of_pid(orig_pid)
-        for cp in orig_children:
-            try:
-                os.kill(cp, signal.SIGKILL)
-            except OSError:
-                pass
         try:
-            os.kill(orig_pid, signal.SIGKILL)
-        except OSError:
-            pass
-        for _ in range(100):
+            for _ in range(200):
+                if (
+                    restore_done_file.exists()
+                    and restore_done_file.stat().st_size > 0
+                    and ns_pid_file.exists()
+                    and ns_pid_file.stat().st_size > 0
+                ):
+                    break
+                if unshare_proc.poll() is not None:
+                    break
+                time.sleep(0.02)
+
+            if (
+                not restore_done_file.exists()
+                or not ns_pid_file.exists()
+                or ns_pid_file.stat().st_size == 0
+            ):
+                log_txt = (
+                    restore_log.read_text(encoding="utf-8", errors="ignore")[-500:]
+                    if restore_log.exists()
+                    else "missing ns_restored.pid / ns_restore.done"
+                )
+                err_msg = f"Real CRIU restore failed: {log_txt.strip()}"
+                self.error_logs.append(err_msg)
+                raise RuntimeError(err_msg)
+
+            ns_root_pid = int(ns_pid_file.read_text(encoding="utf-8").strip())
+            init_host_pid: Optional[int] = None
+            restored_host_pid: Optional[int] = None
+            for _ in range(50):
+                init_children = (
+                    Path(f"/proc/{unshare_proc.pid}/task/{unshare_proc.pid}/children")
+                    .read_text(encoding="utf-8")
+                    .split()
+                )
+                if init_children:
+                    init_host_pid = int(init_children[0])
+                    cand_pids = [
+                        int(x)
+                        for x in Path(f"/proc/{init_host_pid}/task/{init_host_pid}/children")
+                        .read_text(encoding="utf-8")
+                        .split()
+                    ]
+                    for cand in cand_pids:
+                        try:
+                            status_txt = Path(f"/proc/{cand}/status").read_text(encoding="utf-8")
+                            for line in status_txt.splitlines():
+                                if line.startswith("NSpid:") and line.split()[-1] == str(ns_root_pid):
+                                    restored_host_pid = cand
+                                    break
+                        except OSError:
+                            pass
+                        if restored_host_pid is not None:
+                            break
+                if restored_host_pid is not None:
+                    break
+                time.sleep(0.01)
+
+            if init_host_pid is None or restored_host_pid is None:
+                raise RuntimeError(
+                    f"Unable to map restored PID namespace root {ns_root_pid} under unshare PID {unshare_proc.pid}"
+                )
+
+            restored_children_host_pids = [
+                int(x)
+                for x in Path(f"/proc/{restored_host_pid}/task/{restored_host_pid}/children")
+                .read_text(encoding="utf-8")
+                .split()
+            ]
+            eff_file.write_text(f"{restored_host_pid}\n", encoding="utf-8")
+            return restored_host_pid, restored_children_host_pids, init_host_pid, unshare_proc, ns_root_pid
+        except Exception:
             try:
-                os.waitpid(orig_pid, os.WNOHANG)
-            except OSError:
+                init_children_cleanup = (
+                    Path(f"/proc/{unshare_proc.pid}/task/{unshare_proc.pid}/children")
+                    .read_text(encoding="utf-8")
+                    .split()
+                )
+                for ic in init_children_cleanup:
+                    os.kill(int(ic), signal.SIGKILL)
+            except Exception:
                 pass
-            if not Path(f"/proc/{orig_pid}/fd").exists() or not list(Path(f"/proc/{orig_pid}/fd").iterdir()):
-                break
-            time.sleep(0.005)
-        self._silenced_source_pids.add(orig_pid)
+            try:
+                unshare_proc.kill()
+                unshare_proc.wait(timeout=1.0)
+            except Exception:
+                pass
+            raise
+
+    def _workload_id_for_source_pid(self, pid: int) -> Optional[str]:
+        for wl_id, srv in self.source_workloads.items():
+            if srv.root_pid == pid or pid in srv.children_pids:
+                return wl_id
+        return None
+
+    def _workload_id_for_dest_pid(self, pid: int) -> Optional[str]:
+        for wl_id, srv in self.dest_workloads.items():
+            if srv.root_pid == pid or pid in srv.children_pids:
+                return wl_id
+        return None
 
     def _signal_sender_a(self, pid: int, sig: int) -> None:
         self.commands_executed.append(f"kill -{sig} {pid} (Host A)")
-        if (
-            self.backend == "REAL_CRIU"
-            and sig == signal.SIGCONT
-            and pid in self._silenced_source_pids
-        ):
-            self._silenced_source_pids.discard(pid)
-            backup_entry = self._backup_source_by_pid.get(pid)
-            if backup_entry is not None:
-                backup_final_dir, target_srv, orig_children = backup_entry
-                r_pid, r_children, init_pid, u_proc, _ = self._restore_in_unshare(
-                    img_dir=backup_final_dir,
-                    target_srv=target_srv,
-                    eff_pid_override=pid,
-                )
-                self._virtual_to_actual_pid_a[pid] = r_pid
-                for idx_c, orig_cp in enumerate(orig_children):
-                    if idx_c < len(r_children):
-                        self._virtual_to_actual_pid_a[orig_cp] = r_children[idx_c]
-                target_srv.root_pid = r_pid
-                target_srv.children_pids = r_children
-                target_srv._unshare_init_pid = init_pid
-                target_srv._unshare_proc = u_proc
-                for p_resume in [r_pid] + r_children:
-                    try:
-                        os.kill(p_resume, signal.SIGCONT)
-                    except OSError:
-                        pass
-                return
+        wl_id = self._workload_id_for_source_pid(pid)
+        vip = self._vip_by_workload_id.get(wl_id) if wl_id else None
+        is_root = bool(wl_id and self.source_workloads[wl_id].root_pid == pid)
 
-        actual_pid = self._virtual_to_actual_pid_a.get(pid, pid)
-        if self.backend == "REAL_CRIU":
-            if sig == signal.SIGKILL:
-                set_pid_tcp_repair(actual_pid, enable=True)
-            elif sig == signal.SIGCONT:
-                set_pid_tcp_repair(actual_pid, enable=False)
+        if sig == signal.SIGCONT and self._netns_fabric is not None and vip and is_root:
+            self._netns_fabric.assign_vip(self._netns_fabric.ns_a, vip)
+            self._netns_fabric.route_vip_to_a(vip)
+            self._netns_fabric.unfence_vip(self._netns_fabric.ns_a, vip)
+
         try:
-            os.kill(actual_pid, sig)
+            os.kill(pid, sig)
         except OSError as exc:
             if exc.errno != errno.ESRCH:
                 raise
         if sig == signal.SIGKILL:
-            try:
-                os.waitpid(actual_pid, os.WNOHANG)
-            except OSError:
-                pass
+            for _ in range(100):
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except OSError:
+                    pass
+                if not self._check_pid_alive_a(pid):
+                    break
+                time.sleep(0.005)
+            if self._netns_fabric is not None and vip and is_root:
+                self._netns_fabric.remove_vip(self._netns_fabric.ns_a, vip)
+                self._netns_fabric.unfence_vip(self._netns_fabric.ns_a, vip)
             shutil.rmtree(self.proc_a / str(pid), ignore_errors=True)
 
     def _signal_sender_b(self, pid: int, sig: int) -> None:
         self.commands_executed.append(f"kill -{sig} {pid} (Host B)")
-        if sig == signal.SIGKILL and self.backend == "REAL_CRIU":
-            _silence_tcp_sockets_of_pid(pid)
+        wl_id = self._workload_id_for_dest_pid(pid)
+        vip = self._vip_by_workload_id.get(wl_id) if wl_id else None
+        is_root = bool(wl_id and self.dest_workloads[wl_id].root_pid == pid)
+
+        if sig == signal.SIGCONT and self._netns_fabric is not None and vip and is_root:
+            self._netns_fabric.unfence_vip(self._netns_fabric.ns_b, vip)
+            self._netns_fabric.route_vip_to_b(vip)
+
+        if sig == signal.SIGKILL and self._netns_fabric is not None and vip and is_root:
+            self._netns_fabric.fence_vip(self._netns_fabric.ns_b, vip)
+
         try:
             os.kill(pid, sig)
         except OSError as exc:
@@ -1131,18 +1305,32 @@ class AcceptanceClusterHarness:
                 if not Path(f"/proc/{pid}").exists():
                     break
                 time.sleep(0.005)
+            if self._netns_fabric is not None and vip and is_root:
+                self._netns_fabric.remove_vip(self._netns_fabric.ns_b, vip)
+                self._netns_fabric.unfence_vip(self._netns_fabric.ns_b, vip)
             shutil.rmtree(self.proc_b / str(pid), ignore_errors=True)
 
     def _check_pid_alive_a(self, pid: int) -> bool:
-        actual_pid = self._virtual_to_actual_pid_a.get(pid, pid)
         try:
-            wpid, _ = os.waitpid(actual_pid, os.WNOHANG)
-            if wpid == actual_pid:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
                 return False
         except OSError:
             pass
+        if sys.platform.startswith("linux"):
+            stat_path = Path(f"/proc/{pid}/stat")
+            if stat_path.exists():
+                try:
+                    raw = stat_path.read_text(encoding="utf-8")
+                    rparen = raw.rfind(")")
+                    if rparen != -1:
+                        st = raw[rparen + 2 :].split()[0]
+                        if st in ("Z", "X"):
+                            return False
+                except OSError:
+                    pass
         try:
-            os.kill(actual_pid, 0)
+            os.kill(pid, 0)
             return True
         except OSError:
             return False
@@ -1211,16 +1399,24 @@ class AcceptanceClusterHarness:
                                 target_srv.quiesce()
 
                             wl_id = target_srv.workload_id if target_srv else "acc-workload"
+                            vip = self._vip_by_workload_id.get(wl_id)
+                            if action == "dump" and self._netns_fabric is not None and vip:
+                                self._netns_fabric.fence_vip(self._netns_fabric.ns_a, vip)
 
-                            real_cmd = [
-                                "criu",
-                                action,
-                                "-t",
-                                str(dump_pid),
-                                "--images-dir",
-                                str(img_dir),
-                                "--shell-job",
-                            ]
+                            real_cmd: List[str] = []
+                            if self._netns_fabric is not None:
+                                real_cmd.extend(["nsenter", f"--net=/var/run/netns/{self._netns_fabric.ns_a}"])
+                            real_cmd.extend(
+                                [
+                                    "criu",
+                                    action,
+                                    "-t",
+                                    str(dump_pid),
+                                    "--images-dir",
+                                    str(img_dir),
+                                    "--shell-job",
+                                ]
+                            )
                             if "--prev-images-dir" in cmd:
                                 p_idx = cmd.index("--prev-images-dir")
                                 real_cmd.extend(["--prev-images-dir", cmd[p_idx + 1]])
@@ -1248,8 +1444,10 @@ class AcceptanceClusterHarness:
                                     err_msg = "Real CRIU dump did not produce tcp-stream-*.img TCP_REPAIR image"
                                     self.error_logs.append(err_msg)
                                     raise RuntimeError(err_msg)
-                                if dump_pid is not None:
-                                    self._dumped_img_by_src_pid[int(dump_pid)] = img_dir
+                                if target_srv is not None and not target_srv.is_alive():
+                                    err_msg = "Invariant violation: Source A process exited instead of remaining stopped (--leave-stopped)"
+                                    self.error_logs.append(err_msg)
+                                    raise RuntimeError(err_msg)
 
                             cp_meta = {
                                 "workload_id": wl_id,
@@ -1369,12 +1567,10 @@ class AcceptanceClusterHarness:
                             if target_srv is None:
                                 raise RuntimeError(f"No source workload registered for {wl_id}")
 
-                            src_img_dir = (
-                                self._dumped_img_by_src_pid.get(target_srv.root_pid, img_dir)
-                                if target_srv.root_pid is not None
-                                else img_dir
-                            )
-                            self._silence_and_terminate_source_for_cutover(src_img_dir, target_srv)
+                            vip = self._vip_by_workload_id.get(wl_id)
+                            if self._netns_fabric is not None and vip:
+                                self._netns_fabric.fence_vip(self._netns_fabric.ns_b, vip)
+                                self._netns_fabric.assign_vip(self._netns_fabric.ns_b, vip)
 
                             (
                                 restored_host_pid,
@@ -1383,6 +1579,14 @@ class AcceptanceClusterHarness:
                                 unshare_proc,
                                 ns_root_pid,
                             ) = self._restore_in_unshare(img_dir=img_dir, target_srv=target_srv)
+
+                            if not target_srv.is_alive():
+                                err_msg = (
+                                    f"Invariant violation: Source A process {target_srv.root_pid} did not remain "
+                                    f"stopped and alive during Destination B CRIU restore"
+                                )
+                                self.error_logs.append(err_msg)
+                                raise RuntimeError(err_msg)
 
                             if "--pidfile" in cmd:
                                 pidfile_path = Path(cmd[cmd.index("--pidfile") + 1])
@@ -1496,405 +1700,433 @@ def run_acceptance_scenario(
             execution_backend=execution_backend,
             injected_fault=injected_fault,
         )
-
-        log_path = Path(tmp) / "state.log"
-        client_sock, server_sock = _create_tcp_socketpair()
-        client = WorkloadClient(client_sock)
-
-        service_a = DeterministicWorkloadService(
-            workload_id="acc-workload",
-            state_log_path=log_path,
-            stream_sock=server_sock,
-            num_children=2,
-            use_real_criu=(execution_backend == "REAL_CRIU"),
-        )
-        service_a.start()
-        harness.register_workload(service_a, server_sock, client_sock)
-
-        src_root_pid = service_a.root_pid
-        assert src_root_pid is not None
-
-        # Phase 1: 10 requests before migration cutover
-        acks_before: List[WorkloadAck] = []
-        for seq in range(1, 11):
-            ack = client.send_request(seq, f"before-{seq}")
-            acks_before.append(ack)
-
-        # Build migration config
-        wal_root = Path(tmp) / "wal"
-        wal_root.mkdir(parents=True, exist_ok=True)
-        attest_key = generate_ephemeral_key_hex()
-        cfg = MigrationConfig(
-            pid=src_root_pid,
-            workload_id="acc-workload",
-            source_addr="10.0.0.1:9700",
-            dest_addr="10.0.0.2:9700",
-            strategy=strategy,
-            fs_mode=FilesystemMode.SHARED,
-            ip_mobility=IpMobilityMode.NONE,
-            verify_attestation=True,
-            attestation_key_hex=attest_key,
-            wipe_images_on_commit=False,
-            journal_dir=str(wal_root),
-            tls=TlsConfig(enabled=False),
-        )
-
-        client_a = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
-        client_b = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
-
-        is_rollback_expected = (
-            injected_fault is not None
-            and injected_fault not in ("GANG_MID_COMMIT_FAULT", "CONTROLLER_RESTART_MID_CUTOVER", "SAME_HOST_COW")
-        )
-        mig_result: Optional[MigrationResult] = None
-
-        blackout_start_time = [time.monotonic()]
-        orig_service_quiesce = service_a.quiesce
-
-        def _hooked_quiesce(*args: Any, **kwargs: Any) -> None:
-            blackout_start_time[0] = time.monotonic()
-            return orig_service_quiesce(*args, **kwargs)
-
-        service_a.quiesce = _hooked_quiesce
-
+        service_a: Optional[DeterministicWorkloadService] = None
+        server_sock: Optional[socket.socket] = None
+        client: Optional[WorkloadClient] = None
         try:
-            if injected_fault == "CRASH_AFTER_RESTORE":
-                # Scenario 8: Controller crash after restore + WAL recovery
-                wal_dir = Path(tmp) / "wal"
-                wal_dir.mkdir(parents=True, exist_ok=True)
-                orch = MigrationOrchestrator(cfg, client_a, client_b, migration_id="mig-crash", journal_dir=wal_dir)
+            log_path = Path(tmp) / "state.log"
+            client_sock, server_sock = harness.create_workload_tcp_pair("acc-workload")
+            client = WorkloadClient(client_sock)
 
-                orch.run_preflight()
-                orch._transition(MigrationState.PREPARE)
-                client_a.call("prepare_migration", migration_id=orch.migration_id)
-                client_b.call("prepare_migration", migration_id=orch.migration_id)
-                orch._transition(MigrationState.FREEZE)
-                orch._transition(MigrationState.FINAL_DUMP)
-                client_a.call("freeze_and_final_dump", migration_id=orch.migration_id, prev_round_name=None, dest_host=client_b.host, config_dict=config_to_dict(cfg))
-                orch._transition(MigrationState.TRANSFER)
-                client_a.call("transfer_final_state", migration_id=orch.migration_id, dest_host=client_b.host, config_dict=config_to_dict(cfg))
-                orch._transition(MigrationState.RESTORE)
-                client_a.call("release_ip", config_dict=config_to_dict(cfg), migration_id=orch.migration_id)
-                # Destination restores process tree and records restored.pid / restore_state.json
-                client_b.call("restore_process", migration_id=orch.migration_id, source_host=client_a.host, config_dict=config_to_dict(cfg))
+            service_a = DeterministicWorkloadService(
+                workload_id="acc-workload",
+                state_log_path=log_path,
+                stream_sock=server_sock,
+                num_children=2,
+                use_real_criu=(execution_backend == "REAL_CRIU"),
+                netns_name=harness.netns_a,
+            )
+            service_a.start()
+            harness.register_workload(service_a, server_sock, client_sock)
 
-                # SIMULATE CRASH: Controller crashes BEFORE recording restored_pid in WAL / calling claim_ip_and_resume
-                wal_file = wal_dir / f"{orch.migration_id}.wal.jsonl"
-                mig_result = MigrationOrchestrator.recover_from_journal(wal_file, client_a, client_b)
-
-            elif injected_fault == "GANG_MEMBER_2_FAIL":
-                # Scenario 9: Gang migration where Member 2 fails verify_restored_stopped
-                harness.service_b._fail_verify_restored_stopped = True
-
-                log_path2 = Path(tmp) / "state2.log"
-                c_sock2, s_sock2 = _create_tcp_socketpair()
-                client2 = WorkloadClient(c_sock2)
-                service_b2 = DeterministicWorkloadService(
-                    workload_id="acc-workload-2",
-                    state_log_path=log_path2,
-                    stream_sock=s_sock2,
-                    num_children=2,
-                    use_real_criu=(execution_backend == "REAL_CRIU"),
-                )
-                service_b2.start()
-                harness.register_workload(service_b2, s_sock2, c_sock2)
-
-                pid2_dir = harness.proc_a / str(service_b2.root_pid)
-                pid2_dir.mkdir(parents=True, exist_ok=True)
-                (pid2_dir / "fd").mkdir(parents=True, exist_ok=True)
-                (pid2_dir / "status").write_text(f"Name:\tacc2\nVmRSS:\t32768 kB\nNSpid:\t{service_b2.root_pid}\t1\n", encoding="utf-8")
-                (pid2_dir / "cgroup").write_text("0::/lkmp/srv-2\n", encoding="utf-8")
-                (pid2_dir / "maps").write_text("", encoding="utf-8")
-
-                for s2 in range(1, 11):
-                    client2.send_request(s2, f"before2-{s2}")
-
-                cfg2 = MigrationConfig(
-                    pid=service_b2.root_pid,
-                    workload_id="acc-workload-2",
-                    source_addr="10.0.0.1:9700",
-                    dest_addr="10.0.0.2:9700",
-                    strategy=strategy,
-                    journal_dir=str(wal_root),
-                    tls=TlsConfig(enabled=False),
-                )
-                coordinator = GangMigrationCoordinator(
-                    gang_id="gang-acc",
-                    members=[(cfg, client_a, client_b), (cfg2, client_a, client_b)],
-                )
-                gang_res = coordinator.execute_atomic()
-                mig_result = gang_res.member_results[0] if gang_res.member_results else None
-
-                for s2 in range(11, 21):
-                    client2.send_request(s2, f"after2-{s2}")
-                client2.close()
-                service_b2.terminate()
-                try:
-                    s_sock2.close()
-                except OSError:
-                    pass
-
-            elif injected_fault == "GANG_MID_COMMIT_FAULT":
-                # Scenario 10: Gang migration where Member 1 succeeds commit_source,
-                # and Member 2 encounters a transient RPC failure during Phase 2 commit.
-                # Recover from journal rolls forward to complete Member 2's cutover so Destination B serves seq=11..20.
-                log_path2 = Path(tmp) / "state2.log"
-                c_sock2, s_sock2 = _create_tcp_socketpair()
-                client2 = WorkloadClient(c_sock2)
-                service_b2 = DeterministicWorkloadService(
-                    workload_id="acc-workload-2",
-                    state_log_path=log_path2,
-                    stream_sock=s_sock2,
-                    num_children=2,
-                    use_real_criu=(execution_backend == "REAL_CRIU"),
-                )
-                service_b2.start()
-                harness.register_workload(service_b2, s_sock2, c_sock2)
-
-                pid2_dir = harness.proc_a / str(service_b2.root_pid)
-                pid2_dir.mkdir(parents=True, exist_ok=True)
-                (pid2_dir / "fd").mkdir(parents=True, exist_ok=True)
-                (pid2_dir / "status").write_text(f"Name:\tacc2\nVmRSS:\t32768 kB\nNSpid:\t{service_b2.root_pid}\t1\n", encoding="utf-8")
-                (pid2_dir / "cgroup").write_text("0::/lkmp/srv-2\n", encoding="utf-8")
-                (pid2_dir / "maps").write_text("", encoding="utf-8")
-
-                for s2 in range(1, 11):
-                    client2.send_request(s2, f"before2-{s2}")
-
-                cfg2 = MigrationConfig(
-                    pid=service_b2.root_pid,
-                    workload_id="acc-workload-2",
-                    source_addr="10.0.0.1:9700",
-                    dest_addr="10.0.0.2:9700",
-                    strategy=strategy,
-                    journal_dir=str(wal_root),
-                    tls=TlsConfig(enabled=False),
-                )
-                coordinator = GangMigrationCoordinator(
-                    gang_id="gang-acc-rollforward",
-                    members=[(cfg, client_a, client_b), (cfg2, client_a, client_b)],
-                )
-
-                # Inject transient failure during Phase 2 commit on Member 2
-                orig_commit_source = harness.service_a.commit_source
-                transient_failure_injected = [True]
-
-                def failing_commit_source(migration_id: str, config_dict: Dict[str, Any]) -> Dict[str, Any]:
-                    if "m2" in migration_id and transient_failure_injected[0]:
-                        transient_failure_injected[0] = False
-                        raise RuntimeError("Injected transient RPC failure during Phase 2 commit_source on Member 2")
-                    return orig_commit_source(migration_id, config_dict)
-
-                harness.service_a.commit_source = failing_commit_source
-
-                gang_res = coordinator.execute_atomic()
-
-                # Verify mid-commit failure semantics
-                if gang_res.atomic_rollback_triggered:
-                    raise AssertionError("atomic_rollback_triggered must be False on mid-commit fault!")
-                if not gang_res.partial_commit_error:
-                    raise AssertionError("partial_commit_error must be True on mid-commit fault!")
-                if gang_res.all_committed:
-                    raise AssertionError("all_committed must be False on initial mid-commit fault!")
-
-                # Recover from journal: rolls forward to complete Member 2's cutover!
-                gang_rec = GangMigrationCoordinator.recover_from_journal(
-                    gang_journal_path=coordinator.journal.path,
-                    members=[(cfg, client_a, client_b), (cfg2, client_a, client_b)],
-                )
-                if not gang_rec.all_committed:
-                    raise AssertionError(f"Gang recovery roll-forward failed: {gang_rec.error_message}")
-                if gang_rec.atomic_rollback_triggered:
-                    raise AssertionError("atomic_rollback_triggered must be False during roll-forward recovery!")
-                if gang_rec.partial_commit_error:
-                    raise AssertionError("partial_commit_error must be False after successful roll-forward recovery!")
-
-                mig_result = gang_rec.member_results[0] if gang_rec.member_results else None
-
-                # Destination B serves seq=11..20 for Member 2!
-                dest_pid_2 = harness.dest_workloads["acc-workload-2"].root_pid
-                for s2 in range(11, 21):
-                    ack2 = client2.send_request(s2, f"after2-{s2}")
-                    if ack2.root_pid != dest_pid_2:
-                        raise AssertionError(f"Member 2 request seq={s2} served by PID {ack2.root_pid}, expected Destination B PID {dest_pid_2}")
-
-                client2.close()
-                service_b2.terminate()
-                if "acc-workload-2" in harness.dest_workloads:
-                    harness.dest_workloads["acc-workload-2"].terminate()
-                try:
-                    s_sock2.close()
-                except OSError:
-                    pass
-
-            elif injected_fault == "CONTROLLER_RESTART_MID_CUTOVER":
-                # Scenario 11 (The Milestone Scenario): Active TCP + File Write Surviving Forced Controller Restart
-                wal_dir = Path(tmp) / "wal"
-                wal_dir.mkdir(parents=True, exist_ok=True)
-                orch = MigrationOrchestrator(cfg, client_a, client_b, migration_id="mig-restart-11", journal_dir=wal_dir)
-
-                orch.run_preflight()
-                orch._transition(MigrationState.PREPARE)
-                client_a.call("prepare_migration", migration_id=orch.migration_id)
-                client_b.call("prepare_migration", migration_id=orch.migration_id)
-
-                # Consistent freeze + volume snapshot
-                orch._transition(MigrationState.FREEZE)
-                orch._transition(MigrationState.FINAL_DUMP)
-                client_a.call("freeze_and_final_dump", migration_id=orch.migration_id, prev_round_name=None, dest_host=client_b.host, config_dict=config_to_dict(cfg))
-
-                orch._transition(MigrationState.TRANSFER)
-                client_a.call("transfer_final_state", migration_id=orch.migration_id, dest_host=client_b.host, config_dict=config_to_dict(cfg))
-
-                orch._transition(MigrationState.RESTORE)
-                client_a.call("release_ip", config_dict=config_to_dict(cfg), migration_id=orch.migration_id)
-                restore_res = client_b.call("restore_process", migration_id=orch.migration_id, source_host=client_a.host, config_dict=config_to_dict(cfg))
-                restored_pid = int(restore_res["restored_pid"])
-                orch._restored_pid = restored_pid
-
-                # Durable COMMITTED decision written to WAL BEFORE commit_source and claim_ip_and_resume
-                if orch.journal is not None:
-                    orch.journal.append(
-                        state=MigrationState.RESTORE,
-                        commit_decision="COMMITTED",
-                        restored_pid=restored_pid,
-                        note="Durable COMMITTED decision written prior to simulated crash",
-                    )
-
-                # SIMULATE FORCED CONTROLLER CRASH: drop old orchestrator instance
-                wal_file = wal_dir / f"{orch.migration_id}.wal.jsonl"
-                del orch
-
-                # Recover from journal: brand-new controller recovers and terminates Source A via commit_source
-                mig_result = MigrationOrchestrator.recover_from_journal(wal_file, client_a, client_b)
-
-                # Resume Destination B idempotently (completing claim_ip_and_resume)
-                client_b.call(
-                    "claim_ip_and_resume",
-                    restored_pid=restored_pid,
-                    target_host=client_b.host,
-                    config_dict=config_to_dict(cfg),
-                    migration_id="mig-restart-11",
-                )
-
-            elif injected_fault == "SAME_HOST_COW":
-                # Scenario 12: Same-Host Two-VM CoW Snapshot Fast Path via production orchestrator
-                cfg.source_addr = "127.0.0.1:9700"
-                cfg.dest_addr = "127.0.0.1:9701"
-                cfg.fs_mode = FilesystemMode.SHARED
-                wal_dir = Path(tmp) / "wal"
-                wal_dir.mkdir(parents=True, exist_ok=True)
-                client_a_cow = AgentClient(cfg.source_addr, direct_service=harness.service_a)
-                client_b_cow = AgentClient(cfg.dest_addr, direct_service=harness.service_b)
-                orch = MigrationOrchestrator(
-                    cfg,
-                    client_a_cow,
-                    client_b_cow,
-                    migration_id="mig-cow-12",
-                    journal_dir=wal_dir,
-                )
-                mig_result = orch.execute()
-                if not any(c.startswith("cp ") for c in harness.commands_executed):
-                    raise AssertionError("Production transfer_final_state did not invoke CoW cp fast path")
-                if any(c.startswith("rsync ") for c in harness.commands_executed):
-                    raise AssertionError("Same-host CoW fast path unexpectedly invoked rsync")
-
-            else:
-                # Normal live migration or standard phase boundary fault injection
-                orch = MigrationOrchestrator(cfg, client_a, client_b, migration_id="mig-acc")
-                mig_result = orch.execute()
-
-        except Exception as exc:
-            error_logs.append(str(exc))
-
-        commands_executed.extend(harness.commands_executed)
-        error_logs.extend(harness.error_logs)
-
-        # Measure client-perceived blackout duration: from just before freezing the service for cutover
-        # to the completion of the first post-cutover request `seq=11` ACK on the persistent TCP connection!
-        acks_after: List[WorkloadAck] = []
-        blackout_end_time = time.monotonic()
-        try:
-            ack_11 = client.send_request(11, "after-11")
-            blackout_end_time = time.monotonic()
-            acks_after.append(ack_11)
-            # Phase 2: 10 requests during and after migration cutover or rollback
-            for seq in range(12, 21):
-                ack = client.send_request(seq, f"after-{seq}")
-                acks_after.append(ack)
-        except Exception as exc:
-            error_logs.append(f"Post-cutover request failed: {exc}")
-        client_observed_blackout_ms = max(0.1, (blackout_end_time - blackout_start_time[0]) * 1000.0)
-
-        client.close()
-
-        # Invariant 1: Same persistent stream connection preserved
-        same_tcp_preserved = len(acks_before) == 10 and len(acks_after) == 10
-
-        # Invariant 2: Strictly contiguous sequence with zero lost or duplicated requests
-        all_acks = acks_before + acks_after
-        received_seqs = [a.seq for a in all_acks]
-        received_counters = [a.counter for a in all_acks]
-        seq_contiguous = received_seqs == list(range(1, 21)) and received_counters == list(range(1, 21))
-
-        # Invariant 3: 100% exact match against deterministic xorshift64* trajectory
-        expected_prng = DEFAULT_PRNG_SEED
-        expected_hexes: List[str] = []
-        for _ in range(1, 21):
-            expected_prng = step_xorshift64star(expected_prng)
-            expected_hexes.append(f"{expected_prng:016x}")
-        actual_hexes = [a.prng_hex for a in all_acks]
-        prng_exact_match = actual_hexes == expected_hexes
-
-        # Invariant 4: fsynced disk records in state.log match exactly 20 records
-        log_lines = [l.strip() for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
-        file_records_verified = len(log_lines)
-        file_records_intact = file_records_verified == 20
-
-        # Invariant 5: Process tree lifecycle verification
-        src_alive = service_a.is_alive()
-        if is_rollback_expected:
-            src_terminated_on_commit = False
-            src_resumed_on_rollback = src_alive
-        else:
-            src_terminated_on_commit = not src_alive
-            src_resumed_on_rollback = False
-
-        # Invariant 6: All child workers responded
-        all_children_resumed = all(a.child_count == 2 for a in acks_after)
-
-        # Invariant 7: Dual execution strictly prevented
-        # In commit scenarios, Source A served 1..10, Dest B served 11..20
-        # In rollback scenarios, Source A served 1..20, Dest B served 0
-        if is_rollback_expected:
-            no_dual_execution = all(a.root_pid == src_root_pid for a in all_acks)
-        else:
-            dest_pid = harness.dest_workload.root_pid if harness.dest_workload else None
-            no_dual_execution = (
-                all(a.root_pid == src_root_pid for a in acks_before)
-                and all(a.root_pid == dest_pid for a in acks_after)
+            src_root_pid = service_a.root_pid
+            assert src_root_pid is not None
+            orig_src_starttime = (
+                read_proc_starttime(src_root_pid, "/proc")
+                if execution_backend == "REAL_CRIU"
+                else None
             )
 
-        passed = (
-            same_tcp_preserved
-            and seq_contiguous
-            and prng_exact_match
-            and file_records_intact
-            and all_children_resumed
-            and no_dual_execution
-            and (src_terminated_on_commit if not is_rollback_expected else src_resumed_on_rollback)
-        )
+            # Phase 1: 10 requests before migration cutover
+            acks_before: List[WorkloadAck] = []
+            for seq in range(1, 11):
+                ack = client.send_request(seq, f"before-{seq}")
+                acks_before.append(ack)
 
-        # Cleanup running services
-        service_a.terminate()
-        for dw in harness.dest_workloads.values():
-            dw.terminate()
-        if harness.dest_workload:
-            harness.dest_workload.terminate()
-        try:
-            server_sock.close()
-        except OSError:
-            pass
+            # Build migration config
+            wal_root = Path(tmp) / "wal"
+            wal_root.mkdir(parents=True, exist_ok=True)
+            attest_key = generate_ephemeral_key_hex()
+            cfg = MigrationConfig(
+                pid=src_root_pid,
+                workload_id="acc-workload",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=strategy,
+                fs_mode=FilesystemMode.SHARED,
+                ip_mobility=IpMobilityMode.NONE,
+                verify_attestation=True,
+                attestation_key_hex=attest_key,
+                wipe_images_on_commit=False,
+                journal_dir=str(wal_root),
+                tls=TlsConfig(enabled=False),
+            )
+
+            client_a = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
+            client_b = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
+
+            is_rollback_expected = (
+                injected_fault is not None
+                and injected_fault not in ("GANG_MID_COMMIT_FAULT", "CONTROLLER_RESTART_MID_CUTOVER", "SAME_HOST_COW")
+            )
+            mig_result: Optional[MigrationResult] = None
+
+            blackout_start_time = [time.monotonic()]
+            orig_service_quiesce = service_a.quiesce
+
+            def _hooked_quiesce(*args: Any, **kwargs: Any) -> None:
+                blackout_start_time[0] = time.monotonic()
+                return orig_service_quiesce(*args, **kwargs)
+
+            service_a.quiesce = _hooked_quiesce
+
+            try:
+                if injected_fault == "CRASH_AFTER_RESTORE":
+                    # Scenario 8: Controller crash after restore + WAL recovery
+                    wal_dir = Path(tmp) / "wal"
+                    wal_dir.mkdir(parents=True, exist_ok=True)
+                    orch = MigrationOrchestrator(cfg, client_a, client_b, migration_id="mig-crash", journal_dir=wal_dir)
+
+                    orch.run_preflight()
+                    orch._transition(MigrationState.PREPARE)
+                    client_a.call("prepare_migration", migration_id=orch.migration_id)
+                    client_b.call("prepare_migration", migration_id=orch.migration_id)
+                    orch._transition(MigrationState.FREEZE)
+                    orch._transition(MigrationState.FINAL_DUMP)
+                    client_a.call("freeze_and_final_dump", migration_id=orch.migration_id, prev_round_name=None, dest_host=client_b.host, config_dict=config_to_dict(cfg))
+                    orch._transition(MigrationState.TRANSFER)
+                    client_a.call("transfer_final_state", migration_id=orch.migration_id, dest_host=client_b.host, config_dict=config_to_dict(cfg))
+                    orch._transition(MigrationState.RESTORE)
+                    client_a.call("release_ip", config_dict=config_to_dict(cfg), migration_id=orch.migration_id)
+                    # Destination restores process tree and records restored.pid / restore_state.json
+                    client_b.call("restore_process", migration_id=orch.migration_id, source_host=client_a.host, config_dict=config_to_dict(cfg))
+
+                    # SIMULATE CRASH: Controller crashes BEFORE recording restored_pid in WAL / calling claim_ip_and_resume
+                    wal_file = wal_dir / f"{orch.migration_id}.wal.jsonl"
+                    mig_result = MigrationOrchestrator.recover_from_journal(wal_file, client_a, client_b)
+
+                elif injected_fault == "GANG_MEMBER_2_FAIL":
+                    # Scenario 9: Gang migration where Member 2 fails verify_restored_stopped
+                    harness.service_b._fail_verify_restored_stopped = True
+
+                    log_path2 = Path(tmp) / "state2.log"
+                    c_sock2, s_sock2 = harness.create_workload_tcp_pair("acc-workload-2")
+                    client2 = WorkloadClient(c_sock2)
+                    service_b2 = DeterministicWorkloadService(
+                        workload_id="acc-workload-2",
+                        state_log_path=log_path2,
+                        stream_sock=s_sock2,
+                        num_children=2,
+                        use_real_criu=(execution_backend == "REAL_CRIU"),
+                        netns_name=harness.netns_a,
+                    )
+                    service_b2.start()
+                    harness.register_workload(service_b2, s_sock2, c_sock2)
+
+                    pid2_dir = harness.proc_a / str(service_b2.root_pid)
+                    pid2_dir.mkdir(parents=True, exist_ok=True)
+                    (pid2_dir / "fd").mkdir(parents=True, exist_ok=True)
+                    (pid2_dir / "status").write_text(f"Name:\tacc2\nVmRSS:\t32768 kB\nNSpid:\t{service_b2.root_pid}\t1\n", encoding="utf-8")
+                    (pid2_dir / "cgroup").write_text("0::/lkmp/srv-2\n", encoding="utf-8")
+                    (pid2_dir / "maps").write_text("", encoding="utf-8")
+
+                    for s2 in range(1, 11):
+                        client2.send_request(s2, f"before2-{s2}")
+
+                    cfg2 = MigrationConfig(
+                        pid=service_b2.root_pid,
+                        workload_id="acc-workload-2",
+                        source_addr="10.0.0.1:9700",
+                        dest_addr="10.0.0.2:9700",
+                        strategy=strategy,
+                        journal_dir=str(wal_root),
+                        tls=TlsConfig(enabled=False),
+                    )
+                    coordinator = GangMigrationCoordinator(
+                        gang_id="gang-acc",
+                        members=[(cfg, client_a, client_b), (cfg2, client_a, client_b)],
+                    )
+                    gang_res = coordinator.execute_atomic()
+                    mig_result = gang_res.member_results[0] if gang_res.member_results else None
+
+                    for s2 in range(11, 21):
+                        client2.send_request(s2, f"after2-{s2}")
+                    client2.close()
+                    service_b2.terminate()
+                    try:
+                        s_sock2.close()
+                    except OSError:
+                        pass
+
+                elif injected_fault == "GANG_MID_COMMIT_FAULT":
+                    # Scenario 10: Gang migration where Member 1 succeeds commit_source,
+                    # and Member 2 encounters a transient RPC failure during Phase 2 commit.
+                    # Recover from journal rolls forward to complete Member 2's cutover so Destination B serves seq=11..20.
+                    log_path2 = Path(tmp) / "state2.log"
+                    c_sock2, s_sock2 = harness.create_workload_tcp_pair("acc-workload-2")
+                    client2 = WorkloadClient(c_sock2)
+                    service_b2 = DeterministicWorkloadService(
+                        workload_id="acc-workload-2",
+                        state_log_path=log_path2,
+                        stream_sock=s_sock2,
+                        num_children=2,
+                        use_real_criu=(execution_backend == "REAL_CRIU"),
+                        netns_name=harness.netns_a,
+                    )
+                    service_b2.start()
+                    harness.register_workload(service_b2, s_sock2, c_sock2)
+
+                    pid2_dir = harness.proc_a / str(service_b2.root_pid)
+                    pid2_dir.mkdir(parents=True, exist_ok=True)
+                    (pid2_dir / "fd").mkdir(parents=True, exist_ok=True)
+                    (pid2_dir / "status").write_text(f"Name:\tacc2\nVmRSS:\t32768 kB\nNSpid:\t{service_b2.root_pid}\t1\n", encoding="utf-8")
+                    (pid2_dir / "cgroup").write_text("0::/lkmp/srv-2\n", encoding="utf-8")
+                    (pid2_dir / "maps").write_text("", encoding="utf-8")
+
+                    for s2 in range(1, 11):
+                        client2.send_request(s2, f"before2-{s2}")
+
+                    cfg2 = MigrationConfig(
+                        pid=service_b2.root_pid,
+                        workload_id="acc-workload-2",
+                        source_addr="10.0.0.1:9700",
+                        dest_addr="10.0.0.2:9700",
+                        strategy=strategy,
+                        journal_dir=str(wal_root),
+                        tls=TlsConfig(enabled=False),
+                    )
+                    coordinator = GangMigrationCoordinator(
+                        gang_id="gang-acc-rollforward",
+                        members=[(cfg, client_a, client_b), (cfg2, client_a, client_b)],
+                    )
+
+                    # Inject transient failure during Phase 2 commit on Member 2
+                    orig_commit_source = harness.service_a.commit_source
+                    transient_failure_injected = [True]
+
+                    def failing_commit_source(migration_id: str, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+                        if "m2" in migration_id and transient_failure_injected[0]:
+                            transient_failure_injected[0] = False
+                            raise RuntimeError("Injected transient RPC failure during Phase 2 commit_source on Member 2")
+                        return orig_commit_source(migration_id, config_dict)
+
+                    harness.service_a.commit_source = failing_commit_source
+
+                    gang_res = coordinator.execute_atomic()
+
+                    # Verify mid-commit failure semantics
+                    if gang_res.atomic_rollback_triggered:
+                        raise AssertionError("atomic_rollback_triggered must be False on mid-commit fault!")
+                    if not gang_res.partial_commit_error:
+                        raise AssertionError("partial_commit_error must be True on mid-commit fault!")
+                    if gang_res.all_committed:
+                        raise AssertionError("all_committed must be False on initial mid-commit fault!")
+
+                    # Recover from journal: rolls forward to complete Member 2's cutover!
+                    gang_rec = GangMigrationCoordinator.recover_from_journal(
+                        gang_journal_path=coordinator.journal.path,
+                        members=[(cfg, client_a, client_b), (cfg2, client_a, client_b)],
+                    )
+                    if not gang_rec.all_committed:
+                        raise AssertionError(f"Gang recovery roll-forward failed: {gang_rec.error_message}")
+                    if gang_rec.atomic_rollback_triggered:
+                        raise AssertionError("atomic_rollback_triggered must be False during roll-forward recovery!")
+                    if gang_rec.partial_commit_error:
+                        raise AssertionError("partial_commit_error must be False after successful roll-forward recovery!")
+
+                    mig_result = gang_rec.member_results[0] if gang_rec.member_results else None
+
+                    # Destination B serves seq=11..20 for Member 2!
+                    dest_pid_2 = harness.dest_workloads["acc-workload-2"].root_pid
+                    for s2 in range(11, 21):
+                        ack2 = client2.send_request(s2, f"after2-{s2}")
+                        if ack2.root_pid != dest_pid_2:
+                            raise AssertionError(f"Member 2 request seq={s2} served by PID {ack2.root_pid}, expected Destination B PID {dest_pid_2}")
+
+                    client2.close()
+                    service_b2.terminate()
+                    if "acc-workload-2" in harness.dest_workloads:
+                        harness.dest_workloads["acc-workload-2"].terminate()
+                    try:
+                        s_sock2.close()
+                    except OSError:
+                        pass
+
+                elif injected_fault == "CONTROLLER_RESTART_MID_CUTOVER":
+                    # Scenario 11 (The Milestone Scenario): Active TCP + File Write Surviving Forced Controller Restart
+                    wal_dir = Path(tmp) / "wal"
+                    wal_dir.mkdir(parents=True, exist_ok=True)
+                    orch = MigrationOrchestrator(cfg, client_a, client_b, migration_id="mig-restart-11", journal_dir=wal_dir)
+
+                    orch.run_preflight()
+                    orch._transition(MigrationState.PREPARE)
+                    client_a.call("prepare_migration", migration_id=orch.migration_id)
+                    client_b.call("prepare_migration", migration_id=orch.migration_id)
+
+                    # Consistent freeze + volume snapshot
+                    orch._transition(MigrationState.FREEZE)
+                    orch._transition(MigrationState.FINAL_DUMP)
+                    client_a.call("freeze_and_final_dump", migration_id=orch.migration_id, prev_round_name=None, dest_host=client_b.host, config_dict=config_to_dict(cfg))
+
+                    orch._transition(MigrationState.TRANSFER)
+                    client_a.call("transfer_final_state", migration_id=orch.migration_id, dest_host=client_b.host, config_dict=config_to_dict(cfg))
+
+                    orch._transition(MigrationState.RESTORE)
+                    client_a.call("release_ip", config_dict=config_to_dict(cfg), migration_id=orch.migration_id)
+                    restore_res = client_b.call("restore_process", migration_id=orch.migration_id, source_host=client_a.host, config_dict=config_to_dict(cfg))
+                    restored_pid = int(restore_res["restored_pid"])
+                    orch._restored_pid = restored_pid
+
+                    # Durable COMMITTED decision written to WAL BEFORE commit_source and claim_ip_and_resume
+                    if orch.journal is not None:
+                        orch.journal.append(
+                            state=MigrationState.RESTORE,
+                            commit_decision="COMMITTED",
+                            restored_pid=restored_pid,
+                            note="Durable COMMITTED decision written prior to simulated crash",
+                        )
+
+                    # SIMULATE FORCED CONTROLLER CRASH: drop old orchestrator instance
+                    wal_file = wal_dir / f"{orch.migration_id}.wal.jsonl"
+                    del orch
+
+                    # Recover from journal: brand-new controller recovers and terminates Source A via commit_source
+                    mig_result = MigrationOrchestrator.recover_from_journal(wal_file, client_a, client_b)
+
+                    # Resume Destination B idempotently (completing claim_ip_and_resume)
+                    client_b.call(
+                        "claim_ip_and_resume",
+                        restored_pid=restored_pid,
+                        target_host=client_b.host,
+                        config_dict=config_to_dict(cfg),
+                        migration_id="mig-restart-11",
+                    )
+
+                elif injected_fault == "SAME_HOST_COW":
+                    # Scenario 12: Same-Host Two-VM CoW Snapshot Fast Path via production orchestrator
+                    cfg.source_addr = "127.0.0.1:9700"
+                    cfg.dest_addr = "127.0.0.1:9701"
+                    cfg.fs_mode = FilesystemMode.SHARED
+                    wal_dir = Path(tmp) / "wal"
+                    wal_dir.mkdir(parents=True, exist_ok=True)
+                    client_a_cow = AgentClient(cfg.source_addr, direct_service=harness.service_a)
+                    client_b_cow = AgentClient(cfg.dest_addr, direct_service=harness.service_b)
+                    orch = MigrationOrchestrator(
+                        cfg,
+                        client_a_cow,
+                        client_b_cow,
+                        migration_id="mig-cow-12",
+                        journal_dir=wal_dir,
+                    )
+                    mig_result = orch.execute()
+                    if not any(c.startswith("cp ") for c in harness.commands_executed):
+                        raise AssertionError("Production transfer_final_state did not invoke CoW cp fast path")
+                    if any(c.startswith("rsync ") for c in harness.commands_executed):
+                        raise AssertionError("Same-host CoW fast path unexpectedly invoked rsync")
+
+                else:
+                    # Normal live migration or standard phase boundary fault injection
+                    orch = MigrationOrchestrator(cfg, client_a, client_b, migration_id="mig-acc")
+                    mig_result = orch.execute()
+
+            except Exception as exc:
+                error_logs.append(str(exc))
+
+            commands_executed.extend(harness.commands_executed)
+            error_logs.extend(harness.error_logs)
+            if mig_result is not None and not is_rollback_expected and not mig_result.success and mig_result.error_message:
+                error_logs.append(f"Unexpected migration rollback/failure: {mig_result.error_message}")
+
+            # Measure client-perceived blackout duration: from just before freezing the service for cutover
+            # to the completion of the first post-cutover request `seq=11` ACK on the persistent TCP connection!
+            acks_after: List[WorkloadAck] = []
+            blackout_end_time = time.monotonic()
+            try:
+                ack_11 = client.send_request(11, "after-11")
+                blackout_end_time = time.monotonic()
+                acks_after.append(ack_11)
+                # Phase 2: 10 requests during and after migration cutover or rollback
+                for seq in range(12, 21):
+                    ack = client.send_request(seq, f"after-{seq}")
+                    acks_after.append(ack)
+            except Exception as exc:
+                error_logs.append(f"Post-cutover request failed: {exc}")
+            client_observed_blackout_ms = max(0.1, (blackout_end_time - blackout_start_time[0]) * 1000.0)
+
+            client.close()
+
+            # Invariant 1: Same persistent stream connection preserved
+            same_tcp_preserved = len(acks_before) == 10 and len(acks_after) == 10
+
+            # Invariant 2: Strictly contiguous sequence with zero lost or duplicated requests
+            all_acks = acks_before + acks_after
+            received_seqs = [a.seq for a in all_acks]
+            received_counters = [a.counter for a in all_acks]
+            seq_contiguous = received_seqs == list(range(1, 21)) and received_counters == list(range(1, 21))
+
+            # Invariant 3: 100% exact match against deterministic xorshift64* trajectory
+            expected_prng = DEFAULT_PRNG_SEED
+            expected_hexes: List[str] = []
+            for _ in range(1, 21):
+                expected_prng = step_xorshift64star(expected_prng)
+                expected_hexes.append(f"{expected_prng:016x}")
+            actual_hexes = [a.prng_hex for a in all_acks]
+            prng_exact_match = actual_hexes == expected_hexes
+
+            # Invariant 4: fsynced disk records in state.log match exactly 20 records
+            log_lines = [l.strip() for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            file_records_verified = len(log_lines)
+            file_records_intact = file_records_verified == 20
+
+            # Invariant 5: Process tree lifecycle verification
+            src_alive = service_a.is_alive()
+            if is_rollback_expected:
+                src_terminated_on_commit = False
+                same_orig_task = True
+                if execution_backend == "REAL_CRIU" and orig_src_starttime is not None:
+                    post_rb_starttime = read_proc_starttime(src_root_pid, "/proc")
+                    same_orig_task = (post_rb_starttime == orig_src_starttime)
+                    if not same_orig_task:
+                        error_logs.append(
+                            f"Source process {src_root_pid} starttime changed ({orig_src_starttime} -> {post_rb_starttime}); "
+                            f"source was re-created instead of resumed in-place via SIGCONT"
+                        )
+                src_resumed_on_rollback = src_alive and same_orig_task
+            else:
+                src_terminated_on_commit = not src_alive
+                src_resumed_on_rollback = False
+
+            # Invariant 6: All child workers responded
+            all_children_resumed = all(a.child_count == 2 for a in acks_after)
+
+            # Invariant 7: Dual execution strictly prevented
+            # In commit scenarios, Source A served 1..10, Dest B served 11..20
+            # In rollback scenarios, Source A served 1..20, Dest B served 0
+            if is_rollback_expected:
+                no_dual_execution = all(a.root_pid == src_root_pid for a in all_acks)
+            else:
+                dest_pid = harness.dest_workload.root_pid if harness.dest_workload else None
+                no_dual_execution = (
+                    all(a.root_pid == src_root_pid for a in acks_before)
+                    and all(a.root_pid == dest_pid for a in acks_after)
+                )
+
+            passed = (
+                same_tcp_preserved
+                and seq_contiguous
+                and prng_exact_match
+                and file_records_intact
+                and all_children_resumed
+                and no_dual_execution
+                and (src_terminated_on_commit if not is_rollback_expected else src_resumed_on_rollback)
+            )
+        finally:
+            if client is not None:
+                client.close()
+            if service_a is not None:
+                service_a.terminate()
+            for sw in harness.source_workloads.values():
+                sw.terminate()
+            for dw in harness.dest_workloads.values():
+                dw.terminate()
+            if harness.dest_workload:
+                harness.dest_workload.terminate()
+            if server_sock is not None:
+                try:
+                    server_sock.close()
+                except OSError:
+                    pass
+            harness.teardown()
 
         if execution_backend == "POSIX_PROCESS_CLONE":
             limitations = (
@@ -1904,8 +2136,9 @@ def run_acceptance_scenario(
             )
         else:
             limitations = (
-                "Proves kernel TCP_REPAIR (criu --tcp-established over AF_INET SOCK_STREAM with tcp-stream-*.img), "
-                "soft-dirty memory tracking, and process tree restoration under Linux CAP_SYS_ADMIN."
+                "Proves kernel TCP_REPAIR (criu --tcp-established over AF_INET SOCK_STREAM across isolated L2-bridged "
+                "network namespaces with tcp-stream-*.img), simultaneous stopped source + restored destination readiness, "
+                "in-place SIGCONT rollback of the original source task, and soft-dirty memory tracking under Linux CAP_SYS_ADMIN."
             )
 
         guarantee_notes = (

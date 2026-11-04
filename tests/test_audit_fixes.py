@@ -143,7 +143,7 @@ class TestAuditFixesP0(unittest.TestCase):
             src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
             dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
 
-            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-cold")
+            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-cold", journal_dir=f"{tmp}/wal")
             res = orch.execute()
 
             self.assertTrue(res.success)
@@ -182,7 +182,7 @@ class TestAuditFixesP0(unittest.TestCase):
             src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
             dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
 
-            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-lazy")
+            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-lazy", journal_dir=f"{tmp}/wal")
             res = orch.execute()
 
             self.assertTrue(res.success)
@@ -233,6 +233,7 @@ class TestAuditFixesP0(unittest.TestCase):
 
             gang = GangMigrationCoordinator(
                 gang_id="gang-2pc",
+                journal_dir=f"{tmp1}/wal",
                 members=[
                     (
                         cfg1,
@@ -410,7 +411,7 @@ class TestAuditFixesP1(unittest.TestCase):
             src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
             dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
 
-            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-cleanup-fail")
+            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-cleanup-fail", journal_dir=f"{tmp}/wal")
             res = orch.execute()
 
             self.assertTrue(res.success)
@@ -437,7 +438,7 @@ class TestAuditFixesP1(unittest.TestCase):
             src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
             dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
 
-            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-rb-fail")
+            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-rb-fail", journal_dir=f"{tmp}/wal")
             res = orch.rollback("Simulated abort before commit")
 
             self.assertFalse(res.success)
@@ -1142,6 +1143,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
 
             coordinator = GangMigrationCoordinator(
                 gang_id="gang-audit-test",
+                journal_dir=f"{tmp1}/wal",
                 members=[
                     (cfg1, AgentClient("10.0.0.1:9700", direct_service=h1.service_a), AgentClient("10.0.0.2:9700", direct_service=h1.service_b)),
                     (cfg2, AgentClient("10.0.0.3:9700", direct_service=h2.service_a), AgentClient("10.0.0.4:9700", direct_service=h2.service_b)),
@@ -1404,6 +1406,7 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
                 DummySourceClient(),  # type: ignore[arg-type]
                 FailingDestClient(),  # type: ignore[arg-type]
                 migration_id="mig-rb-fence",
+                journal_dir=f"{tmp}/wal",
             )
             rb_res = orch.rollback("Verify failed on B")
             self.assertFalse(rb_res.rolled_back)
@@ -1667,6 +1670,170 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
         self.assertEqual(executed[1][:3], ["nft", "flush", "table"])
         self.assertEqual(sum(1 for c in executed if "drop" in c), 2)
         self.assertFalse(any(c[:3] == ["nft", "delete", "table"] for c in executed))
+
+    def test_p1_round2_real_criu_never_kills_source_before_restore_or_restores_backup(self) -> None:
+        """P1 round-2: REAL_CRIU acceptance uses isolated L2-bridged netns, never kills source before restore, and verifies starttime on rollback."""
+        acc_src = (Path(__file__).resolve().parent.parent / "lkmp" / "acceptance.py").read_text(encoding="utf-8")
+        self.assertIn("class RealNetnsL2Fabric", acc_src)
+        self.assertNotIn("_silence_and_terminate_source_for_cutover", acc_src)
+        self.assertNotIn("_backup_source_by_pid", acc_src)
+        self.assertNotIn("rb_backup_", acc_src)
+        self.assertIn("did not remain", acc_src)
+        self.assertIn("post_rb_starttime == orig_src_starttime", acc_src)
+
+    def test_p1_round2_set_pid_tcp_repair_raises_on_permission_or_socket_error(self) -> None:
+        """P1 round-2: set_pid_tcp_repair fails closed with TcpRepairError on pidfd_open or pidfd_getfd permission errors."""
+        import errno
+        from lkmp.network import TcpRepairError, set_pid_tcp_repair
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp) / "proc"
+            fd_dir = proc_root / "4242" / "fd"
+            fd_dir.mkdir(parents=True, exist_ok=True)
+            os.symlink("socket:[99999]", fd_dir / "3")
+
+            # Missing PID returns process_alive=False without error
+            dead_res = set_pid_tcp_repair(9999, enable=True, proc_root=proc_root)
+            self.assertFalse(dead_res.process_alive)
+            self.assertEqual(dead_res.tcp_sockets_confirmed, 0)
+
+            # 1. pidfd_open failing with EPERM must raise TcpRepairError (never return 0)
+            def eperm_pidfd_open(_pid: int) -> int:
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+
+            with self.assertRaises(TcpRepairError):
+                set_pid_tcp_repair(
+                    4242,
+                    enable=True,
+                    proc_root=proc_root,
+                    pidfd_opener=eperm_pidfd_open,
+                )
+
+            # 2. pidfd_getfd failing with EPERM must raise TcpRepairError (never return 0)
+            r_fd, w_fd = os.pipe()
+            os.close(w_fd)
+
+            def eperm_getfd(_pfd: int, _fd: int) -> int:
+                raise PermissionError(errno.EPERM, "pidfd_getfd denied")
+
+            with self.assertRaises(TcpRepairError):
+                set_pid_tcp_repair(
+                    4242,
+                    enable=True,
+                    proc_root=proc_root,
+                    pidfd_opener=lambda _p: r_fd,
+                    fd_duplicator=eperm_getfd,
+                )
+
+    def test_p1_round2_rollback_dest_and_source_fail_closed_when_tcp_repair_unconfirmed(self) -> None:
+        """P1 round-2: rollback_dest refuses SIGKILL and rollback_source refuses SIGCONT if TCP_REPAIR confirmation fails."""
+        from lkmp.network import TcpRepairError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc_a = root / "proc_a"
+            proc_b = root / "proc_b"
+            for p_dir, p_num in ((proc_a, 100), (proc_b, 200)):
+                (p_dir / str(p_num)).mkdir(parents=True, exist_ok=True)
+                (p_dir / str(p_num) / "stat").write_text(f"{p_num} (app) T 1 " + "0 " * 17 + "555 0\n", encoding="utf-8")
+
+            signals_a: List[Tuple[int, int]] = []
+            signals_b: List[Tuple[int, int]] = []
+
+            def failing_repair(_pids: Any, _enable: bool) -> Any:
+                raise TcpRepairError("TCP_REPAIR confirmation denied (EPERM)")
+
+            svc_a = AgentService(
+                work_dir=str(root / "work_a"),
+                proc_root=str(proc_a),
+                net_manager=NetworkMobilityManager(runner=lambda cmd: subprocess.CompletedProcess(cmd, 0, "", "")),
+                signal_sender=lambda p, s: signals_a.append((p, s)),
+                pid_alive_checker=lambda _p: True,
+                tcp_repair_handler=failing_repair,
+            )
+            svc_b = AgentService(
+                work_dir=str(root / "work_b"),
+                proc_root=str(proc_b),
+                net_manager=NetworkMobilityManager(runner=lambda cmd: subprocess.CompletedProcess(cmd, 0, "", "")),
+                signal_sender=lambda p, s: signals_b.append((p, s)),
+                pid_alive_checker=lambda _p: True,
+                tcp_repair_handler=failing_repair,
+            )
+            svc_a.prepare_migration("mig-tcp-fail")
+            svc_b.prepare_migration("mig-tcp-fail")
+
+            cfg = MigrationConfig(
+                pid=100,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                tls=TlsConfig(enabled=False),
+                journal_dir=str(root / "wal"),
+            )
+
+            # 1. rollback_dest fails closed without sending SIGKILL (preventing unconfirmed FIN/RST)
+            rb_dest = svc_b.rollback_dest("mig-tcp-fail", restored_pid=200, config_dict=config_to_dict(cfg))
+            self.assertFalse(rb_dest["rolled_back_dest"])
+            self.assertFalse(rb_dest["tcp_repair_confirmed"])
+            self.assertEqual(signals_b, [])
+
+            # 2. Orchestrator.rollback keeps Source A frozen because rollback_dest returned rolled_back_dest=False
+            orch = MigrationOrchestrator(
+                cfg,
+                AgentClient("10.0.0.1:9700", direct_service=svc_a),
+                AgentClient("10.0.0.2:9700", direct_service=svc_b),
+                migration_id="mig-tcp-fail",
+                journal_dir=str(root / "wal"),
+            )
+            orch._restored_pid = 200
+            rb_orch = orch.rollback("Verify failed")
+            self.assertFalse(rb_orch.rolled_back)
+            self.assertEqual(signals_a, [])
+            self.assertEqual(signals_b, [])
+
+            # 3. Direct rollback_source also refuses SIGCONT if TCP_REPAIR=0 confirmation fails
+            with self.assertRaises(RuntimeError):
+                svc_a.rollback_source("mig-tcp-fail", source_host="10.0.0.1", config_dict=config_to_dict(cfg))
+            self.assertEqual(signals_a, [])
+
+    def test_p1_round2_journal_fails_closed_without_tempdir_fallback_and_rejects_tmpfs(self) -> None:
+        """P1 round-2: open_migration_journal never falls back to tempfile.gettempdir() and rejects volatile tmpfs mounts."""
+        from unittest.mock import patch
+        from lkmp.journal import _verify_persistent_filesystem, open_migration_journal
+
+        journal_src = (Path(__file__).resolve().parent.parent / "lkmp" / "journal.py").read_text(encoding="utf-8")
+        self.assertNotIn("gettempdir", journal_src)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blocked_parent = root / "not_a_dir"
+            blocked_parent.write_text("regular file blocking mkdir\n", encoding="utf-8")
+            unwritable_dir = blocked_parent / "journals"
+
+            with self.assertRaises(OSError):
+                open_migration_journal(unwritable_dir, "mig-durable-check")
+
+            # Also verify _verify_persistent_filesystem rejects tmpfs and accepts ext4
+            fake_mounts = root / "mounts"
+            wal_dir = root / "persistent_wal"
+            wal_dir.mkdir(parents=True, exist_ok=True)
+            resolved_wal = str(wal_dir.resolve())
+
+            fake_mounts.write_text(
+                f"dev/sda1 / ext4 rw,relatime 0 0\n"
+                f"tmpfs {resolved_wal} tmpfs rw,nosuid,nodev 0 0\n",
+                encoding="utf-8",
+            )
+            with patch("lkmp.journal.sys.platform", "linux"):
+                with self.assertRaises(RuntimeError):
+                    _verify_persistent_filesystem(wal_dir, mounts_file=fake_mounts)
+
+            fake_mounts.write_text(
+                f"/dev/nvme0n1p1 / ext4 rw,relatime 0 0\n"
+                f"/dev/nvme0n1p2 {resolved_wal} xfs rw,relatime 0 0\n",
+                encoding="utf-8",
+            )
+            with patch("lkmp.journal.sys.platform", "linux"):
+                _verify_persistent_filesystem(wal_dir, mounts_file=fake_mounts)
 
 
 if __name__ == "__main__":

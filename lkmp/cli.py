@@ -379,9 +379,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.subcommand == "preflight":
         cfg = _build_migration_config(args)
+        cfg.journal_dir = None
         src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
         dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
-        orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
+        orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=None)
         report = orch.run_preflight()
         if args.json:
             payload = {
@@ -399,9 +400,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.subcommand == "portability":
         cfg = _build_migration_config(args)
+        portability_jdir = cfg.journal_dir if args.trial_restore else None
+        if not args.trial_restore:
+            cfg.journal_dir = None
         src_client = AgentClient(cfg.source_addr, tls=cfg.tls)
         dst_client = AgentClient(cfg.dest_addr, tls=cfg.tls)
-        orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=cfg.journal_dir)
+        orch = MigrationOrchestrator(cfg, src_client, dst_client, journal_dir=portability_jdir)
         report = orch.assess_portability(
             run_check_only=args.check_only if args.check_only else None,
             run_trial_restore=args.trial_restore if args.trial_restore else None,

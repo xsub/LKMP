@@ -13,6 +13,7 @@ Verifies:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from enum import Enum
 import io
 import json
@@ -434,7 +435,9 @@ def assess_portability(
     proc_root: str = "/proc",
 ) -> PortabilityStatus:
     """Run preflight check and optional isolated trial restore on Destination B with rollback to Source A."""
-    orch = MigrationOrchestrator(config, source_client, dest_client)
+    j_dir = config.journal_dir if (run_trial_restore and config.journal_dir != "/var/lib/lkmp/journals") else None
+    cfg_copy = dataclasses.replace(config, journal_dir=j_dir)
+    orch = MigrationOrchestrator(cfg_copy, source_client, dest_client, journal_dir=j_dir)
     report = orch.run_preflight()
     if not report.compatible or report.blockers:
         return PortabilityStatus.BLOCKED

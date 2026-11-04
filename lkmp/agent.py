@@ -12,11 +12,12 @@ import socket
 import socketserver
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from lkmp.attestation import CheckpointAttestor, compute_directory_img_digests
 from lkmp.config import (
@@ -33,7 +34,12 @@ from lkmp.envelope import EnvelopeManager
 from lkmp.fs_sync import FilesystemSyncManager
 from lkmp.journal import validate_safe_identifier
 from lkmp.models import FileArtifact, HostCapabilities, ProcessSnapshotInfo
-from lkmp.network import NetworkMobilityManager, set_pid_tcp_repair
+from lkmp.network import (
+    NetworkMobilityManager,
+    TcpRepairError,
+    TcpRepairResult,
+    set_tree_tcp_repair,
+)
 from lkmp.preflight import (
     collect_host_capabilities,
     compute_file_sha256,
@@ -138,6 +144,7 @@ class AgentService:
         attestor: Optional[CheckpointAttestor] = None,
         signal_sender: Optional[Callable[[int, int], None]] = None,
         pid_alive_checker: Optional[Callable[[int], bool]] = None,
+        tcp_repair_handler: Optional[Callable[[Sequence[int], bool], List[TcpRepairResult]]] = None,
     ) -> None:
         self.work_dir = Path(work_dir).resolve()
         self.proc_root = proc_root
@@ -148,6 +155,51 @@ class AgentService:
         self.attestor = attestor or CheckpointAttestor()
         self._send_signal = signal_sender or os.kill
         self._check_pid_alive = pid_alive_checker or self._default_pid_alive
+        self._tcp_repair_handler = tcp_repair_handler
+
+    def _uses_real_linux_proc(self) -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        try:
+            return Path(self.proc_root).resolve() == Path("/proc").resolve()
+        except OSError:
+            return False
+
+    def _collect_verified_tree_pids(
+        self,
+        root_pid: int,
+        recorded_pids: Optional[List[int]] = None,
+        expected_starttimes: Optional[Dict[str, int]] = None,
+    ) -> List[int]:
+        discovered = discover_process_tree_pids(int(root_pid), self.proc_root)
+        targets: List[int] = [int(p) for p in discovered]
+        if recorded_pids:
+            for p in recorded_pids:
+                if int(p) not in targets:
+                    targets.append(int(p))
+        verified: List[int] = []
+        for p in targets:
+            if expected_starttimes:
+                exp_st = expected_starttimes.get(str(p))
+                if exp_st is None:
+                    exp_st = expected_starttimes.get(p)  # type: ignore[arg-type]
+                if exp_st is not None:
+                    curr_st = read_proc_starttime(p, self.proc_root)
+                    if curr_st is not None and curr_st != exp_st:
+                        continue
+            verified.append(p)
+        return verified
+
+    def _apply_tcp_repair(
+        self,
+        pids: Sequence[int],
+        enable: bool,
+    ) -> Optional[List[TcpRepairResult]]:
+        if self._tcp_repair_handler is not None:
+            return self._tcp_repair_handler(pids, enable)
+        if self._uses_real_linux_proc():
+            return set_tree_tcp_repair(pids, enable=enable, proc_root=Path(self.proc_root))
+        return None
 
     def _default_pid_alive(self, pid: int) -> bool:
         proc_entry = Path(self.proc_root) / str(pid)
@@ -864,6 +916,19 @@ class AgentService:
         if lazy_dump_pidfile.exists():
             self.criu.stop_daemon(lazy_dump_pidfile)
 
+        # Confirm TCP_REPAIR=1 on source sockets before SIGKILL so kernel socket teardown cannot queue FIN/RST
+        verified_src_pids = self._collect_verified_tree_pids(
+            config.pid,
+            recorded_pids=tree_pids,
+            expected_starttimes=starttimes,
+        )
+        repair_res = self._apply_tcp_repair(verified_src_pids, enable=True)
+        tcp_sockets_confirmed = (
+            sum(r.tcp_sockets_confirmed for r in repair_res)
+            if repair_res is not None
+            else 0
+        )
+
         # Terminate source process tree BEFORE marking source_state.json as committed
         self._signal_process_tree(
             config.pid,
@@ -885,7 +950,11 @@ class AgentService:
             pass
         if config.wipe_images_on_commit:
             self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
-        return {"committed": True}
+        return {
+            "committed": True,
+            "tcp_repair_confirmed": repair_res is not None,
+            "tcp_sockets_confirmed": tcp_sockets_confirmed,
+        }
 
     def cleanup_dest(self, migration_id: str, wipe_images: bool) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
@@ -932,10 +1001,28 @@ class AgentService:
         if lazy_pidfile.exists():
             self.criu.stop_daemon(lazy_pidfile)
 
+        tcp_repair_confirmed = False
+        tcp_sockets_confirmed = 0
         if restored_pid is not None:
-            if self.proc_root == Path("/proc").resolve():
-                for tp in list(tree_pids or [int(restored_pid)]):
-                    set_pid_tcp_repair(int(tp), enable=True)
+            verified_dst_pids = self._collect_verified_tree_pids(
+                int(restored_pid),
+                recorded_pids=tree_pids,
+                expected_starttimes=starttimes,
+            )
+            try:
+                repair_res = self._apply_tcp_repair(verified_dst_pids, enable=True)
+                if repair_res is not None:
+                    tcp_repair_confirmed = True
+                    tcp_sockets_confirmed = sum(r.tcp_sockets_confirmed for r in repair_res)
+            except TcpRepairError as exc:
+                errors.append(f"TCP_REPAIR=1 confirmation before SIGKILL failed: {exc}")
+                return {
+                    "rolled_back_dest": False,
+                    "tcp_repair_confirmed": False,
+                    "tcp_sockets_confirmed": 0,
+                    "errors": errors,
+                }
+
             try:
                 self._signal_process_tree(
                     int(restored_pid),
@@ -957,7 +1044,12 @@ class AgentService:
             pass
         if not errors:
             self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
-        return {"rolled_back_dest": len(errors) == 0, "errors": errors}
+        return {
+            "rolled_back_dest": len(errors) == 0,
+            "tcp_repair_confirmed": tcp_repair_confirmed,
+            "tcp_sockets_confirmed": tcp_sockets_confirmed,
+            "errors": errors,
+        }
 
     def rollback_source(
         self,
@@ -974,6 +1066,35 @@ class AgentService:
         if lazy_dump_pidfile.exists():
             self.criu.stop_daemon(lazy_dump_pidfile)
 
+        source_state_file = mig_dir / "source_state.json"
+        tree_pids: Optional[List[int]] = None
+        starttimes: Optional[Dict[str, int]] = None
+        quiesced = False
+        if source_state_file.exists():
+            try:
+                st_data = json.loads(source_state_file.read_text(encoding="utf-8"))
+                tree_pids = st_data.get("tree_pids")
+                starttimes = st_data.get("starttimes")
+                quiesced = bool(st_data.get("quiesced", False))
+            except Exception:
+                pass
+
+        verified_src_pids = self._collect_verified_tree_pids(
+            config.pid,
+            recorded_pids=tree_pids,
+            expected_starttimes=starttimes,
+        )
+        tcp_repair_confirmed = False
+        tcp_sockets_confirmed = 0
+        try:
+            repair_res = self._apply_tcp_repair(verified_src_pids, enable=False)
+            if repair_res is not None:
+                tcp_repair_confirmed = True
+                tcp_sockets_confirmed = sum(r.tcp_sockets_confirmed for r in repair_res)
+        except TcpRepairError as exc:
+            errors.append(f"TCP_REPAIR=0 confirmation before SIGCONT failed: {exc}")
+            raise RuntimeError("; ".join(errors)) from exc
+
         try:
             self.criu.run_gpu_rollback_hook(config)
         except Exception as exc:
@@ -989,23 +1110,6 @@ class AgentService:
         if config.workload_id:
             validate_safe_identifier(config.workload_id, "workload_id")
             self.envelope.unfreeze_cgroup(config.workload_id)
-
-        source_state_file = mig_dir / "source_state.json"
-        tree_pids: Optional[List[int]] = None
-        starttimes: Optional[Dict[str, int]] = None
-        quiesced = False
-        if source_state_file.exists():
-            try:
-                st_data = json.loads(source_state_file.read_text(encoding="utf-8"))
-                tree_pids = st_data.get("tree_pids")
-                starttimes = st_data.get("starttimes")
-                quiesced = bool(st_data.get("quiesced", False))
-            except Exception:
-                pass
-
-        if self.proc_root == Path("/proc").resolve():
-            for sp in list(tree_pids or [config.pid]):
-                set_pid_tcp_repair(int(sp), enable=False)
 
         try:
             self._signal_process_tree(
@@ -1034,10 +1138,16 @@ class AgentService:
             except Exception as r_exc:
                 errors.append(f"resume_cmd failed: {r_exc}")
 
-        self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+        if not errors:
+            self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
         if errors:
             raise RuntimeError("; ".join(errors))
-        return {"rolled_back_source": True, "resumed_pid": config.pid}
+        return {
+            "rolled_back_source": True,
+            "resumed_pid": config.pid,
+            "tcp_repair_confirmed": tcp_repair_confirmed,
+            "tcp_sockets_confirmed": tcp_sockets_confirmed,
+        }
 
     def dispatch_rpc(self, method: str, params: Dict[str, Any]) -> Any:
         """Dispatch an incoming JSON-RPC call to the corresponding service method."""

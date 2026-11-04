@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -68,6 +68,7 @@ class MigrationJournal:
     ) -> JournalEntry:
         """Append and fsync a state transition record to the WAL."""
         self.journal_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        created_new = not self.path.exists()
         self._seq += 1
         entry = JournalEntry(
             seq=self._seq,
@@ -86,6 +87,16 @@ class MigrationJournal:
             os.fsync(fd)
         finally:
             os.close(fd)
+        if created_new:
+            dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            try:
+                dir_fd = os.open(str(self.journal_dir), dir_flags)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         self.entries.append(entry)
         return entry
 
@@ -147,30 +158,58 @@ def _probe_journal_writable(journal: MigrationJournal) -> None:
                 pass
 
 
+def _verify_persistent_filesystem(target_dir: Path, mounts_file: Path = Path("/proc/mounts")) -> None:
+    """Reject volatile tmpfs/ramfs backing storage when durability across host restarts is required."""
+    if not sys.platform.startswith("linux") or not mounts_file.exists():
+        return
+    try:
+        resolved = str(target_dir.resolve())
+        best_mp = ""
+        best_fstype = ""
+        for raw in mounts_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = raw.split()
+            if len(parts) < 3:
+                continue
+            mp, fstype = parts[1], parts[2]
+            if resolved == mp or resolved.startswith(mp.rstrip("/") + "/") or mp == "/":
+                if len(mp) >= len(best_mp):
+                    best_mp = mp
+                    best_fstype = fstype
+        if best_fstype in ("tmpfs", "ramfs"):
+            raise RuntimeError(
+                f"Journal directory {target_dir} resides on volatile {best_fstype} mount ({best_mp}); "
+                f"durable WAL recovery across host restarts requires persistent disk storage"
+            )
+    except RuntimeError:
+        raise
+    except OSError:
+        pass
+
+
 def open_migration_journal(
     journal_dir: str | Path,
     migration_id: str,
     extra_ids: Sequence[str] = (),
+    *,
+    require_persistent: Optional[bool] = None,
 ) -> MigrationJournal:
     """
     Create a MigrationJournal and verify write access for migration_id (and any coupled extra_ids).
-    Falls back to a per-UID 0700 temp directory only when using DEFAULT_JOURNAL_DIR.
+    Fails closed without falling back to temporary directories so WAL durability across host
+    restarts is never silently degraded.
     """
     target_dir = Path(journal_dir)
     journal = MigrationJournal(target_dir, migration_id)
-    try:
-        _probe_journal_writable(journal)
-        for extra_id in extra_ids:
-            _probe_journal_writable(MigrationJournal(target_dir, extra_id))
-        return journal
-    except OSError:
-        if target_dir != Path(DEFAULT_JOURNAL_DIR):
-            raise
-        uid_tag = str(os.geteuid()) if hasattr(os, "geteuid") else "default"
-        fallback_dir = Path(tempfile.gettempdir()) / f"lkmp-journals-{uid_tag}"
-        fallback_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fallback_journal = MigrationJournal(fallback_dir, migration_id)
-        _probe_journal_writable(fallback_journal)
-        for extra_id in extra_ids:
-            _probe_journal_writable(MigrationJournal(fallback_dir, extra_id))
-        return fallback_journal
+    _probe_journal_writable(journal)
+    for extra_id in extra_ids:
+        _probe_journal_writable(MigrationJournal(target_dir, extra_id))
+
+    enforce_persistent = (
+        require_persistent
+        if require_persistent is not None
+        else (target_dir == Path(DEFAULT_JOURNAL_DIR))
+    )
+    if enforce_persistent:
+        _verify_persistent_filesystem(target_dir)
+
+    return journal

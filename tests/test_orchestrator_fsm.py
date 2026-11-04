@@ -173,7 +173,7 @@ class TestOrchestratorStateMachine(unittest.TestCase):
             src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
             dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
 
-            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-test1")
+            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-test1", journal_dir=f"{tmp}/wal")
             res = orch.execute()
 
             self.assertTrue(res.success)
@@ -224,7 +224,7 @@ class TestOrchestratorStateMachine(unittest.TestCase):
             src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
             dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
 
-            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-rollback1")
+            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-rollback1", journal_dir=f"{tmp}/wal")
             res = orch.execute()
 
             self.assertFalse(res.success)
@@ -254,7 +254,7 @@ class TestOrchestratorStateMachine(unittest.TestCase):
             src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
             dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
 
-            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-rollback2")
+            orch = MigrationOrchestrator(cfg, src, dst, migration_id="mig-rollback2", journal_dir=f"{tmp}/wal")
             res = orch.execute()
 
             self.assertFalse(res.success)

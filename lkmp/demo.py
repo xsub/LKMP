@@ -283,6 +283,7 @@ def run_live_demo(
                 fs_mode=FilesystemMode.SHARED,
                 ip_mobility=IpMobilityMode.TUNNEL,
                 workload_ip="10.0.0.99/24",
+                journal_dir=str(Path(tmp) / "journals"),
                 tls=TlsConfig(enabled=False),
             )
             client_a = AgentClient(cfg.source_addr, tls=cfg.tls)
