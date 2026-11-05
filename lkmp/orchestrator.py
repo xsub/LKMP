@@ -121,6 +121,7 @@ class MigrationOrchestrator:
         self._freeze_downtime_ms: float = 0.0
         self._precopy_stats: List[PreCopyIterationStats] = []
         self._restored_pid: Optional[int] = None
+        self._restored_starttime: Optional[int] = None
         self._dest_has_userfaultfd: bool = False
 
     def _transition(
@@ -134,13 +135,14 @@ class MigrationOrchestrator:
         if self.journal is not None:
             cfg_dict = (
                 config_to_dict(self.config)
-                if len(self.journal.entries) == 0
+                if len(self.journal.entries) == 0 and not self.journal.path.exists()
                 else None
             )
             self.journal.append(
                 state=next_state,
                 commit_decision=commit_decision,
                 restored_pid=self._restored_pid,
+                restored_starttime=self._restored_starttime,
                 config_dict=cfg_dict,
                 note=note,
             )
@@ -360,6 +362,7 @@ class MigrationOrchestrator:
         self._t_start = time.monotonic()
         self._precopy_stats = []
         self._restored_pid = None
+        self._restored_starttime = None
         freeze_start: Optional[float] = None
         self._freeze_downtime_ms = 0.0
 
@@ -537,11 +540,14 @@ class MigrationOrchestrator:
                 config_dict=cfg_dict,
             )
             self._restored_pid = int(restore_res["restored_pid"])
+            raw_rst_st = restore_res.get("restored_starttime")
+            self._restored_starttime = int(raw_rst_st) if raw_rst_st is not None else None
             if self.journal is not None:
                 self.journal.append(
                     state=MigrationState.RESTORE,
                     commit_decision="PREPARING",
                     restored_pid=self._restored_pid,
+                    restored_starttime=self._restored_starttime,
                     note="Restore completed, pid recorded",
                 )
 
@@ -588,6 +594,7 @@ class MigrationOrchestrator:
                 health_check_cmd=self.config.health_check_cmd,
                 timeout_sec=self.config.health_check_timeout_sec,
                 migration_id=self.migration_id,
+                expected_restored_starttime=self._restored_starttime,
             )
             if not verify_res.get("healthy"):
                 raise RuntimeError(
@@ -626,13 +633,19 @@ class MigrationOrchestrator:
             migration_id=self.migration_id,
         )
         self._transition(MigrationState.VERIFY, commit_decision="COMMITTED")
-        verify_res = self.dest.call(
-            "verify_process",
-            restored_pid=self._restored_pid,
-            health_check_cmd=self.config.health_check_cmd,
-            timeout_sec=self.config.health_check_timeout_sec,
-            migration_id=self.migration_id,
-        )
+        verify_kwargs: Dict[str, object] = {
+            "restored_pid": self._restored_pid,
+            "health_check_cmd": self.config.health_check_cmd,
+            "timeout_sec": self.config.health_check_timeout_sec,
+            "migration_id": self.migration_id,
+        }
+        if self._restored_starttime is not None:
+            verify_kwargs["expected_restored_starttime"] = self._restored_starttime
+        try:
+            verify_res = self.dest.call("verify_process", **verify_kwargs)
+        except TypeError:
+            verify_kwargs.pop("expected_restored_starttime", None)
+            verify_res = self.dest.call("verify_process", **verify_kwargs)
         if not verify_res.get("healthy"):
             raise RuntimeError(
                 f"Destination verification failed: {verify_res.get('reason')}"
@@ -690,12 +703,18 @@ class MigrationOrchestrator:
         src_ok = False
 
         try:
-            dest_res = self.dest.call(
-                "rollback_dest",
-                migration_id=self.migration_id,
-                restored_pid=self._restored_pid,
-                config_dict=cfg_dict,
-            )
+            rb_kwargs: Dict[str, object] = {
+                "migration_id": self.migration_id,
+                "restored_pid": self._restored_pid,
+                "config_dict": cfg_dict,
+            }
+            if self._restored_starttime is not None:
+                rb_kwargs["expected_restored_starttime"] = self._restored_starttime
+            try:
+                dest_res = self.dest.call("rollback_dest", **rb_kwargs)
+            except TypeError:
+                rb_kwargs.pop("expected_restored_starttime", None)
+                dest_res = self.dest.call("rollback_dest", **rb_kwargs)
             dest_ok = bool(dest_res.get("rolled_back_dest", True))
             if dest_res.get("errors"):
                 rb_errors.extend(dest_res["errors"])
@@ -809,18 +828,26 @@ class MigrationOrchestrator:
         for entry in reversed(journal.entries):
             if entry.restored_pid is not None:
                 orch._restored_pid = entry.restored_pid
+                orch._restored_starttime = entry.restored_starttime
                 break
         orch.state_history = [MigrationState(e.state) for e in journal.entries]
         if orch.state_history:
             orch.state = orch.state_history[-1]
 
         if should_commit:
-            pre_verify = dest_client.call(
-                "verify_process",
-                restored_pid=orch._restored_pid,
-                health_check_cmd=None,
-                migration_id=orch.migration_id,
-            )
+            verify_kwargs: Dict[str, object] = {
+                "restored_pid": orch._restored_pid,
+                "health_check_cmd": None,
+                "migration_id": orch.migration_id,
+            }
+            if orch._restored_starttime is not None:
+                verify_kwargs["expected_restored_starttime"] = orch._restored_starttime
+            try:
+                pre_verify = dest_client.call("verify_process", **verify_kwargs)
+            except TypeError:
+                verify_kwargs.pop("expected_restored_starttime", None)
+                pre_verify = dest_client.call("verify_process", **verify_kwargs)
+
             if not pre_verify.get("healthy"):
                 return MigrationResult(
                     migration_id=orch.migration_id,
@@ -852,5 +879,11 @@ class MigrationOrchestrator:
                 return orch.commit()
 
             return orch.commit()
+
+        # If a prior recovery already completed rollback and recorded ROLLED_BACK, avoid
+        # re-signaling a stale restored_pid on Destination B (which may have been recycled).
+        if journal.has_rolled_back_decision:
+            orch._restored_pid = None
+            orch._restored_starttime = None
 
         return orch.rollback("Controller crash recovery: no COMMITTED record in WAL")

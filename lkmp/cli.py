@@ -490,12 +490,43 @@ def main(argv: Optional[List[str]] = None) -> int:
                 gang_id = gang_id[:-5]
 
             j_dir = g_path.parent
-            member_files = sorted(j_dir.glob(f"{gang_id}-m*.wal.jsonl"))
+            expected_member_ids = journal.expected_member_ids
+            if not expected_member_ids:
+                raise ValueError(
+                    f"Gang journal {g_path} is missing authoritative member_ids manifest; "
+                    "refusing partial gang recovery"
+                )
+            expected_configs = journal.expected_member_configs or []
+            only_unstarted_init = (
+                len(journal.entries) == 1
+                and journal.entries[0].state == "INIT"
+                and journal.entries[0].commit_decision == "PREPARING"
+            )
             members = []
-            for mf in member_files:
-                mj = MigrationJournal.load(mf)
-                if mj.initial_config_dict:
-                    m_cfg = config_from_dict(mj.initial_config_dict)
+            seen_uncreated_init_member = False
+            for idx, mid in enumerate(expected_member_ids):
+                mf = j_dir / f"{mid}.wal.jsonl"
+                if not mf.exists():
+                    if only_unstarted_init:
+                        seen_uncreated_init_member = True
+                        cfg_raw = expected_configs[idx] if idx < len(expected_configs) else None
+                    else:
+                        raise FileNotFoundError(
+                            f"Cannot recover gang {gang_id!r}: required member WAL is missing at {mf} "
+                            f"(expected full gang {expected_member_ids})"
+                        )
+                else:
+                    if seen_uncreated_init_member:
+                        raise FileNotFoundError(
+                            f"Cannot recover gang {gang_id!r}: non-contiguous member WAL missing before {mf} "
+                            f"(expected full gang {expected_member_ids})"
+                        )
+                    mj = MigrationJournal.load(mf)
+                    cfg_raw = mj.initial_config_dict or (
+                        expected_configs[idx] if idx < len(expected_configs) else None
+                    )
+                if cfg_raw:
+                    m_cfg = config_from_dict(cfg_raw)
                     if getattr(args, "source", None):
                         m_cfg.source_addr = args.source
                     if getattr(args, "dest", None):

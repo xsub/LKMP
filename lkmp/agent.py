@@ -778,7 +778,11 @@ class AgentService:
         (img_dir / "restore_state.json").write_text(json.dumps(restore_state, indent=2), encoding="utf-8")
 
         self.criu.run_gpu_post_restore_hook(config, restored_pid)
-        return {"restored_pid": restored_pid, "command": restore_cmd}
+        return {
+            "restored_pid": restored_pid,
+            "restored_starttime": starttimes.get(str(restored_pid)),
+            "command": restore_cmd,
+        }
 
     def release_ip(
         self,
@@ -821,6 +825,19 @@ class AgentService:
         if restored_pid is None or int(restored_pid) <= 0:
             raise RuntimeError("No restored PID found on destination; refusing to claim IP or resume")
 
+        root_pid = int(restored_pid)
+        if starttimes:
+            exp_root_st = starttimes.get(str(root_pid))
+            if exp_root_st is None:
+                exp_root_st = starttimes.get(root_pid)  # type: ignore[arg-type]
+            if exp_root_st is not None:
+                curr_root_st = read_proc_starttime(root_pid, self.proc_root)
+                if curr_root_st is None or curr_root_st != exp_root_st:
+                    raise RuntimeError(
+                        f"Restored process {root_pid} starttime mismatch on destination "
+                        f"(expected {exp_root_st}, got {curr_root_st}); refusing to claim IP or resume"
+                    )
+
         cmds = self.net.announce_ip_on_host(config, target_host=target_host, ensure_assigned=True)
         self.net.unlock_network(config.workload_ip, migration_id=migration_id)
         if config.workload_id:
@@ -851,15 +868,36 @@ class AgentService:
         health_check_cmd: Optional[str],
         timeout_sec: float = 5.0,
         migration_id: Optional[str] = None,
+        expected_restored_starttime: Optional[int] = None,
     ) -> Dict[str, Any]:
-        if restored_pid is None and migration_id:
+        recorded_pids: Optional[List[int]] = None
+        expected_starttimes: Dict[str, Optional[int]] = {}
+
+        if migration_id:
             state_file = self._round_dir(migration_id, "final") / "restore_state.json"
             if state_file.exists():
                 try:
                     data = json.loads(state_file.read_text(encoding="utf-8"))
-                    restored_pid = data.get("restored_pid")
-                except Exception:
-                    pass
+                    st_pid = data.get("restored_pid")
+                    if restored_pid is None:
+                        restored_pid = st_pid
+                    elif st_pid is not None and int(st_pid) != int(restored_pid):
+                        return {
+                            "healthy": False,
+                            "reason": (
+                                f"Restored PID mismatch on destination: WAL expected {restored_pid}, "
+                                f"restore_state.json recorded {st_pid}"
+                            ),
+                        }
+                    recorded_pids = data.get("tree_pids")
+                    raw_st = data.get("starttimes")
+                    if isinstance(raw_st, dict):
+                        expected_starttimes.update({str(k): v for k, v in raw_st.items()})
+                except Exception as exc:
+                    return {
+                        "healthy": False,
+                        "reason": f"Failed to parse restore_state.json on destination: {exc}",
+                    }
             if restored_pid is None:
                 pidfile = self._round_dir(migration_id, "final") / "restored.pid"
                 if pidfile.exists():
@@ -875,13 +913,34 @@ class AgentService:
         if pid_int <= 0:
             return {"healthy": False, "reason": "No restored PID found on destination"}
 
-        tree_pids = discover_process_tree_pids(pid_int, self.proc_root)
+        if (
+            expected_restored_starttime is not None
+            and expected_starttimes.get(str(pid_int)) is None
+        ):
+            expected_starttimes[str(pid_int)] = int(expected_restored_starttime)
+
+        tree_pids: List[int] = [pid_int]
+        for p in discover_process_tree_pids(pid_int, self.proc_root):
+            if int(p) not in tree_pids:
+                tree_pids.append(int(p))
+
         for p in tree_pids:
             if not self._check_pid_alive(p):
                 return {
                     "healthy": False,
                     "reason": f"Restored process {p} is not alive on destination",
                 }
+            exp_st = expected_starttimes.get(str(p))
+            if exp_st is not None:
+                curr_st = read_proc_starttime(p, self.proc_root)
+                if curr_st is None or curr_st != exp_st:
+                    return {
+                        "healthy": False,
+                        "reason": (
+                            f"Restored process {p} starttime mismatch on destination "
+                            f"(expected {exp_st}, got {curr_st}); PID was reused or vanished"
+                        ),
+                    }
         if health_check_cmd:
             try:
                 res = subprocess.run(
@@ -907,13 +966,14 @@ class AgentService:
         workload_ip: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Verify that restored_pid and all restored process tree PIDs are alive, explicitly
-        in stopped state ('T'/'t' via --leave-stopped), and protected by an active nftables
-        network drop lock on Destination B before the 2PC coordinator may commit.
+        Verify that restored_pid and all restored process tree PIDs are alive, match recorded
+        kernel starttimes, are explicitly in stopped state ('T'/'t' via --leave-stopped), and
+        are protected by an active nftables network drop lock on Destination B before 2PC commit.
         """
         tree_pids: List[int] = [int(restored_pid)]
         resolved_ip: Optional[str] = workload_ip
         tcp_established: bool = True
+        expected_starttimes: Dict[str, Optional[int]] = {}
 
         if migration_id:
             state_file = self._round_dir(migration_id, "final") / "restore_state.json"
@@ -925,6 +985,9 @@ class AgentService:
                         for p in rec_pids:
                             if int(p) not in tree_pids:
                                 tree_pids.append(int(p))
+                    raw_st = data.get("starttimes")
+                    if isinstance(raw_st, dict):
+                        expected_starttimes.update({str(k): v for k, v in raw_st.items()})
                     if resolved_ip is None:
                         resolved_ip = data.get("workload_ip")
                     if "tcp_established" in data:
@@ -946,6 +1009,17 @@ class AgentService:
                     "healthy": False,
                     "reason": f"Restored process {p} is not alive on destination",
                 }
+            exp_st = expected_starttimes.get(str(p))
+            if exp_st is not None:
+                curr_st = read_proc_starttime(p, self.proc_root)
+                if curr_st is None or curr_st != exp_st:
+                    return {
+                        "healthy": False,
+                        "reason": (
+                            f"Restored process {p} starttime mismatch on destination "
+                            f"(expected {exp_st}, got {curr_st}); PID was reused or vanished"
+                        ),
+                    }
             stopped_ok, stopped_detail = is_pid_stopped(p, self.proc_root)
             if not stopped_ok:
                 return {
@@ -1047,11 +1121,22 @@ class AgentService:
 
     def cleanup_dest(self, migration_id: str, wipe_images: bool) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
-        lazy_pidfile = self._round_dir(migration_id, "final") / "lazy-pages.pid"
+        final_dir = self._round_dir(migration_id, "final")
+        lazy_pidfile = final_dir / "lazy-pages.pid"
         if lazy_pidfile.exists():
             self.criu.stop_daemon(lazy_pidfile)
         if wipe_images:
+            saved_restore_state: Optional[str] = None
+            state_file = final_dir / "restore_state.json"
+            if state_file.exists():
+                try:
+                    saved_restore_state = state_file.read_text(encoding="utf-8")
+                except OSError:
+                    saved_restore_state = None
             self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+            if saved_restore_state is not None:
+                final_dir.mkdir(parents=True, exist_ok=True)
+                state_file.write_text(saved_restore_state, encoding="utf-8")
         return {"cleaned": True}
 
     def rollback_dest(
@@ -1059,6 +1144,7 @@ class AgentService:
         migration_id: str,
         restored_pid: Optional[int],
         config_dict: Dict[str, Any],
+        expected_restored_starttime: Optional[int] = None,
     ) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
         config = config_from_dict(config_dict)
@@ -1084,6 +1170,14 @@ class AgentService:
                     restored_pid = int(pidfile.read_text(encoding="utf-8").strip())
                 except Exception:
                     pass
+
+        if (
+            restored_pid is not None
+            and expected_restored_starttime is not None
+            and (starttimes is None or starttimes.get(str(restored_pid)) is None)
+        ):
+            starttimes = dict(starttimes or {})
+            starttimes[str(restored_pid)] = int(expected_restored_starttime)
 
         # Stop lazy-pages daemon if running
         lazy_pidfile = self._round_dir(migration_id, "final") / "lazy-pages.pid"

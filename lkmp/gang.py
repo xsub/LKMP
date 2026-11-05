@@ -57,11 +57,12 @@ class GangMigrationCoordinator:
             or (members[0][0].journal_dir if members else None)
             or DEFAULT_JOURNAL_DIR
         )
-        member_ids = [f"{self.gang_id}-m{idx}" for idx in range(1, len(members) + 1)]
+        self.member_ids = [f"{self.gang_id}-m{idx}" for idx in range(1, len(members) + 1)]
         self.journal = open_migration_journal(
             j_dir,
             f"{self.gang_id}.gang",
-            extra_ids=member_ids,
+            extra_ids=self.member_ids,
+            member_ids=self.member_ids,
         )
 
         self.orchestrators: List[MigrationOrchestrator] = [
@@ -80,11 +81,40 @@ class GangMigrationCoordinator:
         """
         Execute 2PC gang migration across all members.
         """
+        member_configs = [config_to_dict(o.config) for o in self.orchestrators]
+
+        # 0. Durable Gang & Member WAL Initialization Barrier (before any host RPC):
+        #    Write GangJournal INIT first (so any member WAL created next can always consult
+        #    GangJournal), initialize every member WAL on disk, then record PREFLIGHT on
+        #    GangJournal so any missing member WAL from PREFLIGHT onwards is provably file loss.
+        self.journal.append(
+            state=MigrationState.INIT,
+            commit_decision="PREPARING",
+            note="Initializing member WALs",
+            member_ids=self.member_ids,
+            member_configs=member_configs,
+        )
+        for orch in self.orchestrators:
+            orch._transition(MigrationState.INIT, commit_decision="PREPARING")
+        self.journal.append(
+            state=MigrationState.PREFLIGHT,
+            commit_decision="PREPARING",
+            note="All member WALs initialized; starting preflight barrier",
+            member_ids=self.member_ids,
+            member_configs=member_configs,
+        )
+
         # 1. Global Preflight Barrier: all members must pass preflight before any member freezes
         for orch in self.orchestrators:
             report = orch.run_preflight()
             if not report.compatible:
-                self.journal.append(state=MigrationState.ABORTED, commit_decision="ABORTING", note="Preflight failed")
+                self.journal.append(
+                    state=MigrationState.ABORTED,
+                    commit_decision="ABORTING",
+                    note="Preflight failed",
+                    member_ids=self.member_ids,
+                    member_configs=member_configs,
+                )
                 results: List[MigrationResult] = []
                 for o in self.orchestrators:
                     o._transition(MigrationState.ABORTED, commit_decision="ABORTING")
@@ -109,7 +139,12 @@ class GangMigrationCoordinator:
             orch.state = MigrationState.INIT
             orch.state_history = [MigrationState.INIT]
 
-        self.journal.append(state=MigrationState.PREPARE, commit_decision="PREPARING")
+        self.journal.append(
+            state=MigrationState.PREPARE,
+            commit_decision="PREPARING",
+            member_ids=self.member_ids,
+            member_configs=member_configs,
+        )
 
         # 2. Phase 1 (Prepare & Verify): stops at VERIFY with keep_stopped_on_prepare=True
         # Process on B stays stopped and network-fenced; source process on A is alive and frozen
@@ -212,29 +247,76 @@ class GangMigrationCoordinator:
         if gang_id.endswith(".gang"):
             gang_id = gang_id[:-5]
 
+        expected_member_ids = journal.expected_member_ids
+        if not expected_member_ids:
+            raise ValueError(
+                f"Gang journal {path} is missing authoritative member_ids manifest; "
+                "refusing partial gang recovery"
+            )
+        if len(members) != len(expected_member_ids):
+            raise ValueError(
+                f"Gang recovery member count mismatch for {gang_id!r}: gang WAL requires "
+                f"{len(expected_member_ids)} members ({expected_member_ids}), got {len(members)}"
+            )
+
+        only_unstarted_init = (
+            len(journal.entries) == 1
+            and journal.entries[0].state == MigrationState.INIT.value
+            and journal.entries[0].commit_decision == "PREPARING"
+        )
+        loaded_member_journals: Dict[str, Optional[MigrationJournal]] = {}
+        seen_uncreated_init_member = False
+        for mid in expected_member_ids:
+            mem_wal_path = path.parent / f"{mid}.wal.jsonl"
+            if not mem_wal_path.exists():
+                if only_unstarted_init:
+                    seen_uncreated_init_member = True
+                    loaded_member_journals[mid] = None
+                    continue
+                raise FileNotFoundError(
+                    f"Cannot recover gang {gang_id!r}: required member WAL is missing at "
+                    f"{mem_wal_path} (expected full gang {expected_member_ids})"
+                )
+            if seen_uncreated_init_member:
+                raise FileNotFoundError(
+                    f"Cannot recover gang {gang_id!r}: non-contiguous member WAL missing before "
+                    f"{mem_wal_path} (expected full gang {expected_member_ids})"
+                )
+            loaded_member_journals[mid] = MigrationJournal.load(mem_wal_path)
+
         committed_decision = journal.has_committed_decision
         results: List[MigrationResult] = []
         coordinator = cls(gang_id=gang_id, members=members, journal_dir=path.parent)
+        if [o.migration_id for o in coordinator.orchestrators] != expected_member_ids:
+            raise ValueError(
+                f"Gang recovery member identifier mismatch for {gang_id!r}: "
+                f"expected {expected_member_ids}"
+            )
 
         if committed_decision:
             for orch in coordinator.orchestrators:
-                if orch._restored_pid is None and orch.journal and orch.journal.path.exists():
-                    try:
-                        mem_journal = MigrationJournal.load(orch.journal.path)
-                        for entry in reversed(mem_journal.entries):
-                            if entry.restored_pid:
-                                orch._restored_pid = entry.restored_pid
-                                break
-                    except Exception:
-                        pass
+                mem_journal = loaded_member_journals[orch.migration_id]
+                assert mem_journal is not None
+                for entry in reversed(mem_journal.entries):
+                    if entry.restored_pid is not None:
+                        orch._restored_pid = entry.restored_pid
+                        orch._restored_starttime = entry.restored_starttime
+                        break
 
                 try:
-                    pre_verify = orch.dest.call(
-                        "verify_process",
-                        restored_pid=orch._restored_pid,
-                        health_check_cmd=None,
-                        migration_id=orch.migration_id,
-                    )
+                    verify_kwargs: Dict[str, object] = {
+                        "restored_pid": orch._restored_pid,
+                        "health_check_cmd": None,
+                        "migration_id": orch.migration_id,
+                    }
+                    if orch._restored_starttime is not None:
+                        verify_kwargs["expected_restored_starttime"] = orch._restored_starttime
+                    try:
+                        pre_verify = orch.dest.call("verify_process", **verify_kwargs)
+                    except TypeError:
+                        verify_kwargs.pop("expected_restored_starttime", None)
+                        pre_verify = orch.dest.call("verify_process", **verify_kwargs)
+
                     if not pre_verify.get("healthy"):
                         raise RuntimeError(
                             "Refusing roll-forward commit_source: "
@@ -245,7 +327,12 @@ class GangMigrationCoordinator:
                         migration_id=orch.migration_id,
                         config_dict=config_to_dict(orch.config),
                     )
-                    orch.complete_switchover_and_verify()
+                    already_switched_over = any(
+                        e.state == MigrationState.SWITCHOVER.value and e.commit_decision == "COMMITTED"
+                        for e in mem_journal.entries
+                    )
+                    if not already_switched_over:
+                        orch.complete_switchover_and_verify()
                     res = orch.commit()
                     results.append(res)
                 except Exception as exc:
@@ -273,6 +360,13 @@ class GangMigrationCoordinator:
             )
         else:
             for orch in coordinator.orchestrators:
+                mem_journal = loaded_member_journals[orch.migration_id]
+                if mem_journal is not None and not mem_journal.has_rolled_back_decision:
+                    for entry in reversed(mem_journal.entries):
+                        if entry.restored_pid is not None:
+                            orch._restored_pid = entry.restored_pid
+                            orch._restored_starttime = entry.restored_starttime
+                            break
                 res = orch.rollback("Gang recovery: aborting uncommitted gang migration")
                 results.append(res)
             all_rolled_back = bool(results) and all(r.rolled_back for r in results)

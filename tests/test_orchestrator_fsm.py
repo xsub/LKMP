@@ -80,6 +80,10 @@ class _FakeClusterHarness:
             if st_file.exists():
                 txt = st_file.read_text(encoding="utf-8")
                 st_file.write_text(txt.replace("State:\tT (stopped)", "State:\tS (sleeping)"), encoding="utf-8")
+            stat_file = self.proc_b / str(pid) / "stat"
+            if stat_file.exists():
+                st_txt = stat_file.read_text(encoding="utf-8")
+                stat_file.write_text(st_txt.replace(") T ", ") S "), encoding="utf-8")
 
     @staticmethod
     def _eval_nft(tables: dict, cmd: List[str], *, _in_batch: bool = False) -> subprocess.CompletedProcess:
@@ -234,8 +238,13 @@ class _FakeClusterHarness:
             p5678 = self.proc_b / "5678"
             p5678.mkdir(parents=True, exist_ok=True)
             state_line = "State:\tT (stopped)\n" if "--leave-stopped" in cmd else "State:\tS (sleeping)\n"
+            stat_char = "T" if "--leave-stopped" in cmd else "S"
             (p5678 / "status").write_text(
                 f"Name:\tserver\n{state_line}VmRSS:\t65536 kB\nTracerPid:\t0\nNSpid:\t5678\t1\n",
+                encoding="utf-8",
+            )
+            (p5678 / "stat").write_text(
+                f"5678 (server) {stat_char} 1 5678 5678 0 -1 4194560 0 0 0 0 1 1 0 0 20 0 1 0 42000 1024 10 18446744073709551615 0\n",
                 encoding="utf-8",
             )
         return subprocess.CompletedProcess(cmd, 0, "CRIU 4.3\n", "")

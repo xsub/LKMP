@@ -27,7 +27,7 @@ from lkmp.criu_driver import CriuDriver
 from lkmp.envelope import EnvelopeManager
 from lkmp.fs_sync import FilesystemSyncManager
 from lkmp.gang import GangMigrationCoordinator
-from lkmp.journal import MigrationJournal, validate_safe_identifier
+from lkmp.journal import MigrationJournal, WalCorruptionError, validate_safe_identifier
 from lkmp.models import HostCapabilities, MigrationResult, MigrationState, ProcessSnapshotInfo
 from lkmp.network import NetworkMobilityManager
 from lkmp.orchestrator import MigrationOrchestrator
@@ -1252,9 +1252,10 @@ class TestAuditRound2Fixes(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             net.lock_network("10.20.30.40", migration_id="mig-fail-clean")
 
-        # 1 atomic batch command tried + 1 cleanup command executed (nft delete table inet <table_name>)
-        self.assertEqual(len(executed), 2)
-        self.assertEqual(executed[-1], ["nft", "delete", "table", "inet", table_name])
+        # 1 atomic batch command tried + 1 lock check (nft list table) + 1 cleanup command (nft delete table)
+        self.assertEqual(len(executed), 3)
+        self.assertEqual(executed[1], ["nft", "list", "table", "inet", table_name])
+        self.assertEqual(executed[2], ["nft", "delete", "table", "inet", table_name])
 
     def test_06_strict_mtls_requiring_ca_cert(self) -> None:
         """
@@ -2189,7 +2190,11 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
             self.assertNotIn((1234, signal.SIGKILL), harness.signals_a)
 
             # 3. Gang roll-forward recovery with missing restored_pid must NOT kill Source A
-            g_journal = MigrationJournal(wal_dir, "gang-nopid.gang")
+            g_journal = MigrationJournal(
+                wal_dir,
+                "gang-nopid.gang",
+                member_ids=["gang-nopid-m1"],
+            )
             g_journal.append(MigrationState.PREPARE, "PREPARING")
             g_journal.append(MigrationState.COMMIT, "COMMITTED")
             m_journal = MigrationJournal(wal_dir, "gang-nopid-m1", gang_id="gang-nopid")
@@ -2328,6 +2333,521 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
             j_empty.write_bytes(b'{"seq": 1, "migration_id": "mig-only-torn"')
             with self.assertRaises(ValueError):
                 MigrationJournal.load(j_empty)
+
+    def test_r5_p0_repeated_recovery_at_every_single_wal_write_point(self) -> None:
+        """
+        P0 round-5: Simulate a hard controller crash right after EVERY single WAL write point
+        (both single-process PRE_COPY migration and 2-member 2PC gang migration), and execute
+        `recover_from_journal` 3 consecutive times at each crash point.
+        Verifies:
+        - Strictly monotonic WAL sequence numbers `1..M` across unlimited repeated recoveries
+          (never resetting to `seq=1`).
+        - Torn trailing bytes are truncated cleanly before appending recovery entries.
+        - Recycled PID on Destination B is never killed on repeated rollback recoveries.
+        - `wipe_images_on_commit=True` preserves `restore_state.json` so repeated commit
+          recoveries verify `restored_starttime` cleanly.
+        """
+
+        class _HardControllerCrash(BaseException):
+            pass
+
+        def _make_cfg(vip: str = "10.0.0.10/24", strategy: MigrationStrategy = MigrationStrategy.PRE_COPY) -> MigrationConfig:
+            return MigrationConfig(
+                pid=1234,
+                workload_id="srv-r5-seq",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=strategy,
+                workload_ip=vip,
+                verify_attestation=False,
+                wipe_images_on_commit=True,
+                tls=TlsConfig(enabled=False),
+            )
+
+        # --- Part A: Single-process PRE_COPY migration at every WAL write point ---
+        with tempfile.TemporaryDirectory() as tmp_base:
+            h_base = _FakeClusterHarness(tmp_base)
+            wal_base = Path(tmp_base) / "wal"
+            orch_base = MigrationOrchestrator(
+                config=_make_cfg(),
+                source_client=AgentClient("10.0.0.1:9700", direct_service=h_base.service_a),
+                dest_client=AgentClient("10.0.0.2:9700", direct_service=h_base.service_b),
+                migration_id="mig-r5-base",
+                journal_dir=wal_base,
+            )
+            base_res = orch_base.execute()
+            self.assertTrue(base_res.success)
+            assert orch_base.journal is not None
+            total_single_writes = len(MigrationJournal.load(orch_base.journal.path).entries)
+            self.assertGreaterEqual(total_single_writes, 11)
+
+        orig_append = MigrationJournal.append
+
+        for crash_after in range(1, total_single_writes + 1):
+            with tempfile.TemporaryDirectory() as tmp_k:
+                h_k = _FakeClusterHarness(tmp_k)
+                wal_k = Path(tmp_k) / "wal"
+                mig_id = f"mig-r5-k{crash_after}"
+                src_k = AgentClient("10.0.0.1:9700", direct_service=h_k.service_a)
+                dst_k = AgentClient("10.0.0.2:9700", direct_service=h_k.service_b)
+                orch_k = MigrationOrchestrator(
+                    config=_make_cfg(),
+                    source_client=src_k,
+                    dest_client=dst_k,
+                    migration_id=mig_id,
+                    journal_dir=wal_k,
+                )
+
+                write_counter = {"n": 0}
+
+                def crashing_append(self_j: MigrationJournal, *args: Any, **kwargs: Any) -> Any:
+                    entry = orig_append(self_j, *args, **kwargs)
+                    write_counter["n"] += 1
+                    if write_counter["n"] == crash_after:
+                        raise _HardControllerCrash(f"crash at single WAL write {crash_after}")
+                    return entry
+
+                with patch.object(MigrationJournal, "append", crashing_append):
+                    with self.assertRaises(_HardControllerCrash):
+                        orch_k.execute()
+
+                wal_file = wal_k / f"{mig_id}.wal.jsonl"
+                pre_rec_journal = MigrationJournal.load(wal_file)
+                expect_committed = pre_rec_journal.has_committed_decision
+
+                # Also inject an unterminated torn tail on one uncommitted crash point to verify truncation + append
+                if not expect_committed and crash_after == 5:
+                    with wal_file.open("ab") as tf:
+                        tf.write(b'{"seq": 99, "migration_id": "' + mig_id.encode("utf-8") + b'", "partial')
+
+                for run_idx in range(1, 4):
+                    rec = MigrationOrchestrator.recover_from_journal(wal_file, src_k, dst_k)
+                    loaded_after = MigrationJournal.load(wal_file)
+                    seqs = [e.seq for e in loaded_after.entries]
+                    self.assertEqual(
+                        seqs,
+                        list(range(1, len(seqs) + 1)),
+                        f"Non-monotonic WAL seq at crash_after={crash_after}, recovery #{run_idx}: {seqs}",
+                    )
+                    if expect_committed:
+                        self.assertTrue(rec.success, f"Expected commit recovery success at k={crash_after} run={run_idx}: {rec.error_message}")
+                        self.assertFalse(rec.rolled_back)
+                        self.assertEqual(rec.final_state, MigrationState.COMMIT)
+                    else:
+                        self.assertFalse(rec.success)
+                        self.assertTrue(rec.rolled_back, f"Expected rollback at k={crash_after} run={run_idx}: {rec.error_message}")
+                        self.assertEqual(rec.final_state, MigrationState.ROLLBACK)
+                        if run_idx == 1:
+                            # Simulate kernel recycling PID 5678 for an unrelated process on Destination B before run #2
+                            p5678 = h_k.proc_b / "5678"
+                            p5678.mkdir(parents=True, exist_ok=True)
+                            (p5678 / "stat").write_text(
+                                "5678 (foreign) S 1 5678 5678 0 -1 4194560 0 0 0 0 1 1 0 0 20 0 1 0 99999 1024 10 18446744073709551615 0\n",
+                                encoding="utf-8",
+                            )
+                            h_k.signals_b.clear()
+                        else:
+                            self.assertNotIn(
+                                (5678, signal.SIGKILL),
+                                h_k.signals_b,
+                                f"Repeated rollback #{run_idx} at k={crash_after} must NOT kill recycled PID 5678",
+                            )
+
+        # --- Part B: 2-member GangMigrationCoordinator at every WAL write point ---
+        with tempfile.TemporaryDirectory() as g_tmp1, tempfile.TemporaryDirectory() as g_tmp2:
+            gh1 = _FakeClusterHarness(g_tmp1)
+            gh2 = _FakeClusterHarness(g_tmp2)
+            g_wal_base = Path(g_tmp1) / "gwal"
+            g_write_count = {"n": 0}
+
+            def counting_append(self_j: MigrationJournal, *args: Any, **kwargs: Any) -> Any:
+                entry = orig_append(self_j, *args, **kwargs)
+                g_write_count["n"] += 1
+                return entry
+
+            cfg_m1 = _make_cfg("10.0.0.10/24", MigrationStrategy.COLD)
+            cfg_m2 = _make_cfg("10.0.0.11/24", MigrationStrategy.COLD)
+            cfg_m2.source_addr = "10.0.0.3:9700"
+            cfg_m2.dest_addr = "10.0.0.4:9700"
+
+            with patch.object(MigrationJournal, "append", counting_append):
+                coord_base = GangMigrationCoordinator(
+                    gang_id="gang-r5-base",
+                    journal_dir=str(g_wal_base),
+                    members=[
+                        (cfg_m1, AgentClient("10.0.0.1:9700", direct_service=gh1.service_a), AgentClient("10.0.0.2:9700", direct_service=gh1.service_b)),
+                        (cfg_m2, AgentClient("10.0.0.3:9700", direct_service=gh2.service_a), AgentClient("10.0.0.4:9700", direct_service=gh2.service_b)),
+                    ],
+                )
+                g_base_res = coord_base.execute_atomic()
+                self.assertTrue(g_base_res.all_committed)
+
+            total_gang_writes = g_write_count["n"]
+            self.assertGreaterEqual(total_gang_writes, 20)
+
+        for g_crash in range(1, total_gang_writes + 1):
+            with tempfile.TemporaryDirectory() as gt1, tempfile.TemporaryDirectory() as gt2:
+                gh_a = _FakeClusterHarness(gt1)
+                gh_b = _FakeClusterHarness(gt2)
+                g_wal_dir = Path(gt1) / "gwal"
+                gid = f"gang-r5-c{g_crash}"
+
+                cfg1 = _make_cfg("10.0.0.10/24", MigrationStrategy.COLD)
+                cfg2 = _make_cfg("10.0.0.11/24", MigrationStrategy.COLD)
+                cfg2.source_addr = "10.0.0.3:9700"
+                cfg2.dest_addr = "10.0.0.4:9700"
+                members_list = [
+                    (cfg1, AgentClient("10.0.0.1:9700", direct_service=gh_a.service_a), AgentClient("10.0.0.2:9700", direct_service=gh_a.service_b)),
+                    (cfg2, AgentClient("10.0.0.3:9700", direct_service=gh_b.service_a), AgentClient("10.0.0.4:9700", direct_service=gh_b.service_b)),
+                ]
+
+                coord_k = GangMigrationCoordinator(
+                    gang_id=gid,
+                    journal_dir=str(g_wal_dir),
+                    members=members_list,
+                )
+                gw_counter = {"n": 0}
+
+                def gang_crashing_append(self_j: MigrationJournal, *args: Any, **kwargs: Any) -> Any:
+                    entry = orig_append(self_j, *args, **kwargs)
+                    gw_counter["n"] += 1
+                    if gw_counter["n"] == g_crash:
+                        raise _HardControllerCrash(f"crash at gang WAL write {g_crash}")
+                    return entry
+
+                with patch.object(MigrationJournal, "append", gang_crashing_append):
+                    with self.assertRaises(_HardControllerCrash):
+                        coord_k.execute_atomic()
+
+                gang_wal_path = g_wal_dir / f"{gid}.gang.wal.jsonl"
+                gang_pre = MigrationJournal.load(gang_wal_path)
+                gang_committed = gang_pre.has_committed_decision
+
+                for grun in range(1, 4):
+                    grec = GangMigrationCoordinator.recover_from_journal(
+                        gang_journal_path=gang_wal_path,
+                        members=members_list,
+                    )
+                    for check_wal in (
+                        gang_wal_path,
+                        g_wal_dir / f"{gid}-m1.wal.jsonl",
+                        g_wal_dir / f"{gid}-m2.wal.jsonl",
+                    ):
+                        lj = MigrationJournal.load(check_wal)
+                        self.assertEqual(
+                            [e.seq for e in lj.entries],
+                            list(range(1, len(lj.entries) + 1)),
+                            f"Non-monotonic seq in {check_wal.name} at g_crash={g_crash} run={grun}",
+                        )
+                    if gang_committed:
+                        self.assertTrue(
+                            grec.all_committed,
+                            f"Expected gang all_committed at g_crash={g_crash} run={grun}: {grec.error_message}",
+                        )
+                        self.assertFalse(grec.atomic_rollback_triggered)
+                        self.assertFalse(grec.partial_commit_error)
+                    else:
+                        self.assertFalse(grec.all_committed)
+                        self.assertTrue(
+                            grec.atomic_rollback_triggered,
+                            f"Expected gang rollback at g_crash={g_crash} run={grun}: {grec.error_message}",
+                        )
+
+    def test_r5_p0_gang_recovery_rejects_missing_member_wal_in_coordinator_and_cli(self) -> None:
+        """
+        P0 round-5: Gang WAL persists authoritative `member_ids` and `member_configs`.
+        If ANY member WAL (`-m2` middle or `-m3` trailing) disappears on disk, or if fewer
+        members are passed, both `GangMigrationCoordinator.recover_from_journal()` and
+        `lkmp recover --gang-journal` CLI fail closed without recovering a partial subset.
+        """
+        from lkmp.cli import main as cli_main
+
+        with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2, tempfile.TemporaryDirectory() as t3:
+            h1 = _FakeClusterHarness(t1)
+            h2 = _FakeClusterHarness(t2)
+            h3 = _FakeClusterHarness(t3)
+            wal_dir = Path(t1) / "wal"
+
+            def _mk_cfg(idx: int) -> MigrationConfig:
+                return MigrationConfig(
+                    pid=1234,
+                    workload_id=f"srv-m{idx}",
+                    source_addr=f"10.0.{idx}.1:9700",
+                    dest_addr=f"10.0.{idx}.2:9700",
+                    strategy=MigrationStrategy.COLD,
+                    workload_ip=f"10.0.{idx}.10/24",
+                    verify_attestation=False,
+                    tls=TlsConfig(enabled=False),
+                )
+
+            c1, c2, c3 = _mk_cfg(1), _mk_cfg(2), _mk_cfg(3)
+            members = [
+                (c1, AgentClient(c1.source_addr, direct_service=h1.service_a), AgentClient(c1.dest_addr, direct_service=h1.service_b)),
+                (c2, AgentClient(c2.source_addr, direct_service=h2.service_a), AgentClient(c2.dest_addr, direct_service=h2.service_b)),
+                (c3, AgentClient(c3.source_addr, direct_service=h3.service_a), AgentClient(c3.dest_addr, direct_service=h3.service_b)),
+            ]
+
+            coord = GangMigrationCoordinator(
+                gang_id="gang-r5-3m",
+                journal_dir=str(wal_dir),
+                members=members,
+            )
+            res = coord.execute_atomic()
+            self.assertTrue(res.all_committed)
+
+            gang_wal = wal_dir / "gang-r5-3m.gang.wal.jsonl"
+            loaded_gang = MigrationJournal.load(gang_wal)
+            self.assertEqual(
+                loaded_gang.expected_member_ids,
+                ["gang-r5-3m-m1", "gang-r5-3m-m2", "gang-r5-3m-m3"],
+            )
+
+            # 1. Passing a 2-member subset to recover_from_journal MUST raise ValueError
+            with self.assertRaises(ValueError) as ctx_subset:
+                GangMigrationCoordinator.recover_from_journal(gang_wal, members[:2])
+            self.assertIn("member count mismatch", str(ctx_subset.exception))
+
+            # 2. Deleting trailing member WAL (-m3) MUST fail closed in both Coordinator and CLI
+            m3_wal = wal_dir / "gang-r5-3m-m3.wal.jsonl"
+            m3_bytes = m3_wal.read_bytes()
+            m3_wal.unlink()
+
+            with self.assertRaises(FileNotFoundError) as ctx_m3_coord:
+                GangMigrationCoordinator.recover_from_journal(gang_wal, members)
+            self.assertIn("gang-r5-3m-m3.wal.jsonl", str(ctx_m3_coord.exception))
+
+            with self.assertRaises(FileNotFoundError) as ctx_m3_cli:
+                cli_main(["recover", "--gang-journal", str(gang_wal), "--no-tls", "--json"])
+            self.assertIn("gang-r5-3m-m3.wal.jsonl", str(ctx_m3_cli.exception))
+
+            # Restore -m3 and delete middle member WAL (-m2) -> ALSO fails closed in both
+            m3_wal.write_bytes(m3_bytes)
+            m2_wal = wal_dir / "gang-r5-3m-m2.wal.jsonl"
+            m2_bytes = m2_wal.read_bytes()
+            m2_wal.unlink()
+
+            with self.assertRaises(FileNotFoundError) as ctx_m2_coord:
+                GangMigrationCoordinator.recover_from_journal(gang_wal, members)
+            self.assertIn("gang-r5-3m-m2.wal.jsonl", str(ctx_m2_coord.exception))
+
+            with self.assertRaises(FileNotFoundError) as ctx_m2_cli:
+                cli_main(["recover", "--gang-journal", str(gang_wal), "--no-tls", "--json"])
+            self.assertIn("gang-r5-3m-m2.wal.jsonl", str(ctx_m2_cli.exception))
+
+            # Restore -m2 -> full 3-member gang recovery succeeds cleanly
+            m2_wal.write_bytes(m2_bytes)
+            rec_ok = GangMigrationCoordinator.recover_from_journal(gang_wal, members)
+            self.assertTrue(rec_ok.all_committed)
+
+            # 3. Gang WAL missing `member_ids` manifest altogether MUST raise ValueError
+            legacy_gang = MigrationJournal(wal_dir, "legacy-nomembers.gang")
+            legacy_gang.append(MigrationState.COMMIT, "COMMITTED")
+            with self.assertRaises(ValueError) as ctx_legacy:
+                GangMigrationCoordinator.recover_from_journal(legacy_gang.path, members[:1])
+            self.assertIn("missing authoritative member_ids", str(ctx_legacy.exception))
+
+    def test_r5_p1_corrupted_newline_terminated_final_wal_record_refuses_auto_rollback(self) -> None:
+        """
+        P1 round-5: A newline-terminated (`\\n`) final WAL record with a bad checksum or invalid JSON
+        may have been a previously fsynced `COMMITTED` record damaged on media. Discarding it and
+        rolling back based on earlier `PREPARING` records would cause split-brain!
+        Verify:
+        - Corrupted `\\n`-terminated final record raises `WalCorruptionError` and NEVER triggers
+          automatic rollback of Source A.
+        - Unterminated EOF fragment (missing `\\n`, crash mid-write) IS safely discarded as a torn
+          tail and truncated via `ftruncate` before appending subsequent records.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = _FakeClusterHarness(tmp)
+            wal_dir = Path(tmp) / "wal"
+            cfg = MigrationConfig(
+                pid=1234,
+                workload_id="srv-corrupt-final",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=MigrationStrategy.COLD,
+                verify_attestation=False,
+                tls=TlsConfig(enabled=False),
+            )
+            src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
+            dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
+
+            j = MigrationJournal(wal_dir, "mig-corrupt-committed")
+            j.append(MigrationState.INIT, "PREPARING", config_dict=config_to_dict(cfg))
+            j.append(MigrationState.VERIFY, "PREPARING", restored_pid=5678, restored_starttime=42000)
+            j.append(MigrationState.COMMIT, "COMMITTED", restored_pid=5678, restored_starttime=42000)
+
+            orig_lines = j.path.read_bytes().splitlines(keepends=True)
+            self.assertEqual(len(orig_lines), 3)
+            self.assertTrue(orig_lines[2].endswith(b"\n"))
+
+            # Case 1: Bitrot / checksum corruption in newline-terminated final COMMITTED record
+            corrupted_csum_line = orig_lines[2].replace(b'"note": null', b'"note": "xx"')
+            self.assertTrue(corrupted_csum_line.endswith(b"\n"))
+            j.path.write_bytes(orig_lines[0] + orig_lines[1] + corrupted_csum_line)
+
+            with self.assertRaises(WalCorruptionError):
+                MigrationJournal.load(j.path)
+            with self.assertRaises(WalCorruptionError):
+                MigrationOrchestrator.recover_from_journal(j.path, src, dst)
+            self.assertEqual(harness.signals_a, [], "Must NEVER auto-rollback or signal Source A on corrupted COMMITTED line")
+
+            # Case 2: Corrupted JSON syntax in newline-terminated final record -> still WalCorruptionError
+            j.path.write_bytes(orig_lines[0] + orig_lines[1] + b'{"seq": 3, CORRUPTED_JSON}\n')
+            with self.assertRaises(WalCorruptionError):
+                MigrationJournal.load(j.path)
+            with self.assertRaises(WalCorruptionError):
+                MigrationOrchestrator.recover_from_journal(j.path, src, dst)
+            self.assertEqual(harness.signals_a, [])
+
+            # Case 3: Unterminated partial tail (no newline) -> discarded cleanly & truncated before next append
+            j.path.write_bytes(orig_lines[0] + orig_lines[1] + b'{"seq": 3, "migration_id": "mig-corrupt-committed"')
+            loaded_torn = MigrationJournal.load(j.path)
+            self.assertTrue(loaded_torn.discarded_torn_tail)
+            self.assertEqual(len(loaded_torn.entries), 2)
+
+            rec_torn = MigrationOrchestrator.recover_from_journal(j.path, src, dst)
+            self.assertTrue(rec_torn.rolled_back)
+            reloaded_clean = MigrationJournal.load(j.path)
+            self.assertFalse(reloaded_clean.discarded_torn_tail)
+            self.assertEqual([e.seq for e in reloaded_clean.entries], [1, 2, 3, 4])
+            self.assertEqual(reloaded_clean.entries[-1].commit_decision, "ROLLED_BACK")
+
+    def test_r5_p1_failed_relock_preserves_existing_active_nft_lock(self) -> None:
+        """
+        P1 round-5: If an active nftables network lock (`drop` ruleset) is already protecting a
+        stopped workload and a subsequent `lock_network()` retry fails during atomic batch execution,
+        `lock_network()` MUST NOT call `unlock_network()` and delete the existing active lock!
+        """
+        nft_state: Dict[str, Any] = {}
+        executed_cmds: List[List[str]] = []
+        fail_next_batch = {"active": False}
+
+        def stateful_nft_runner(cmd: List[str]) -> subprocess.CompletedProcess:
+            executed_cmds.append(list(cmd))
+            if fail_next_batch["active"] and len(cmd) == 2 and cmd[0] == "nft" and ";" in cmd[1]:
+                raise subprocess.CalledProcessError(1, cmd, stderr="transient nft batch allocation error")
+            return _FakeClusterHarness._eval_nft(nft_state, cmd)
+
+        net = NetworkMobilityManager(runner=stateful_nft_runner)
+        vip = "10.0.0.50/24"
+        mig_id = "mig-r5-relock"
+        tname = net.table_name_for(vip, mig_id)
+
+        # 1. Initial lock succeeds -> active drop protection confirmed
+        net.lock_network(vip, migration_id=mig_id)
+        self.assertTrue(net.verify_network_locked(vip, migration_id=mig_id))
+
+        # 2. Retry lock_network fails during batch -> MUST preserve existing active lock!
+        executed_cmds.clear()
+        fail_next_batch["active"] = True
+        with self.assertRaises(subprocess.CalledProcessError):
+            net.lock_network(vip, migration_id=mig_id)
+
+        self.assertFalse(
+            any(c[:4] == ["nft", "delete", "table", "inet"] for c in executed_cmds),
+            f"Failed re-lock must NOT delete active protective table! Executed: {executed_cmds}",
+        )
+        self.assertTrue(
+            net.verify_network_locked(vip, migration_id=mig_id),
+            "Active nftables drop lock must remain intact after failed re-lock!",
+        )
+
+        # 3. Contrast: if table exists WITHOUT active drop rules (broken/empty table), cleanup DOES delete it
+        nft_state[tname] = {"chains": {"input": "type filter hook input priority -100"}, "rules": {"input": []}}
+        self.assertFalse(net.verify_network_locked(vip, migration_id=mig_id))
+        executed_cmds.clear()
+        with self.assertRaises(subprocess.CalledProcessError):
+            net.lock_network(vip, migration_id=mig_id)
+        self.assertTrue(any(c == ["nft", "delete", "table", "inet", tname] for c in executed_cmds))
+        self.assertNotIn(tname, nft_state)
+
+    def test_r5_verify_process_and_resume_reject_recycled_pid_starttime_mismatch(self) -> None:
+        """
+        Additional round-5: `verify_process()`, `verify_restored_stopped()`, `claim_ip_and_resume()`,
+        and `recover_from_journal()` compare `/proc/<pid>/stat` field 22 (`starttime`) against the
+        recorded `restore_state.json` and WAL `restored_starttime`, refusing to treat a recycled
+        foreign PID as the restored workload or kill Source A.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = _FakeClusterHarness(tmp)
+            wal_dir = Path(tmp) / "wal"
+            cfg = MigrationConfig(
+                pid=1234,
+                workload_id="srv-r5-starttime",
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                strategy=MigrationStrategy.COLD,
+                workload_ip="10.0.0.10/24",
+                verify_attestation=False,
+                wipe_images_on_commit=True,
+                tls=TlsConfig(enabled=False),
+            )
+            src = AgentClient("10.0.0.1:9700", direct_service=harness.service_a)
+            dst = AgentClient("10.0.0.2:9700", direct_service=harness.service_b)
+            mig_id = "mig-r5-starttime"
+
+            orch = MigrationOrchestrator(
+                config=cfg,
+                source_client=src,
+                dest_client=dst,
+                migration_id=mig_id,
+                journal_dir=wal_dir,
+            )
+            prep = orch.execute_prepare_phase(keep_stopped_on_prepare=True)
+            self.assertTrue(prep.success)
+            self.assertEqual(orch._restored_pid, 5678)
+            self.assertEqual(orch._restored_starttime, 42000)
+
+            # Mutate field 22 (starttime) on Destination B from 42000 -> 88888 (PID reuse by foreign process)
+            stat_path = harness.proc_b / "5678" / "stat"
+            orig_stat = stat_path.read_text(encoding="utf-8")
+            recycled_stat = orig_stat.replace(" 42000 ", " 88888 ")
+            stat_path.write_text(recycled_stat, encoding="utf-8")
+
+            # 1. verify_process rejects starttime mismatch
+            vp_bad = harness.service_b.verify_process(5678, None, migration_id=mig_id)
+            self.assertFalse(vp_bad["healthy"])
+            self.assertIn("starttime mismatch", vp_bad["reason"])
+
+            # 2. verify_restored_stopped rejects starttime mismatch
+            vrs_bad = harness.service_b.verify_restored_stopped(5678, migration_id=mig_id)
+            self.assertFalse(vrs_bad["healthy"])
+            self.assertIn("starttime mismatch", vrs_bad["reason"])
+
+            # 3. claim_ip_and_resume refuses to SIGCONT recycled PID
+            with self.assertRaises(RuntimeError) as ctx_resume:
+                harness.service_b.claim_ip_and_resume(
+                    restored_pid=5678,
+                    target_host="10.0.0.2",
+                    config_dict=config_to_dict(cfg),
+                    migration_id=mig_id,
+                )
+            self.assertIn("starttime mismatch", str(ctx_resume.exception))
+            self.assertNotIn((5678, signal.SIGCONT), harness.signals_b)
+
+            # 4. COMMITTED roll-forward recovery refuses commit_source (never kills Source A!) on recycled PID
+            assert orch.journal is not None
+            orch._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
+            rec_bad = MigrationOrchestrator.recover_from_journal(orch.journal.path, src, dst)
+            self.assertFalse(rec_bad.success)
+            self.assertIn("starttime mismatch", rec_bad.error_message or "")
+            self.assertNotIn((1234, signal.SIGKILL), harness.signals_a)
+
+            # 5. Restore true starttime (42000), switch over, wipe images via cleanup_dest, and verify
+            #    starttime protection STILL detects PID reuse via preserved restore_state.json + WAL!
+            stat_path.write_text(orig_stat, encoding="utf-8")
+            orch.complete_switchover_and_verify()
+            rec_good = MigrationOrchestrator.recover_from_journal(orch.journal.path, src, dst)
+            self.assertTrue(rec_good.success)
+            self.assertTrue((harness.work_b / mig_id / "final" / "restore_state.json").exists())
+
+            # Mutate running PID 5678 starttime after commit cleanup -> subsequent recovery detects reuse!
+            running_stat = stat_path.read_text(encoding="utf-8")
+            stat_path.write_text(running_stat.replace(" 42000 ", " 77777 "), encoding="utf-8")
+            rec_post_wipe_bad = MigrationOrchestrator.recover_from_journal(orch.journal.path, src, dst)
+            self.assertFalse(rec_post_wipe_bad.success)
+            self.assertIn("starttime mismatch", rec_post_wipe_bad.error_message or "")
 
 
 if __name__ == "__main__":

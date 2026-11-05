@@ -338,8 +338,11 @@ class NetworkMobilityManager:
         try:
             self.runner(cmd)
         except Exception:
+            # Preserve any pre-existing protective drop ruleset if already active in the kernel;
+            # only clean up when no active lock is protecting `workload_ip`.
             try:
-                self.unlock_network(workload_ip, migration_id)
+                if not self.verify_network_locked(workload_ip, migration_id):
+                    self.unlock_network(workload_ip, migration_id)
             except Exception:
                 pass
             raise
