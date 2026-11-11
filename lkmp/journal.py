@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -137,6 +138,7 @@ class MigrationJournal:
         self.entries: List[JournalEntry] = []
         self.discarded_torn_tail = False
         self._valid_prefix_bytes: Optional[int] = None
+        self._lock = threading.RLock()
 
     def sync_from_disk_if_exists(self) -> None:
         """
@@ -192,55 +194,56 @@ class MigrationJournal:
         member_configs: Optional[List[Dict[str, Any]]] = None,
     ) -> JournalEntry:
         """Append and fsync a state transition record to the WAL."""
-        _mkdir_durable(self.journal_dir, mode=0o700)
-        if self.require_persistent and not self._persistence_verified:
-            _verify_persistent_filesystem(self.journal_dir)
-            self._persistence_verified = True
+        with self._lock:
+            _mkdir_durable(self.journal_dir, mode=0o700)
+            if self.require_persistent and not self._persistence_verified:
+                _verify_persistent_filesystem(self.journal_dir)
+                self._persistence_verified = True
 
-        self.sync_from_disk_if_exists()
-        self._truncate_torn_tail_if_needed()
+            self.sync_from_disk_if_exists()
+            self._truncate_torn_tail_if_needed()
 
-        resolved_gang_id = gang_id if gang_id is not None else self.gang_id
-        if resolved_gang_id is not None:
-            validate_safe_identifier(resolved_gang_id, "gang_id")
+            resolved_gang_id = gang_id if gang_id is not None else self.gang_id
+            if resolved_gang_id is not None:
+                validate_safe_identifier(resolved_gang_id, "gang_id")
 
-        resolved_members: Optional[List[str]] = None
-        if member_ids is not None:
-            resolved_members = [validate_safe_identifier(m, "member_id") for m in member_ids]
-        elif self.member_ids is not None and not any(e.member_ids for e in self.entries):
-            resolved_members = list(self.member_ids)
+            resolved_members: Optional[List[str]] = None
+            if member_ids is not None:
+                resolved_members = [validate_safe_identifier(m, "member_id") for m in member_ids]
+            elif self.member_ids is not None and not any(e.member_ids for e in self.entries):
+                resolved_members = list(self.member_ids)
 
-        created_new = not self.path.exists()
-        next_seq = self._seq + 1
-        entry = JournalEntry(
-            seq=next_seq,
-            timestamp_unix=time.time(),
-            migration_id=self.migration_id,
-            state=state.value,
-            commit_decision=commit_decision,
-            restored_pid=restored_pid,
-            restored_starttime=restored_starttime,
-            config_dict=config_dict,
-            note=note,
-            gang_id=resolved_gang_id,
-            member_ids=resolved_members,
-            member_configs=member_configs,
-        )
-        raw_dict = entry.to_dict()
-        entry.checksum = _compute_entry_checksum(raw_dict)
-        raw_dict["checksum"] = entry.checksum
-        line = (json.dumps(raw_dict) + "\n").encode("utf-8")
-        fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, line)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        if created_new:
-            _fsync_directory(self.journal_dir)
-        self._seq = next_seq
-        self.entries.append(entry)
-        return entry
+            created_new = not self.path.exists()
+            next_seq = self._seq + 1
+            entry = JournalEntry(
+                seq=next_seq,
+                timestamp_unix=time.time(),
+                migration_id=self.migration_id,
+                state=state.value,
+                commit_decision=commit_decision,
+                restored_pid=restored_pid,
+                restored_starttime=restored_starttime,
+                config_dict=config_dict,
+                note=note,
+                gang_id=resolved_gang_id,
+                member_ids=resolved_members,
+                member_configs=member_configs,
+            )
+            raw_dict = entry.to_dict()
+            entry.checksum = _compute_entry_checksum(raw_dict)
+            raw_dict["checksum"] = entry.checksum
+            line = (json.dumps(raw_dict) + "\n").encode("utf-8")
+            fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, line)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if created_new:
+                _fsync_directory(self.journal_dir)
+            self._seq = next_seq
+            self.entries.append(entry)
+            return entry
 
     @classmethod
     def load(

@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 from lkmp.agent import AgentClient, AgentServer, AgentService, config_to_dict
 from lkmp.attestation import CheckpointAttestor, compute_directory_img_digests, generate_ephemeral_key_hex
 from lkmp.config import (
     FilesystemMode,
-    GpuPlugin,
     IpMobilityMode,
     MigrationConfig,
     MigrationStrategy,
@@ -28,7 +28,7 @@ from lkmp.envelope import EnvelopeManager
 from lkmp.fs_sync import FilesystemSyncManager
 from lkmp.gang import GangMigrationCoordinator
 from lkmp.journal import MigrationJournal, WalCorruptionError, validate_safe_identifier
-from lkmp.models import HostCapabilities, MigrationResult, MigrationState, ProcessSnapshotInfo
+from lkmp.models import HostCapabilities, MigrationState, ProcessSnapshotInfo
 from lkmp.network import NetworkMobilityManager
 from lkmp.orchestrator import MigrationOrchestrator
 from lkmp.pagemap import sample_process_dirty_rate
@@ -605,7 +605,7 @@ class TestAuditFixesP2(unittest.TestCase):
 
     def test_p2_evaluate_compatibility_criu_available_blocker(self) -> None:
         """Verify evaluate_compatibility returns compatible=False when criu_available=False on either host."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory():
             snap = ProcessSnapshotInfo(root_pid=500)
 
             caps_ok = HostCapabilities(
@@ -645,9 +645,9 @@ class TestAuditFixesP2(unittest.TestCase):
             max_iterations=8,
         )
         # Sequence of iterations plateauing at high dirty rate (above 25MB target)
-        d1 = tracker.evaluate(1, 80_000_000)
-        d2 = tracker.evaluate(2, 60_000_000)
-        d3 = tracker.evaluate(3, 50_000_000)
+        tracker.evaluate(1, 80_000_000)
+        tracker.evaluate(2, 60_000_000)
+        tracker.evaluate(3, 50_000_000)
         d4 = tracker.evaluate(4, 45_000_000)
 
         self.assertTrue(d4.should_stop)
@@ -874,7 +874,6 @@ class TestAuditRound2Fixes(unittest.TestCase):
         claim_ip_and_resume, rollback_source, commit_source, and rollback_dest signal ALL 3 PIDs,
         AND if a PID's starttime in <proc_root>/<pid>/stat changed, that PID is NOT signaled.
         """
-        import errno
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             proc_root = root / "proc"
@@ -886,7 +885,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
                 p_dir = proc_root / str(pid)
                 p_dir.mkdir(parents=True, exist_ok=True)
                 (p_dir / "stat").write_text(f"{pid} (proc) S 1 " + "0 " * 17 + f"{st} 0\n", encoding="utf-8")
-                (p_dir / "status").write_text(f"Name:\tproc\nVmRSS:\t1024 kB\n", encoding="utf-8")
+                (p_dir / "status").write_text("Name:\tproc\nVmRSS:\t1024 kB\n", encoding="utf-8")
 
             task_dir = proc_root / "3000" / "task" / "3000"
             task_dir.mkdir(parents=True, exist_ok=True)
@@ -992,7 +991,6 @@ class TestAuditRound2Fixes(unittest.TestCase):
         Verify freeze_cgroup polls cgroup.events for frozen 1 (and raises TimeoutError if frozen 0 persists),
         and quiesce_cmd runs before lock_network while resume_cmd runs after SIGCONT.
         """
-        import errno
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             cg_root = root / "cgroup"
@@ -1195,7 +1193,6 @@ class TestAuditRound2Fixes(unittest.TestCase):
         Verify that when rollback_dest is called with restored_pid=None,
         it reads final/restore_state.json and kills the orphaned restored root PID and child PIDs on Destination B.
         """
-        import errno
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             work_dir = root / "work"
@@ -1207,7 +1204,7 @@ class TestAuditRound2Fixes(unittest.TestCase):
                 p_dir = proc_root / str(pid)
                 p_dir.mkdir(parents=True, exist_ok=True)
                 (p_dir / "stat").write_text(f"{pid} (srv) S 1 " + "0 " * 17 + f"{st} 0\n", encoding="utf-8")
-                (p_dir / "status").write_text(f"Name:\tsrv\nVmRSS:\t1024 kB\n", encoding="utf-8")
+                (p_dir / "status").write_text("Name:\tsrv\nVmRSS:\t1024 kB\n", encoding="utf-8")
 
             final_dir = work_dir / mig_id / "final"
             final_dir.mkdir(parents=True, exist_ok=True)
@@ -1344,7 +1341,6 @@ class TestStaffAuditFindingsFixes(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             work_a = root / "work_a"
-            work_b = root / "work_b"
             proc_a = root / "proc_a"
             proc_b = root / "proc_b"
             for p in (proc_a / "100", proc_b / "200"):

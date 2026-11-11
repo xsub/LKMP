@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from lkmp.config import EnvelopeConfig
+from lkmp.drivers.qemu_qmp import build_migratable_qemu_command
 
 
 CommandRunner = Callable[[List[str]], subprocess.CompletedProcess]
@@ -131,12 +132,29 @@ class EnvelopeManager:
         self.runner(["nsenter", "-t", str(pid), "-n", "ip", "addr", "add", ip_cidr, "dev", interface])
         self.runner(["nsenter", "-t", str(pid), "-n", "ip", "link", "set", interface, "up"])
 
+    def build_launch_command(self, config: EnvelopeConfig) -> List[str]:
+        """Build the launch command for either a POSIX namespace envelope or a zero-copy QEMU VM."""
+        if (config.profile or "posix").lower() == "qemu":
+            qmp_sock = str(self.state_dir / f"{config.workload_id}.qmp.sock")
+            cmd, _qmp = build_migratable_qemu_command(
+                workload_id=config.workload_id,
+                qmp_socket=qmp_sock,
+                memory_mb=config.memory_mb,
+                vcpus=config.vcpus,
+                disk_path=config.disk_path,
+                extra_args=list(config.command) if config.command else None,
+            )
+            return cmd
+        return self.build_unshare_command(config)
+
     def save_envelope_metadata(self, config: EnvelopeConfig, host_pid: int) -> Path:
         """Persist envelope metadata so `lkmp migrate` can look up workload settings by ID or PID."""
         self.state_dir.mkdir(parents=True, exist_ok=True)
         meta_path = self.state_dir / f"{config.workload_id}.json"
         payload = asdict(config)
         payload["host_pid"] = host_pid
+        if (config.profile or "posix").lower() == "qemu":
+            payload["qmp_socket"] = str(self.state_dir / f"{config.workload_id}.qmp.sock")
         meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return meta_path
 
@@ -158,10 +176,11 @@ class EnvelopeManager:
         return items
 
     def launch(self, config: EnvelopeConfig) -> int:
-        """Launch a process inside its migration envelope, attach cgroup v2, and record metadata."""
-        unshare_cmd = self.build_unshare_command(config)
+        """Launch a process or QEMU VM inside its migration envelope, attach cgroup v2, and record metadata."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        launch_cmd = self.build_launch_command(config)
         proc = subprocess.Popen(
-            unshare_cmd,
+            launch_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,

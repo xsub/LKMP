@@ -8,8 +8,11 @@ import os
 import re
 import shlex
 import socket
+import struct
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
@@ -19,6 +22,100 @@ from lkmp.config import IpMobilityMode, MigrationConfig
 SYS_PIDFD_GETFD: int = 438
 SOL_TCP_REPAIR: int = getattr(socket, "TCP_REPAIR", 19)
 SO_ACCEPTCONN_OPT: int = getattr(socket, "SO_ACCEPTCONN", 30)
+ETH_P_ARP: int = 0x0806
+
+
+def build_gratuitous_arp_frame(
+    mac_bytes: bytes,
+    ipv4_str: str,
+    is_reply: bool = False,
+) -> bytes:
+    """
+    Construct a 42-byte Ethernet II broadcast Gratuitous ARP frame (RFC 5227):
+    - `dst_mac`: `ff:ff:ff:ff:ff:ff`
+    - `ethertype`: `0x0806` (ARP)
+    - `sender_mac = mac_bytes`, `sender_ip = target_ip = ipv4_str`
+    """
+    if len(mac_bytes) != 6:
+        raise ValueError(f"Expected 6-byte Ethernet MAC address, got {len(mac_bytes)} bytes")
+    ip_bytes = ipaddress.IPv4Address(ipv4_str).packed
+    bcast = b"\xff\xff\xff\xff\xff\xff"
+    target_hw = bcast if is_reply else b"\x00\x00\x00\x00\x00\x00"
+    opcode = 2 if is_reply else 1
+    eth_hdr = struct.pack("!6s6sH", bcast, mac_bytes, ETH_P_ARP)
+    arp_payload = struct.pack(
+        "!HHBBH6s4s6s4s",
+        1,          # HTYPE = Ethernet (1)
+        0x0800,     # PTYPE = IPv4
+        6,          # HLEN = 6
+        4,          # PLEN = 4
+        opcode,     # OPER = 1 (Request) or 2 (Reply)
+        mac_bytes,  # SHA
+        ip_bytes,   # SPA
+        target_hw,  # THA
+        ip_bytes,   # TPA == SPA (Gratuitous ARP)
+    )
+    return eth_hdr + arp_payload
+
+
+def _read_iface_mac_bytes(iface: str) -> Optional[bytes]:
+    sysfs_addr = Path("/sys/class/net") / iface / "address"
+    if sysfs_addr.exists():
+        try:
+            hex_parts = sysfs_addr.read_text(encoding="utf-8").strip().split(":")
+            if len(hex_parts) == 6:
+                mac = bytes(int(p, 16) for p in hex_parts)
+                if mac != b"\x00\x00\x00\x00\x00\x00":
+                    return mac
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def send_gratuitous_arp_raw(
+    iface: str,
+    ipv4_str: str,
+    background_followups: bool = True,
+) -> bool:
+    """
+    Sub-millisecond raw `AF_PACKET` Gratuitous ARP transmitter on Linux (`<0.2 ms` vs
+    `2,000 ms` synchronous sleep in `arping -c 3`). Transmits an immediate GARP Request +
+    Unsolicited ARP Reply pair, then optionally schedules 2 non-blocking follow-up bursts
+    on a daemon thread so switchover resumes the workload without waiting on L2 timers.
+    """
+    af_packet = getattr(socket, "AF_PACKET", None)
+    if af_packet is None or not sys.platform.startswith("linux"):
+        return False
+
+    mac = _read_iface_mac_bytes(iface)
+    if mac is None:
+        return False
+
+    req_frame = build_gratuitous_arp_frame(mac, ipv4_str, is_reply=False)
+    rep_frame = build_gratuitous_arp_frame(mac, ipv4_str, is_reply=True)
+
+    try:
+        with socket.socket(af_packet, socket.SOCK_RAW, socket.htons(ETH_P_ARP)) as sock:
+            sock.bind((iface, ETH_P_ARP))
+            sock.send(req_frame)
+            sock.send(rep_frame)
+    except OSError:
+        return False
+
+    if background_followups:
+        def _followup_burst() -> None:
+            for delay_s in (0.025, 0.085):
+                time.sleep(delay_s)
+                try:
+                    with socket.socket(af_packet, socket.SOCK_RAW, socket.htons(ETH_P_ARP)) as s2:
+                        s2.bind((iface, ETH_P_ARP))
+                        s2.send(req_frame)
+                except OSError:
+                    return
+
+        threading.Thread(target=_followup_burst, daemon=True).start()
+
+    return True
 
 
 class TcpRepairError(RuntimeError):
@@ -610,6 +707,20 @@ class NetworkMobilityManager:
         if config.ip_mobility in (IpMobilityMode.GARP, IpMobilityMode.TUNNEL):
             if addr.version == 6:
                 cmds.append(["ndsend", bare_ip, config.net_interface])
+            elif self.runner is _default_runner and sys.platform.startswith("linux"):
+                # Execute IP assignment first if needed before emitting raw AF_PACKET GARP
+                for pre_cmd in cmds:
+                    self.runner(pre_cmd)
+                executed_cmds = list(cmds)
+                cmds.clear()
+                if send_gratuitous_arp_raw(config.net_interface, bare_ip, background_followups=True):
+                    executed_cmds.append(["af_packet_garp", config.net_interface, bare_ip])
+                else:
+                    cmds.append(["arping", "-U", "-c", "1", "-w", "0", "-I", config.net_interface, bare_ip])
+                for rem_cmd in cmds:
+                    self.runner(rem_cmd)
+                    executed_cmds.append(rem_cmd)
+                return executed_cmds
             else:
                 cmds.append(
                     ["arping", "-U", "-c", "3", "-I", config.net_interface, bare_ip]

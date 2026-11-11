@@ -8,11 +8,8 @@ from typing import Any, Dict, List, Tuple
 
 from lkmp.models import (
     MigrationResult,
-    MigrationState,
     PortabilityReport,
-    PortabilityStatus,
     PreflightReport,
-    ResourceClassification,
 )
 
 
@@ -134,7 +131,7 @@ def render_preflight_scorecard(report: PreflightReport, selected_strategy: str) 
     verdict = "PASS (COMPATIBLE)" if report.compatible else "FAIL (BLOCKED)"
     lines = [
         "┌──────────────────────────────────────────────────────────────────────────┐",
-        f"│ LKMP PREFLIGHT COMPATIBILITY SCORECARD                                   │",
+        "│ LKMP PREFLIGHT COMPATIBILITY SCORECARD                                   │",
         "├──────────────────────────────┬───────────────────────────────────────────┤",
         f"│ Verdict                      │ {verdict:<41} │",
         f"│ Active Migration Strategy    │ {selected_strategy:<41} │",
@@ -351,4 +348,45 @@ def render_agent_status_report(status: Dict[str, Any]) -> str:
         f"│ Work Dir Free Space          │ {free_str:<41} │",
         "└──────────────────────────────┴───────────────────────────────────────────┘",
     ]
+    return "\n".join(lines)
+
+
+def render_workload_doctor_report(diag: Dict[str, Any]) -> str:
+    """Render a terminal advisor scorecard for `lkmp doctor`."""
+    kind = str(diag.get("kind", "posix")).upper()
+    subkind = str(diag.get("subkind") or "generic")
+    driver = str(diag.get("recommended_driver", "criu"))
+    ready = "READY (SEAMLESS)" if diag.get("ready") else "ACTION REQUIRED"
+    zc = "YES (MSG_ZEROCOPY / memfd / reflink)" if diag.get("zero_copy_capable") else "PARTIAL / STANDARD"
+    ctrl = str(diag.get("control_socket") or diag.get("container_id") or "none")
+    if len(ctrl) > 41:
+        ctrl = "..." + ctrl[-38:]
+
+    lines = [
+        "┌──────────────────────────────────────────────────────────────────────────┐",
+        "│ LKMP WORKLOAD RUNTIME FINGERPRINT & PORTING DOCTOR                       │",
+        "├──────────────────────────────┬───────────────────────────────────────────┤",
+        f"│ Target PID                   │ {str(diag.get('pid', '?')):<41} │",
+        f"│ Detected Runtime Kind        │ {f'{kind} ({subkind})':<41} │",
+        f"│ Recommended LKMP Driver      │ {driver:<41} │",
+        f"│ Readiness Verdict            │ {ready:<41} │",
+        f"│ Zero-Copy Capable            │ {zc:<41} │",
+        f"│ Control Socket / Handle      │ {ctrl:<41} │",
+        "└──────────────────────────────┴───────────────────────────────────────────┘",
+    ]
+    blockers = diag.get("blockers") or []
+    if blockers:
+        lines.append("\nPorting Blockers:")
+        for b in blockers:
+            lines.append(f"  ✗ {b}")
+    warnings = diag.get("warnings") or []
+    if warnings:
+        lines.append("\nZero-Copy & Low-Latency Warnings:")
+        for w in warnings:
+            lines.append(f"  ! {w}")
+    recs = diag.get("recommended_launch_flags") or []
+    if recs:
+        lines.append("\nRecommended Launch Flags for Seamless Porting:")
+        for r in recs:
+            lines.append(f"  → {r}")
     return "\n".join(lines)

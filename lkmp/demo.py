@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from lkmp.agent import AgentClient, AgentServer, AgentService
 from lkmp.config import (
@@ -23,7 +23,7 @@ from lkmp.models import MigrationResult
 from lkmp.network import NetworkMobilityManager
 from lkmp.orchestrator import MigrationOrchestrator
 from lkmp.pagemap import PAGE_SIZE, PTE_PRESENT_BIT, PTE_SOFT_DIRTY_BIT
-from lkmp.telemetry import PrometheusMetricsCollector, format_bytes
+from lkmp.telemetry import PrometheusMetricsCollector
 import struct
 
 

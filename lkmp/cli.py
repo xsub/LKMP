@@ -7,9 +7,9 @@ import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-from lkmp.agent import AgentClient, AgentServer, AgentService, config_from_dict, config_to_dict
+from lkmp.agent import AgentClient, AgentServer, AgentService, config_from_dict
 from lkmp.config import (
     EnvelopeConfig,
     FilesystemMode,
@@ -20,48 +20,23 @@ from lkmp.config import (
     TlsConfig,
 )
 from lkmp.demo import run_live_demo, run_sota_benchmark_suite
+from lkmp.drivers import WorkloadKind, diagnose_workload_porting
 from lkmp.envelope import EnvelopeManager
 from lkmp.journal import MigrationJournal, inspect_journal_file
-from lkmp.orchestrator import MigrationOrchestrator, PortabilityReport, PortabilityStatus
+from lkmp.logging_utils import configure_logging
+from lkmp.models import PortabilityStatus
+from lkmp.orchestrator import MigrationOrchestrator
 from lkmp.pki import generate_mtls_pki
+from lkmp.realtime import apply_realtime_agent_tuning
 from lkmp.telemetry import (
     render_agent_status_report,
     render_gang_migration_report,
     render_migration_report,
+    render_portability_report,
     render_preflight_scorecard,
     render_wal_inspection_report,
+    render_workload_doctor_report,
 )
-
-try:
-    from lkmp.telemetry import render_portability_report
-except ImportError:
-    render_portability_report = None
-
-
-def _fallback_render_portability_report(report: Any) -> str:
-    verdict = "PASS (PORTABLE)" if report.compatible else "FAIL (BLOCKED)"
-    status_str = report.overall_status.value if hasattr(report.overall_status, "value") else str(report.overall_status)
-    fast_path_str = "ENABLED" if getattr(report, "same_host_fast_path_available", False) else "DISABLED"
-    check_only_str = "PASSED" if getattr(report, "check_only_passed", None) else ("FAILED" if getattr(report, "check_only_passed", None) is False else "SKIPPED")
-    trial_str = "PASSED" if getattr(report, "trial_restore_passed", None) else ("FAILED" if getattr(report, "trial_restore_passed", None) is False else "SKIPPED")
-
-    lines = [
-        "┌──────────────────────────────────────────────────────────────────────────┐",
-        "│ LKMP WORKLOAD PORTABILITY ASSESSMENT                                     │",
-        "├──────────────────────────────┬───────────────────────────────────────────┤",
-        f"│ Compatibility Verdict        │ {verdict:<41} │",
-        f"│ Overall Status               │ {status_str:<41} │",
-        f"│ Same-Host CoW Fast Path      │ {fast_path_str:<41} │",
-        f"│ CRIU --check-only            │ {check_only_str:<41} │",
-        f"│ Isolated Trial Restore       │ {trial_str:<41} │",
-        "└──────────────────────────────┴───────────────────────────────────────────┘",
-    ]
-    if getattr(report, "findings", None):
-        lines.append("\nFindings:")
-        for f in report.findings:
-            tag = f.classification.value.upper() if hasattr(f.classification, "value") else str(f.classification)
-            lines.append(f"  • [{tag}] {f.resource_type} ({f.identifier}): {f.reason}")
-    return "\n".join(lines)
 
 
 def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
@@ -173,6 +148,33 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
         "--attestation-key-hex",
         help="Secret hex key for HMAC-SHA256 checkpoint manifest attestation",
     )
+    parser.add_argument(
+        "--workload-kind",
+        choices=[w.value for w in WorkloadKind],
+        default=WorkloadKind.AUTO.value,
+        help="Target runtime driver: auto, posix, qemu, oci, microvm (default: auto)",
+    )
+    parser.add_argument(
+        "--tmpfs-staging",
+        action="store_true",
+        help="Stage checkpoint images in RAM (/dev/shm/lkmp-migrations) for zero disk I/O",
+    )
+    parser.add_argument(
+        "--auto-dedup",
+        action="store_true",
+        help="Enable CRIU --auto-dedup to punch holes in superseded pre-copy page images",
+    )
+    parser.add_argument(
+        "--qemu-multifd",
+        type=int,
+        default=4,
+        help="Parallel multifd TCP channels for QEMU QMP live migration (default: 4)",
+    )
+    parser.add_argument(
+        "--no-inband-transfer",
+        action="store_true",
+        help="Disable zero-fork persistent-socket in-band metadata .img transfer",
+    )
     parser.add_argument("--no-tls", action="store_true", help="Disable TLS on agent & page-server links")
     parser.add_argument("--tls-ca", help="Path to CA certificate bundle")
     parser.add_argument("--tls-cert", help="Path to TLS certificate")
@@ -230,6 +232,11 @@ def _build_migration_config(args: argparse.Namespace) -> MigrationConfig:
         trial_restore=getattr(args, "trial_restore", False),
         journal_dir=getattr(args, "journal_dir", "/var/lib/lkmp/journals"),
         attestation_key_hex=getattr(args, "attestation_key_hex", None),
+        workload_kind=getattr(args, "workload_kind", "auto"),
+        prefer_tmpfs_work_dir=bool(getattr(args, "tmpfs_staging", False)),
+        auto_dedup=bool(getattr(args, "auto_dedup", False)),
+        qemu_multifd_channels=int(getattr(args, "qemu_multifd", 4)),
+        inband_metadata_transfer=not bool(getattr(args, "no_inband_transfer", False)),
         tls=tls,
     )
 
@@ -268,13 +275,33 @@ def _parse_member_spec(spec: str, default_tls: TlsConfig) -> MigrationConfig:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lkmp",
-        description="LKMP: Linux Process Migration Orchestrator on top of CRIU",
+        description="LKMP: Real-Time Zero-Copy Linux Process, Container & VM Migration Orchestrator",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Structured log verbosity level (default: WARNING)",
+    )
+    parser.add_argument(
+        "--json-logs",
+        action="store_true",
+        help="Emit structured JSON log lines to stderr",
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     # 1. `lkmp run`
-    run_p = sub.add_parser("run", help="Launch a workload inside an isolated migration envelope")
+    run_p = sub.add_parser("run", help="Launch a workload inside an isolated migration envelope or VM profile")
     run_p.add_argument("--id", required=True, dest="workload_id", help="Unique workload identifier")
+    run_p.add_argument(
+        "--profile",
+        choices=["posix", "qemu"],
+        default="posix",
+        help="Workload launch profile: posix namespace envelope or zero-copy qemu VM (default: posix)",
+    )
+    run_p.add_argument("--memory-mb", type=int, default=512, help="Guest RAM in MiB when --profile=qemu")
+    run_p.add_argument("--vcpus", type=int, default=2, help="Guest vCPUs when --profile=qemu")
+    run_p.add_argument("--disk", dest="disk_path", help="Disk image path when --profile=qemu")
     run_p.add_argument("--rootfs", help="Optional chroot/pivot_root directory")
     run_p.add_argument("--hostname", help="Optional UTS hostname inside namespace")
     run_p.add_argument(
@@ -287,7 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--ip", dest="ip_address", help="Dedicated IP/CIDR inside netns")
     run_p.add_argument("--iface", default="eth0", help="Network interface inside netns")
     run_p.add_argument("--no-time-ns", action="store_true", help="Disable time namespace isolation")
-    run_p.add_argument("--dry-run", action="store_true", help="Print unshare command without executing")
+    run_p.add_argument("--dry-run", action="store_true", help="Print launch command without executing")
     run_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to run (prefix with --)")
 
     # 2. `lkmp agent`
@@ -305,10 +332,44 @@ def build_parser() -> argparse.ArgumentParser:
         default="/var/lib/lkmp/migrations",
         help="Directory for CRIU checkpoint images",
     )
+    agent_p.add_argument(
+        "--prefer-tmpfs",
+        action="store_true",
+        help="Stage checkpoints on tmpfs (/dev/shm/lkmp-migrations) for zero disk I/O",
+    )
+    agent_p.add_argument(
+        "--rt-priority",
+        type=int,
+        default=0,
+        help="Optional SCHED_FIFO real-time priority (1..99) for deterministic blackout",
+    )
+    agent_p.add_argument(
+        "--mlockall",
+        action="store_true",
+        help="Pin agent pages in RAM via mlockall(MCL_CURRENT | MCL_FUTURE)",
+    )
+    agent_p.add_argument(
+        "--cpu-affinity",
+        help="Comma-separated CPU core IDs for agent pinning (e.g. '0,1')",
+    )
     agent_p.add_argument("--no-tls", action="store_true", help="Disable TLS")
     agent_p.add_argument("--tls-ca", help="Path to mTLS CA certificate")
     agent_p.add_argument("--tls-cert", help="Path to server certificate")
     agent_p.add_argument("--tls-key", help="Path to server private key")
+
+    # 2b. `lkmp doctor`
+    doc_p = sub.add_parser(
+        "doctor",
+        help="Fingerprint a running process/VM/container PID and advise zero-copy migration flags",
+    )
+    doc_p.add_argument("--pid", type=int, required=True, help="Target PID to fingerprint")
+    doc_p.add_argument("--agent", help="Optional remote lkmp-agent address (host:port); inspects locally if omitted")
+    doc_p.add_argument("--proc-root", default="/proc", help="Local procfs root when --agent is omitted")
+    doc_p.add_argument("--no-tls", action="store_true", help="Disable TLS when --agent is set")
+    doc_p.add_argument("--tls-ca", help="Path to CA certificate bundle")
+    doc_p.add_argument("--tls-cert", help="Path to TLS certificate")
+    doc_p.add_argument("--tls-key", help="Path to TLS private key")
+    doc_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
 
     # 3. `lkmp preflight`
     pre_p = sub.add_parser("preflight", help="Run non-destructive compatibility & blocker checks")
@@ -464,32 +525,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-_in_patched_main = False
-_ORIGINAL_MAIN_CODE = None
-
-
 def main(argv: Optional[List[str]] = None) -> int:
-    global _in_patched_main
-    if not _in_patched_main:
-        cli_mod = sys.modules.get("lkmp.cli")
-        if cli_mod is not None:
-            patched_main = getattr(cli_mod, "main", None)
-            if patched_main is not None and getattr(patched_main, "__code__", None) is not _ORIGINAL_MAIN_CODE:
-                _in_patched_main = True
-                try:
-                    return patched_main(argv)
-                finally:
-                    _in_patched_main = False
-
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(level=args.log_level, json_logs=bool(args.json_logs))
 
     if args.subcommand == "run":
         cmd = list(args.command)
         if cmd and cmd[0] == "--":
             cmd = cmd[1:]
-        if not cmd:
-            parser.error("lkmp run requires a command after '--'")
+        if not cmd and args.profile != "qemu":
+            parser.error("lkmp run requires a command after '--' (unless --profile=qemu)")
         env_cfg = EnvelopeConfig(
             workload_id=args.workload_id,
             command=cmd,
@@ -499,23 +545,38 @@ def main(argv: Optional[List[str]] = None) -> int:
             ip_address=args.ip_address,
             net_interface=args.iface,
             use_time_ns=not args.no_time_ns,
+            profile=args.profile,
+            memory_mb=args.memory_mb,
+            vcpus=args.vcpus,
+            disk_path=args.disk_path,
         )
         mgr = EnvelopeManager()
         if args.dry_run:
-            print(" ".join(mgr.build_unshare_command(env_cfg)))
+            print(" ".join(mgr.build_launch_command(env_cfg)))
             return 0
         pid = mgr.launch(env_cfg)
-        print(json.dumps({"workload_id": args.workload_id, "host_pid": pid}))
+        print(json.dumps({"workload_id": args.workload_id, "profile": args.profile, "host_pid": pid}))
         return 0
 
     if args.subcommand == "agent":
+        cpus = (
+            [int(c.strip()) for c in args.cpu_affinity.split(",") if c.strip()]
+            if args.cpu_affinity
+            else None
+        )
+        if args.rt_priority > 0 or args.mlockall or cpus:
+            apply_realtime_agent_tuning(
+                rt_priority=args.rt_priority,
+                lock_memory=bool(args.mlockall),
+                cpu_affinity=cpus,
+            )
         tls = TlsConfig(
             enabled=not args.no_tls,
             ca_cert=args.tls_ca,
             cert_file=args.tls_cert,
             key_file=args.tls_key,
         )
-        service = AgentService(work_dir=args.work_dir)
+        service = AgentService(work_dir=args.work_dir, prefer_tmpfs=bool(args.prefer_tmpfs))
         server = AgentServer(
             host=args.host,
             port=args.port,
@@ -524,12 +585,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             metrics_port=args.metrics_port,
         )
         metrics_note = f", metrics_port={args.metrics_port}" if args.metrics_port else ""
-        print(f"lkmp-agent listening on {args.host}:{args.port} (work_dir={args.work_dir}{metrics_note})")
+        print(f"lkmp-agent listening on {args.host}:{args.port} (work_dir={service.work_dir}{metrics_note})")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             server.shutdown()
         return 0
+
+    if args.subcommand == "doctor":
+        if args.agent:
+            tls = TlsConfig(
+                enabled=not args.no_tls,
+                ca_cert=args.tls_ca,
+                cert_file=args.tls_cert,
+                key_file=args.tls_key,
+            )
+            with AgentClient(args.agent, tls=tls) as client:
+                diag = client.call("diagnose_workload", pid=args.pid)
+        else:
+            diag = diagnose_workload_porting(args.pid, proc_root=args.proc_root)
+
+        if args.json:
+            print(json.dumps(diag, indent=2))
+        else:
+            print(render_workload_doctor_report(diag))
+        return 0 if diag.get("ready") else 2
 
     if args.subcommand == "preflight":
         cfg = _build_migration_config(args)
@@ -573,10 +653,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             print(json.dumps(payload, indent=2))
         else:
-            if render_portability_report is not None:
-                print(render_portability_report(report))
-            else:
-                print(_fallback_render_portability_report(report))
+            print(render_portability_report(report))
         valid_statuses = (
             PortabilityStatus.VERIFIED,
             PortabilityStatus.UNKNOWN,
@@ -832,9 +909,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if all_passed else 1
 
     return 1
-
-
-_ORIGINAL_MAIN_CODE = main.__code__
 
 
 if __name__ == "__main__":

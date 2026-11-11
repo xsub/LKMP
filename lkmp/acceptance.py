@@ -21,12 +21,12 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from lkmp.agent import AgentClient, AgentServer, AgentService, config_from_dict, config_to_dict
-from lkmp.attestation import CheckpointAttestor, generate_ephemeral_key_hex
+from lkmp.agent import AgentClient, AgentService, config_to_dict
+from lkmp.attestation import generate_ephemeral_key_hex
 from lkmp.config import (
     FilesystemMode,
     IpMobilityMode,
@@ -38,13 +38,10 @@ from lkmp.criu_driver import CriuDriver
 from lkmp.envelope import EnvelopeManager
 from lkmp.fs_sync import (
     FilesystemSyncManager,
-    cow_clone_directory,
-    is_same_host_or_shared_storage,
 )
 from lkmp.gang import GangMigrationCoordinator
-from lkmp.journal import MigrationJournal
 from lkmp.models import MigrationResult, MigrationState
-from lkmp.network import NetworkMobilityManager, set_pid_tcp_repair, set_tree_tcp_repair
+from lkmp.network import NetworkMobilityManager, set_tree_tcp_repair
 from lkmp.orchestrator import MigrationOrchestrator
 from lkmp.preflight import read_proc_starttime
 
@@ -2227,7 +2224,11 @@ def run_acceptance_scenario(
             prng_exact_match = actual_hexes == expected_hexes
 
             # Invariant 4: fsynced disk records in state.log match exactly 20 records
-            log_lines = [l.strip() for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            log_lines = [
+                raw_ln.strip()
+                for raw_ln in log_path.read_text(encoding="utf-8").splitlines()
+                if raw_ln.strip()
+            ]
             file_records_verified = len(log_lines)
             file_records_intact = file_records_verified == 20
 

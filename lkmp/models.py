@@ -103,6 +103,10 @@ class HostCapabilities:
     criu_checked_features: Dict[str, bool] = field(default_factory=dict)
     host_id: Optional[str] = None
     work_dir_free_bytes: Optional[int] = None
+    qemu_available: Optional[bool] = None
+    qemu_version: Optional[str] = None
+    podman_available: Optional[bool] = None
+    tmpfs_available_bytes: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -130,6 +134,8 @@ class ProcessSnapshotInfo:
     in_envelope: bool = False
     cgroup_path: Optional[str] = None
     dirty_rate_actively_sampled: bool = False
+    workload_kind: str = "posix"
+    runtime_profile: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -142,6 +148,8 @@ class ProcessSnapshotInfo:
             "in_envelope": self.in_envelope,
             "cgroup_path": self.cgroup_path,
             "dirty_rate_actively_sampled": self.dirty_rate_actively_sampled,
+            "workload_kind": self.workload_kind,
+            "runtime_profile": self.runtime_profile,
         }
 
     @classmethod
@@ -156,6 +164,8 @@ class ProcessSnapshotInfo:
             in_envelope=bool(data.get("in_envelope", False)),
             cgroup_path=data.get("cgroup_path"),
             dirty_rate_actively_sampled=bool(data.get("dirty_rate_actively_sampled", False)),
+            workload_kind=str(data.get("workload_kind", "posix")),
+            runtime_profile=data.get("runtime_profile"),
         )
 
 

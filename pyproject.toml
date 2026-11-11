@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lkmp"
-version = "0.2.0"
-description = "Linux Kernel/Process Live Migration Orchestrator built on top of CRIU"
+version = "0.3.0"
+description = "Real-Time Zero-Copy Linux Process, Container & VM Live Migration Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -39,3 +39,10 @@ include = ["lkmp*"]
 
 [tool.setuptools.package-data]
 lkmp = ["py.typed"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

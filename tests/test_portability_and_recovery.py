@@ -12,43 +12,29 @@ Verifies:
 
 from __future__ import annotations
 
-import argparse
-import dataclasses
-from enum import Enum
 import io
 import json
 import os
 from pathlib import Path
-import select
 import shlex
-import shutil
-import signal
-import socket
 import subprocess
-import sys
 import tempfile
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, List
 import unittest
 from unittest.mock import MagicMock, patch
 
-from lkmp.agent import AgentClient, AgentServer, AgentService, config_to_dict
-from lkmp.cli import build_parser, main as cli_main
+from lkmp.agent import AgentClient, AgentService, config_to_dict
+from lkmp.cli import main as cli_main
 from lkmp.config import (
-    FilesystemMode,
-    IpMobilityMode,
     MigrationConfig,
-    MigrationStrategy,
     TlsConfig,
 )
 from lkmp.criu_driver import CriuDriver
 from lkmp.envelope import EnvelopeManager
 from lkmp.fs_sync import FilesystemSyncManager
-from lkmp.journal import MigrationJournal
 from lkmp.models import (
     HostCapabilities,
-    MigrationResult,
-    MigrationState,
-    ProcessSnapshotInfo,
+    PortabilityStatus,
     ResourceClassification,
     ResourceFinding,
 )
@@ -56,458 +42,9 @@ from lkmp.network import NetworkMobilityManager
 from lkmp.orchestrator import MigrationOrchestrator
 import lkmp.preflight
 from lkmp.preflight import (
-    discover_process_tree_pids,
-    evaluate_compatibility,
-    inspect_process_tree as _orig_inspect_process_tree,
-    read_proc_starttime,
+    assess_portability,
+    evaluate_portability,
 )
-
-
-# --- Portability State Definitions & Enum Extension ---
-
-class PortabilityStatus(str, Enum):
-    """Portability classification states."""
-
-    BLOCKED = "BLOCKED"
-    PREPARE = "PREPARE"
-    UNKNOWN = "UNKNOWN"
-    VERIFIED = "VERIFIED"
-
-
-# Attach PortabilityStatus to lkmp.preflight and lkmp.models
-setattr(lkmp.preflight, "PortabilityStatus", PortabilityStatus)
-import lkmp.models
-setattr(lkmp.models, "PortabilityStatus", PortabilityStatus)
-
-# Ensure ResourceClassification has UNKNOWN member
-if not hasattr(ResourceClassification, "UNKNOWN"):
-    try:
-        setattr(ResourceClassification, "UNKNOWN", "unknown")
-    except Exception:
-        pass
-
-
-# --- Enhanced Process Tree Inspection with Child PID Inspection & Pipe Classification ---
-
-def enhanced_inspect_process_tree(
-    pid: int,
-    proc_root: str = "/proc",
-    ghost_limit_bytes: int = 64 * 1024 * 1024,
-) -> ProcessSnapshotInfo:
-    """
-    Enhanced inspect_process_tree inspecting root PID AND all child PIDs:
-    - Recursively inspects child PIDs found in /proc/<pid>/task/*/children and /proc/*/stat.
-    - Classifies internal pipes (both ends inside tree) as OK, external pipes as UNKNOWN.
-    - Classifies sockets as NEEDS_FLAG (--tcp-established).
-    - Classifies anon_inode:[eventpoll] as OK, unknown anon_inodes as UNKNOWN.
-    - Surfaces blockers/findings from all child processes.
-    """
-    root_proc = Path(proc_root) / str(pid)
-    if not root_proc.exists():
-        raise FileNotFoundError(f"Process {pid} does not exist in {proc_root}")
-
-    # Discover all process tree PIDs
-    tree_pids = discover_process_tree_pids(pid, proc_root=proc_root)
-    # Also check /proc/<pid>/task/*/children explicitly
-    task_dir = root_proc / "task"
-    if task_dir.exists():
-        for tid in task_dir.iterdir():
-            ch_file = tid / "children"
-            if ch_file.exists():
-                for tok in ch_file.read_text(encoding="utf-8", errors="ignore").split():
-                    if tok.isdigit() and int(tok) not in tree_pids:
-                        tree_pids.append(int(tok))
-
-    child_pids = [p for p in tree_pids if p != pid]
-
-    # First pass: collect all pipe references across the entire process tree
-    pipe_occurrences: Dict[str, List[Tuple[int, str]]] = {}
-    for p in tree_pids:
-        p_fd_dir = Path(proc_root) / str(p) / "fd"
-        if p_fd_dir.exists():
-            try:
-                for fd_entry in p_fd_dir.iterdir():
-                    try:
-                        target = os.readlink(fd_entry)
-                        if target.startswith("pipe:["):
-                            pipe_occurrences.setdefault(target, []).append((p, fd_entry.name))
-                    except OSError:
-                        pass
-            except OSError:
-                pass
-
-    # Second pass: inspect each process in the tree
-    all_findings: List[ResourceFinding] = []
-    total_rss = 0
-    in_envelope = False
-    cgroup_path: Optional[str] = None
-    all_files: List[Any] = []
-
-    for curr_pid in tree_pids:
-        curr_dir = Path(proc_root) / str(curr_pid)
-        if not curr_dir.exists():
-            continue
-
-        # Inspect status
-        status_file = curr_dir / "status"
-        if status_file.exists():
-            for line in status_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if line.startswith("VmRSS:"):
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        total_rss += int(parts[1]) * 1024
-                elif line.startswith("TracerPid:"):
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) != 0:
-                        all_findings.append(
-                            ResourceFinding(
-                                resource_type="ptrace",
-                                identifier=f"TracerPid:{parts[1]}",
-                                classification=ResourceClassification.BLOCKER,
-                                reason=f"Process {curr_pid} is currently traced by PID {parts[1]}",
-                            )
-                        )
-                elif curr_pid == pid and line.startswith("NSpid:"):
-                    parts = line.split()[1:]
-                    if len(parts) > 1 or (len(parts) == 1 and parts[0] == "1"):
-                        in_envelope = True
-
-        # Inspect cgroup
-        if curr_pid == pid:
-            cg_file = curr_dir / "cgroup"
-            if cg_file.exists():
-                for line in cg_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    if line.startswith("0::"):
-                        cgroup_path = line.split("0::", 1)[1].strip()
-                        if "/lkmp/" in cgroup_path:
-                            in_envelope = True
-
-        # Inspect maps
-        maps_file = curr_dir / "maps"
-        if maps_file.exists():
-            for line in maps_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                parts = line.split(None, 5)
-                if len(parts) < 6:
-                    continue
-                perms = parts[1]
-                pathname = parts[5].strip()
-                if not pathname or pathname.startswith("["):
-                    continue
-                is_del = pathname.endswith(" (deleted)")
-                clean = pathname[:-10] if is_del else pathname
-                if clean.startswith("/dev/nvidia"):
-                    all_findings.append(
-                        ResourceFinding(
-                            resource_type="gpu_device",
-                            identifier=clean,
-                            classification=ResourceClassification.NEEDS_FLAG,
-                            reason="NVIDIA GPU device open; requires cuda-checkpoint plugin",
-                            suggested_flag="--gpu-plugin cuda-checkpoint",
-                        )
-                    )
-                elif clean.startswith("/dev/") and not any(clean.startswith(pfx) for pfx in ("/dev/null", "/dev/zero", "/dev/urandom", "/dev/shm/")):
-                    all_findings.append(
-                        ResourceFinding(
-                            resource_type="mmap",
-                            identifier=clean,
-                            classification=ResourceClassification.BLOCKER,
-                            reason=f"Non-migratable hardware device {clean}",
-                        )
-                    )
-                elif is_del:
-                    # Check ghost file
-                    size = 0
-                    if os.path.exists(clean):
-                        try:
-                            size = os.path.getsize(clean)
-                        except OSError:
-                            pass
-                    if size > ghost_limit_bytes:
-                        all_findings.append(
-                            ResourceFinding(
-                                resource_type="ghost_file",
-                                identifier=clean,
-                                classification=ResourceClassification.NEEDS_FLAG,
-                                reason=f"Deleted mapped file ({size} bytes) exceeds default ghost limit",
-                                suggested_flag=f"--ghost-limit {size + 1024 * 1024}",
-                            )
-                        )
-
-        # Inspect fds
-        fd_dir = curr_dir / "fd"
-        if fd_dir.exists():
-            try:
-                for fd_entry in fd_dir.iterdir():
-                    try:
-                        target = os.readlink(fd_entry)
-                    except OSError:
-                        continue
-
-                    # io_uring blocker
-                    if "io_uring" in target:
-                        all_findings.append(
-                            ResourceFinding(
-                                resource_type="fd",
-                                identifier=f"fd:{fd_entry.name}->{target}",
-                                classification=ResourceClassification.BLOCKER,
-                                reason="Kernel io_uring rings cannot be safely checkpointed by CRIU",
-                            )
-                        )
-                    # Pipe classification
-                    elif target.startswith("pipe:["):
-                        pipe_refs = pipe_occurrences.get(target, [])
-                        if len(pipe_refs) >= 2:
-                            # Both ends inside tree -> OK
-                            all_findings.append(
-                                ResourceFinding(
-                                    resource_type="pipe",
-                                    identifier=target,
-                                    classification=ResourceClassification.OK,
-                                    reason="Internal pipe with both ends inside process tree",
-                                )
-                            )
-                        else:
-                            # Only one end inside tree -> UNKNOWN
-                            all_findings.append(
-                                ResourceFinding(
-                                    resource_type="pipe",
-                                    identifier=target,
-                                    classification=getattr(ResourceClassification, "UNKNOWN", ResourceClassification.OK),
-                                    reason="external_pipe: pipe with only one end inside process tree",
-                                )
-                            )
-                    # Socket classification
-                    elif target.startswith("socket:["):
-                        all_findings.append(
-                            ResourceFinding(
-                                resource_type="socket",
-                                identifier=target,
-                                classification=ResourceClassification.NEEDS_FLAG,
-                                reason="Active stream socket requires TCP preservation flag",
-                                suggested_flag="--tcp-established",
-                            )
-                        )
-                    # anon_inode classification
-                    elif target.startswith("anon_inode:["):
-                        if any(k in target for k in ("eventpoll", "epoll", "signalfd", "timerfd", "inotify")):
-                            all_findings.append(
-                                ResourceFinding(
-                                    resource_type="anon_inode",
-                                    identifier=target,
-                                    classification=ResourceClassification.OK,
-                                    reason="Migratable anonymous inode descriptor",
-                                )
-                            )
-                        else:
-                            all_findings.append(
-                                ResourceFinding(
-                                    resource_type="anon_inode",
-                                    identifier=target,
-                                    classification=getattr(ResourceClassification, "UNKNOWN", ResourceClassification.BLOCKER),
-                                    reason=f"Unknown anonymous driver descriptor: {target}",
-                                )
-                            )
-                    # Device classification
-                    elif target.startswith("/dev/nvidia"):
-                        all_findings.append(
-                            ResourceFinding(
-                                resource_type="gpu_device",
-                                identifier=target,
-                                classification=ResourceClassification.NEEDS_FLAG,
-                                reason="NVIDIA GPU device open; requires cuda-checkpoint plugin",
-                                suggested_flag="--gpu-plugin cuda-checkpoint",
-                            )
-                        )
-                    elif target.startswith("/dev/") and not any(target.startswith(p) for p in ("/dev/null", "/dev/zero", "/dev/urandom", "/dev/shm/")):
-                        all_findings.append(
-                            ResourceFinding(
-                                resource_type="fd",
-                                identifier=target,
-                                classification=ResourceClassification.BLOCKER,
-                                reason=f"Non-migratable hardware device {target}",
-                            )
-                        )
-                    # Deleted ghost file check on fd
-                    elif target.endswith(" (deleted)"):
-                        clean_target = target[:-10]
-                        size = 0
-                        if os.path.exists(clean_target):
-                            try:
-                                size = os.path.getsize(clean_target)
-                            except OSError:
-                                pass
-                        if size > ghost_limit_bytes:
-                            all_findings.append(
-                                ResourceFinding(
-                                    resource_type="ghost_file",
-                                    identifier=clean_target,
-                                    classification=ResourceClassification.NEEDS_FLAG,
-                                    reason=f"Deleted open file ({size} bytes) exceeds ghost limit",
-                                    suggested_flag=f"--ghost-limit {size + 1024 * 1024}",
-                                )
-                            )
-            except OSError:
-                pass
-
-    return ProcessSnapshotInfo(
-        root_pid=pid,
-        child_pids=child_pids,
-        rss_bytes=total_rss,
-        dirty_rate_bytes_per_sec=0,
-        files=[],
-        findings=all_findings,
-        in_envelope=in_envelope,
-        cgroup_path=cgroup_path,
-    )
-
-
-# Monkeypatch inspect_process_tree into lkmp.preflight
-lkmp.preflight.inspect_process_tree = enhanced_inspect_process_tree
-
-
-# --- Portability Evaluator & Assessor ---
-
-def evaluate_portability(
-    snapshot_or_report: Any = None,
-    dirty_rate_actively_sampled: bool = False,
-    trial_restore_passed: bool = False,
-    config: Optional[MigrationConfig] = None,
-    source_caps: Optional[HostCapabilities] = None,
-    dest_caps: Optional[HostCapabilities] = None,
-    findings: Optional[List[ResourceFinding]] = None,
-) -> PortabilityStatus:
-    """
-    Evaluate process portability into 4 mutually exclusive states:
-    - BLOCKED: unmigratable blocker present (e.g. io_uring, missing ISA flags, non-whitelisted hardware).
-    - PREPARE: migratable with specific flags/preparation (e.g. ghost file needing --ghost-limit, --tcp-established).
-    - UNKNOWN: static /proc inspection without actively sampled dirty-rate convergence or trial restore.
-    - VERIFIED: passed preflight AND verified via isolated trial restore on Destination B with clean rollback.
-    """
-    all_findings: List[ResourceFinding] = []
-    if isinstance(snapshot_or_report, ProcessSnapshotInfo):
-        all_findings.extend(snapshot_or_report.findings)
-    elif hasattr(snapshot_or_report, "findings"):
-        all_findings.extend(snapshot_or_report.findings)
-    elif isinstance(snapshot_or_report, list):
-        all_findings.extend(snapshot_or_report)
-
-    if findings:
-        all_findings.extend(findings)
-
-    # Missing ISA instruction checks
-    if source_caps is not None and dest_caps is not None:
-        from lkmp.preflight import CRITICAL_ISA_FLAGS
-        missing_isa = (source_caps.cpu_flags & CRITICAL_ISA_FLAGS) - dest_caps.cpu_flags
-        if missing_isa:
-            return PortabilityStatus.BLOCKED
-
-    has_blocker = False
-    has_prepare = False
-
-    for f in all_findings:
-        c = f.classification
-        c_val = getattr(c, "value", str(c)).lower()
-        if c_val == "blocker" or c == ResourceClassification.BLOCKER:
-            has_blocker = True
-        elif c_val == "needs_flag" or c == ResourceClassification.NEEDS_FLAG or f.suggested_flag:
-            has_prepare = True
-
-    if has_blocker:
-        return PortabilityStatus.BLOCKED
-
-    if has_prepare:
-        return PortabilityStatus.PREPARE
-
-    # VERIFIED only if isolated trial restore passed
-    if trial_restore_passed:
-        return PortabilityStatus.VERIFIED
-
-    # Static inspection without trial restore or active dirty sampling remains UNKNOWN
-    return PortabilityStatus.UNKNOWN
-
-
-def assess_portability(
-    config: MigrationConfig,
-    source_client: AgentClient,
-    dest_client: AgentClient,
-    run_check_only: bool = True,
-    run_trial_restore: bool = False,
-    proc_root: str = "/proc",
-) -> PortabilityStatus:
-    """Run preflight check and optional isolated trial restore on Destination B with rollback to Source A."""
-    j_dir = config.journal_dir if (run_trial_restore and config.journal_dir != "/var/lib/lkmp/journals") else None
-    cfg_copy = dataclasses.replace(config, journal_dir=j_dir)
-    orch = MigrationOrchestrator(cfg_copy, source_client, dest_client, journal_dir=j_dir)
-    report = orch.run_preflight()
-    if not report.compatible or report.blockers:
-        return PortabilityStatus.BLOCKED
-
-    if report.required_criu_flags:
-        return PortabilityStatus.PREPARE
-
-    if run_trial_restore:
-        # Isolated trial restore on Destination B: prepare stopped -> verify stopped -> rollback
-        prep = orch.execute_prepare_phase(keep_stopped_on_prepare=True)
-        if not prep.success:
-            return PortabilityStatus.BLOCKED
-        rb = orch.rollback("Trial restore passed successfully; clean rollback to Source A")
-        if rb.rolled_back or prep.success:
-            return PortabilityStatus.VERIFIED
-        return PortabilityStatus.UNKNOWN
-
-    return PortabilityStatus.UNKNOWN
-
-
-# Attach to lkmp.preflight
-setattr(lkmp.preflight, "evaluate_portability", evaluate_portability)
-setattr(lkmp.preflight, "assess_portability", assess_portability)
-
-
-# --- CLI Portability & Migrate Parser Extensions ---
-
-_orig_build_parser = lkmp.cli.build_parser
-
-def enhanced_build_parser() -> argparse.ArgumentParser:
-    parser = _orig_build_parser()
-    subparsers_action = None
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            subparsers_action = action
-            break
-
-    if subparsers_action is not None and "portability" not in subparsers_action.choices:
-        port_p = subparsers_action.add_parser(
-            "portability",
-            help="Assess process-tree migration portability and readiness",
-        )
-        lkmp.cli._add_common_migration_args(port_p)
-        port_p.add_argument("--trial-restore", action="store_true", help="Execute isolated trial restore")
-
-    return parser
-
-lkmp.cli.build_parser = enhanced_build_parser
-
-_orig_cli_main = lkmp.cli.main
-
-def enhanced_cli_main(argv: Optional[List[str]] = None) -> int:
-    args_list = argv if argv is not None else sys.argv[1:]
-    if args_list and args_list[0] == "portability":
-        parser = lkmp.cli.build_parser()
-        parsed = parser.parse_args(args_list)
-        report_data = {
-            "status": "UNKNOWN",
-            "findings": [],
-            "compatible": True,
-            "workload_id": getattr(parsed, "workload_id", None),
-        }
-        if parsed.json:
-            print(json.dumps(report_data, indent=2))
-        else:
-            print(f"Portability Status: {report_data['status']}")
-        return 0
-    return _orig_cli_main(argv)
-
-lkmp.cli.main = enhanced_cli_main
 
 
 # ==============================================================================
@@ -906,31 +443,6 @@ class TestPortabilityAndRecovery(unittest.TestCase):
             wal_dir = Path(tmp) / "journals"
             wal_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Test `lkmp portability --json`
-            captured_stdout = io.StringIO()
-            with patch("sys.stdout", captured_stdout):
-                code = cli_main([
-                    "portability",
-                    "--pid", "1234",
-                    "--source", "10.0.0.1:9700",
-                    "--dest", "10.0.0.2:9700",
-                    "--json",
-                    "--no-tls",
-                ])
-            self.assertEqual(code, 0)
-            output = captured_stdout.getvalue()
-            parsed_json = json.loads(output)
-            self.assertIn("status", parsed_json)
-
-            # 2. Test `lkmp migrate` creates .wal.jsonl in --journal-dir
-            cfg = MigrationConfig(
-                pid=1234,
-                source_addr="10.0.0.1:9700",
-                dest_addr="10.0.0.2:9700",
-                journal_dir=str(wal_dir),
-                tls=TlsConfig(enabled=False),
-            )
-
             # Mock AgentClients
             mock_src = MagicMock(spec=AgentClient)
             mock_src.host = "10.0.0.1"
@@ -956,6 +468,34 @@ class TestPortabilityAndRecovery(unittest.TestCase):
                 "verify_process": {"healthy": True},
                 "cleanup_dest": {},
             }.get(method, {})
+
+            # 1. Test real `lkmp portability --json` CLI path against mocked AgentClients
+            captured_stdout = io.StringIO()
+            with patch(
+                "lkmp.cli.AgentClient",
+                side_effect=lambda addr, **kw: mock_src if "10.0.0.1" in addr else mock_dst,
+            ), patch("sys.stdout", captured_stdout):
+                code = cli_main([
+                    "portability",
+                    "--pid", "1234",
+                    "--source", "10.0.0.1:9700",
+                    "--dest", "10.0.0.2:9700",
+                    "--json",
+                    "--no-tls",
+                ])
+            self.assertEqual(code, 0)
+            output = captured_stdout.getvalue()
+            parsed_json = json.loads(output)
+            self.assertIn("status", parsed_json)
+
+            # 2. Test `lkmp migrate` creates .wal.jsonl in --journal-dir
+            cfg = MigrationConfig(
+                pid=1234,
+                source_addr="10.0.0.1:9700",
+                dest_addr="10.0.0.2:9700",
+                journal_dir=str(wal_dir),
+                tls=TlsConfig(enabled=False),
+            )
 
             orch = MigrationOrchestrator(
                 config=cfg,

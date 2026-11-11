@@ -11,14 +11,12 @@ import unittest
 from pathlib import Path
 
 from lkmp.acceptance import (
-    DEFAULT_PRNG_SEED,
     AcceptanceScenarioResult,
     DeterministicWorkloadService,
     WorkloadClient,
     render_acceptance_report,
     run_acceptance_matrix,
     run_acceptance_scenario,
-    step_xorshift64star,
 )
 from lkmp.config import MigrationStrategy
 import socket

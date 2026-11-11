@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class MigrationStrategy(str, Enum):
@@ -78,6 +78,10 @@ class EnvelopeConfig:
     hostname: Optional[str] = None
     use_time_ns: bool = True
     state_dir: str = "/var/lib/lkmp/envelopes"
+    profile: str = "posix"
+    memory_mb: int = 512
+    vcpus: int = 2
+    disk_path: Optional[str] = None
 
 
 @dataclass
@@ -117,7 +121,14 @@ class MigrationConfig:
     check_only: bool = False
     trial_restore: bool = False
 
-    # CRIU & storage settings
+    # CRIU, hypervisor & zero-copy staging settings
+    workload_kind: str = "auto"
+    runtime_metadata: Dict[str, Any] = field(default_factory=dict)
+    prefer_tmpfs_work_dir: bool = False
+    auto_dedup: bool = False
+    inband_metadata_transfer: bool = True
+    qemu_multifd_channels: int = 1
+    qemu_zero_copy_send: bool = True
     work_dir: str = "/var/lib/lkmp/migrations"
     page_server_port: int = 27000
     lazy_pages_port: int = 27001

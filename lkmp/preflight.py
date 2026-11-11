@@ -8,9 +8,14 @@ import platform
 import struct
 import subprocess
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from lkmp.config import FilesystemMode, GpuPlugin, MigrationConfig, MigrationStrategy
+from lkmp.drivers.detector import (
+    WorkloadKind,
+    detect_workload_profile,
+    read_proc_starttime as read_proc_starttime,
+)
 from lkmp.models import (
     DomainPortabilityAssessment,
     FileArtifact,
@@ -177,16 +182,20 @@ def compute_file_sha256(file_path: str | Path, max_bytes: int = 16 * 1024 * 1024
     """Compute SHA-256 digest of a file (bounded to max_bytes for fast preflight)."""
     path = Path(file_path)
     try:
-        h = hashlib.sha256()
-        remaining = max_bytes
+        st_size = path.stat().st_size
+        file_digest = getattr(hashlib, "file_digest", None)
         with path.open("rb") as f:
+            if callable(file_digest) and st_size <= max_bytes:
+                return file_digest(f, "sha256").hexdigest()
+            h = hashlib.sha256()
+            remaining = max_bytes
             while remaining > 0:
-                chunk = f.read(min(65536, remaining))
+                chunk = f.read(min(262144, remaining))
                 if not chunk:
                     break
                 h.update(chunk)
                 remaining -= len(chunk)
-        return h.hexdigest()
+            return h.hexdigest()
     except OSError:
         return None
 
@@ -246,23 +255,6 @@ def collect_host_capabilities(proc_root: str = "/proc") -> HostCapabilities:
         has_cgroup_v2=has_cgroup_v2,
         host_id=host_id,
     )
-
-
-def read_proc_starttime(pid: int, proc_root: str = "/proc") -> Optional[int]:
-    """Read field 22 (starttime) from <proc_root>/<pid>/stat, returning None if unavailable."""
-    stat_file = Path(proc_root) / str(pid) / "stat"
-    try:
-        content = stat_file.read_text(encoding="utf-8", errors="ignore")
-        rparen = content.rfind(")")
-        if rparen != -1:
-            fields = content[rparen + 1:].strip().split()
-            # field 3 is fields[0] (state)
-            # field 22 is fields[19] (starttime)
-            if len(fields) >= 20:
-                return int(fields[19])
-    except Exception:
-        pass
-    return None
 
 
 def _parse_stat_file_state(stat_file: Path) -> Optional[str]:
@@ -438,6 +430,10 @@ def inspect_process_tree(
     if not proc_dir.exists():
         raise FileNotFoundError(f"Process {pid} does not exist in {proc_root}")
 
+    # Detect VM / MicroVM / OCI container runtime profile
+    profile = detect_workload_profile(pid, proc_root=proc_root)
+    workload_kind = profile.kind.value
+
     # Discover ALL PIDs in the process tree
     tree_pids = discover_process_tree_pids(pid, proc_root=proc_root)
     child_pids = [p for p in tree_pids if p != pid]
@@ -446,8 +442,23 @@ def inspect_process_tree(
     files_by_path: Dict[str, FileArtifact] = {}
     pipe_holders: Dict[str, List[Tuple[int, str]]] = {}
     rss_bytes = 0
-    in_envelope = False
-    cgroup_path: Optional[str] = None
+    in_envelope = profile.kind in (
+        WorkloadKind.QEMU_VM,
+        WorkloadKind.MICROVM,
+        WorkloadKind.OCI_CONTAINER,
+    )
+    cgroup_path: Optional[str] = profile.cgroup_path
+
+    if profile.kind in (WorkloadKind.QEMU_VM, WorkloadKind.MICROVM):
+        for blk_reason in profile.blockers:
+            findings.append(
+                ResourceFinding(
+                    resource_type="hypervisor",
+                    identifier=f"pid:{pid}:{profile.kind.value}",
+                    classification=ResourceClassification.BLOCKER,
+                    reason=blk_reason,
+                )
+            )
 
     for curr_pid in tree_pids:
         curr_dir = Path(proc_root) / str(curr_pid)
@@ -506,7 +517,10 @@ def inspect_process_tree(
                 clean_path = pathname[:-10] if is_deleted else pathname
 
                 if clean_path.startswith("/dev/"):
-                    _classify_device(clean_path, "mmap", findings)
+                    _classify_device(clean_path, "mmap", findings, workload_kind=workload_kind)
+                    continue
+
+                if workload_kind in ("qemu", "microvm") and clean_path in profile.disk_paths:
                     continue
 
                 if clean_path not in files_by_path:
@@ -550,6 +564,7 @@ def inspect_process_tree(
                             ghost_limit_bytes,
                             curr_pid=curr_pid,
                             root_pid=pid,
+                            workload_kind=workload_kind,
                         )
             except OSError:
                 pass
@@ -557,26 +572,23 @@ def inspect_process_tree(
     # Process pipe holders across the whole tree
     for pipe_target, holders in pipe_holders.items():
         if len(holders) < 2:
-            for holder_pid, fd_num in holders:
-                findings.append(
-                    ResourceFinding(
-                        resource_type="external_pipe",
-                        identifier=f"pid:{holder_pid}:fd:{fd_num}->{pipe_target}",
-                        classification=ResourceClassification.UNKNOWN,
-                        reason="Pipe has only one endpoint inside process tree; external peer process may break on restore",
-                        suggested_flag="--inherit-fd",
-                    )
+            findings.append(
+                ResourceFinding(
+                    resource_type="external_pipe",
+                    identifier=pipe_target,
+                    classification=ResourceClassification.UNKNOWN,
+                    reason="Pipe has only one endpoint inside process tree; external peer process may break on restore",
                 )
+            )
         else:
-            for holder_pid, fd_num in holders:
-                findings.append(
-                    ResourceFinding(
-                        resource_type="pipe",
-                        identifier=f"pid:{holder_pid}:fd:{fd_num}->{pipe_target}",
-                        classification=ResourceClassification.OK,
-                        reason="Internal pipe shared within process tree",
-                    )
+            findings.append(
+                ResourceFinding(
+                    resource_type="pipe",
+                    identifier=pipe_target,
+                    classification=ResourceClassification.OK,
+                    reason="Internal pipe shared within process tree",
                 )
+            )
 
     dirty_rate_bps = 0
     dirty_rate_actively_sampled = False
@@ -615,6 +627,8 @@ def inspect_process_tree(
         in_envelope=in_envelope,
         cgroup_path=cgroup_path,
         dirty_rate_actively_sampled=dirty_rate_actively_sampled,
+        workload_kind=workload_kind,
+        runtime_profile=profile.to_dict(),
     )
 
 
@@ -650,8 +664,21 @@ def _classify_device(
     dev_path: str,
     source_kind: str,
     findings: List[ResourceFinding],
+    workload_kind: str = "posix",
 ) -> None:
     if any(dev_path.startswith(prefix) for prefix in ALLOWED_DEVICE_PREFIXES):
+        return
+    if workload_kind in ("qemu", "microvm") and (
+        dev_path == "/dev/kvm" or dev_path.startswith("/dev/vhost")
+    ):
+        findings.append(
+            ResourceFinding(
+                resource_type="device",
+                identifier=dev_path,
+                classification=ResourceClassification.OK,
+                reason=f"Hypervisor device {dev_path} migrated natively by {workload_kind} driver",
+            )
+        )
         return
     if dev_path.startswith("/dev/nvidia"):
         findings.append(
@@ -692,10 +719,13 @@ def _classify_fd_target(
     ghost_limit_bytes: int,
     curr_pid: int = 0,
     root_pid: int = 0,
+    workload_kind: str = "posix",
 ) -> None:
     ident = f"fd:{fd_num}->{target}" if (curr_pid == 0 or curr_pid == root_pid) else f"pid:{curr_pid}:fd:{fd_num}->{target}"
 
     if "io_uring" in target:
+        if workload_kind in ("qemu", "microvm"):
+            return
         findings.append(
             ResourceFinding(
                 resource_type="anon_inode",
@@ -707,10 +737,12 @@ def _classify_fd_target(
         return
 
     if target.startswith("socket:"):
+        if workload_kind in ("qemu", "microvm"):
+            return
         findings.append(
             ResourceFinding(
                 resource_type="socket",
-                identifier=f"pid:{curr_pid}:fd:{fd_num}->{target}",
+                identifier=target,
                 classification=ResourceClassification.NEEDS_FLAG,
                 reason="Active socket requires --tcp-established or --ext-unix-sk verification",
                 suggested_flag="--tcp-established",
@@ -719,11 +751,21 @@ def _classify_fd_target(
         return
 
     if target.startswith("anon_inode:"):
-        if any(k in target for k in ("eventpoll", "eventfd", "timerfd", "signalfd", "inotify")):
+        if workload_kind in ("qemu", "microvm") and ("kvm-" in target or "vhost" in target):
             findings.append(
                 ResourceFinding(
                     resource_type="anon_inode",
-                    identifier=ident,
+                    identifier=target,
+                    classification=ResourceClassification.OK,
+                    reason=f"Hypervisor descriptor {target} migrated natively by {workload_kind} driver",
+                )
+            )
+            return
+        if any(k in target for k in ("eventpoll", "epoll", "eventfd", "timerfd", "signalfd", "inotify")):
+            findings.append(
+                ResourceFinding(
+                    resource_type="anon_inode",
+                    identifier=target,
                     classification=ResourceClassification.OK,
                     reason=f"Standard supported anonymous inode {target}",
                 )
@@ -732,7 +774,7 @@ def _classify_fd_target(
             findings.append(
                 ResourceFinding(
                     resource_type="anon_inode",
-                    identifier=ident,
+                    identifier=target,
                     classification=ResourceClassification.UNKNOWN,
                     reason=f"Unverified kernel anonymous inode {target} requires --check-only or trial restore",
                 )
@@ -743,7 +785,7 @@ def _classify_fd_target(
     clean_path = target[:-10] if is_deleted else target
 
     if clean_path.startswith("/dev/"):
-        _classify_device(clean_path, "fd", findings)
+        _classify_device(clean_path, "fd", findings, workload_kind=workload_kind)
         return
 
     if clean_path.startswith(("/run/dbus/", "/run/systemd/", "/var/run/dbus/")):
@@ -800,6 +842,7 @@ def evaluate_portability(
             source_addr="127.0.0.1:9700",
             dest_addr="127.0.0.1:9700",
             strategy=MigrationStrategy.COLD,
+            tcp_established=False,
         )
     if source_caps is None:
         source_caps = HostCapabilities(arch="x86_64", kernel_release="", cpu_vendor="", criu_available=True, has_soft_dirty=True)
@@ -821,32 +864,63 @@ def evaluate_portability(
             in_envelope=snapshot.in_envelope,
             cgroup_path=snapshot.cgroup_path,
             dirty_rate_actively_sampled=snapshot.dirty_rate_actively_sampled or dirty_rate_actively_sampled,
+            workload_kind=snapshot.workload_kind,
+            runtime_profile=snapshot.runtime_profile,
         )
     if dest_files is None:
         dest_files = {}
 
-    findings: List[ResourceFinding] = list(snapshot.findings)
+    effective_kind = (
+        config.workload_kind
+        if config.workload_kind and config.workload_kind != "auto"
+        else snapshot.workload_kind
+    )
+    uses_hypervisor_driver = effective_kind in ("qemu", "microvm")
+
+    findings_list: List[ResourceFinding] = list(snapshot.findings)
     required_flags: List[str] = []
 
-    # 1. CRIU availability check on both hosts
-    if not source_caps.criu_available:
-        findings.append(
-            ResourceFinding(
-                resource_type="criu",
-                identifier="source_criu",
-                classification=ResourceClassification.BLOCKER,
-                reason="CRIU binary is not available or failed check on source host",
+    # 1. Runtime engine availability check on both hosts
+    if uses_hypervisor_driver:
+        if effective_kind == "qemu":
+            if source_caps.qemu_available is False:
+                findings_list.append(
+                    ResourceFinding(
+                        resource_type="hypervisor",
+                        identifier="source_qemu",
+                        classification=ResourceClassification.BLOCKER,
+                        reason="QEMU hypervisor binary is not available on source host",
+                    )
+                )
+            if dest_caps.qemu_available is False:
+                findings_list.append(
+                    ResourceFinding(
+                        resource_type="hypervisor",
+                        identifier="dest_qemu",
+                        classification=ResourceClassification.BLOCKER,
+                        reason="QEMU hypervisor binary is not available on destination host",
+                    )
+                )
+    else:
+        if not source_caps.criu_available:
+            findings_list.append(
+                ResourceFinding(
+                    resource_type="criu",
+                    identifier="source_criu",
+                    classification=ResourceClassification.BLOCKER,
+                    reason="CRIU binary is not available or failed check on source host",
+                )
             )
-        )
-    if not dest_caps.criu_available:
-        findings.append(
-            ResourceFinding(
-                resource_type="criu",
-                identifier="dest_criu",
-                classification=ResourceClassification.BLOCKER,
-                reason="CRIU binary is not available or failed check on destination host",
+        if not dest_caps.criu_available:
+            findings_list.append(
+                ResourceFinding(
+                    resource_type="criu",
+                    identifier="dest_criu",
+                    classification=ResourceClassification.BLOCKER,
+                    reason="CRIU binary is not available or failed check on destination host",
+                )
             )
-        )
+    findings = findings_list
 
     # 2. Architecture check
     if source_caps.arch != dest_caps.arch:
@@ -890,7 +964,7 @@ def evaluate_portability(
                 )
             )
 
-    if config.strategy in (MigrationStrategy.PRE_COPY, MigrationStrategy.HYBRID):
+    if not uses_hypervisor_driver and config.strategy in (MigrationStrategy.PRE_COPY, MigrationStrategy.HYBRID):
         if not source_caps.has_soft_dirty:
             findings.append(
                 ResourceFinding(
@@ -901,8 +975,8 @@ def evaluate_portability(
                 )
             )
 
-    # CRIU extra features check
-    if source_caps.criu_check_extra_ok is False:
+    # CRIU extra features check (only for CRIU-backed workloads)
+    if not uses_hypervisor_driver and source_caps.criu_check_extra_ok is False:
         findings.append(
             ResourceFinding(
                 resource_type="criu",
@@ -911,7 +985,7 @@ def evaluate_portability(
                 reason="CRIU check --extra failed on source host; missing required kernel features",
             )
         )
-    if dest_caps.criu_check_extra_ok is False:
+    if not uses_hypervisor_driver and dest_caps.criu_check_extra_ok is False:
         findings.append(
             ResourceFinding(
                 resource_type="criu",
@@ -988,10 +1062,15 @@ def evaluate_portability(
     for src_file in snapshot.files:
         if src_file.is_deleted:
             continue
-        if config.fs_mode == FilesystemMode.RSYNC and any(
+        if effective_kind == "oci" and ("/overlay/" in src_file.path or "/containers/storage/" in src_file.path):
+            continue
+        if effective_kind in ("qemu", "microvm") and config.fs_mode == FilesystemMode.RSYNC:
+            continue
+        is_declared_writable = any(
             src_file.path.startswith(wp.rstrip("/") + "/") or src_file.path == wp
             for wp in config.writable_paths
-        ):
+        )
+        if config.fs_mode == FilesystemMode.RSYNC and is_declared_writable:
             continue
 
         dst_file = dest_files.get(src_file.path)
@@ -1004,6 +1083,10 @@ def evaluate_portability(
                     reason=f"Required file {src_file.path} is missing on destination host",
                 )
             )
+            continue
+
+        if config.fs_mode == FilesystemMode.SHARED and is_declared_writable:
+            # Mounted on both hosts (`dst_file is not None`); online writes mutate size/sha256 before freeze
             continue
 
         if src_file.size != dst_file.size:
@@ -1070,7 +1153,7 @@ def evaluate_portability(
     if any(f.classification == ResourceClassification.BLOCKER for f in mem_findings):
         mem_status = PortabilityStatus.BLOCKED
         mem_summary = "Architecture, CPU ISA, CRIU, or kernel feature blocker detected"
-    elif source_caps.criu_check_extra_ok is False or dest_caps.criu_check_extra_ok is False:
+    elif not uses_hypervisor_driver and (source_caps.criu_check_extra_ok is False or dest_caps.criu_check_extra_ok is False):
         mem_status = PortabilityStatus.BLOCKED
         mem_summary = "CRIU extra feature check failed on host"
     elif trial_restore_passed:
@@ -1157,16 +1240,30 @@ def evaluate_portability(
     # Domain 5: external_resources
     ext_findings = [
         f for f in findings
-        if f.resource_type in ("ptrace", "namespace", "external_pipe", "anon_inode", "pipe")
+        if f.resource_type in ("ptrace", "namespace", "external_pipe", "anon_inode", "pipe", "hypervisor")
         or "io_uring" in f.identifier
     ]
     if any(
         f.classification == ResourceClassification.BLOCKER
-        and (f.resource_type in ("ptrace", "namespace") or "io_uring" in f.identifier)
-        for f in ext_findings
+        and (f.resource_type in ("ptrace", "namespace", "hypervisor", "fd", "anon_inode") or "io_uring" in f.identifier)
+        for f in ext_findings + [x for x in findings if x.classification == ResourceClassification.BLOCKER]
     ):
-        ext_status = PortabilityStatus.BLOCKED
-        ext_summary = "Process tracing, namespace isolation, or io_uring blocker detected"
+        if any(f.classification == ResourceClassification.BLOCKER for f in ext_findings) or any(
+            f.classification == ResourceClassification.BLOCKER
+            and f.resource_type not in ("arch", "cpu", "criu", "kernel", "memory", "file", "ghost_file", "disk", "socket", "network", "gpu_device", "device", "mmap")
+            for f in findings
+        ):
+            ext_status = PortabilityStatus.BLOCKED
+            ext_summary = "Process tracing, namespace isolation, hypervisor, or io_uring blocker detected"
+        elif trial_restore_passed:
+            ext_status = PortabilityStatus.VERIFIED
+            ext_summary = "External resources and namespaces verified portable via trial restore"
+        elif not snapshot.in_envelope:
+            ext_status = PortabilityStatus.UNKNOWN
+            ext_summary = "Process outside isolation envelope; external resources cannot be guaranteed"
+        else:
+            ext_status = PortabilityStatus.VERIFIED
+            ext_summary = "Process isolated in envelope; all anonymous inodes and pipes verified"
     elif any(f.classification == ResourceClassification.NEEDS_FLAG for f in ext_findings):
         ext_status = PortabilityStatus.PREPARE
         ext_summary = "External resources require flag configuration"
@@ -1274,4 +1371,33 @@ def evaluate_compatibility(
         findings=port_report.findings,
         portability_status=port_report.overall_status,
         domains=port_report.domains,
+    )
+
+
+def assess_portability(
+    config: MigrationConfig,
+    source_client: Any,
+    dest_client: Any,
+    run_check_only: bool = True,
+    run_trial_restore: bool = False,
+    proc_root: str = "/proc",
+) -> PortabilityReport:
+    """
+    Execute end-to-end portability assessment across `source_client` and `dest_client`
+    with optional `--check-only` and non-destructive 2PC `--trial-restore` verification.
+    """
+    _ = proc_root
+    import dataclasses as _dc
+    from lkmp.orchestrator import MigrationOrchestrator
+
+    j_dir = (
+        config.journal_dir
+        if (run_trial_restore and config.journal_dir != "/var/lib/lkmp/journals")
+        else None
+    )
+    cfg_copy = _dc.replace(config, journal_dir=j_dir)
+    orch = MigrationOrchestrator(cfg_copy, source_client, dest_client, journal_dir=j_dir)
+    return orch.assess_portability(
+        run_check_only=run_check_only,
+        run_trial_restore=run_trial_restore,
     )

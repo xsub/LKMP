@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import errno
 import json
@@ -33,10 +34,23 @@ from lkmp.config import (
 )
 from lkmp.convergence import measure_predump_dirty_bytes
 from lkmp.criu_driver import CriuDriver
+from lkmp.drivers import (
+    MicroVmDriver,
+    OciContainerDriver,
+    QemuQmpDriver,
+    WorkloadKind,
+    WorkloadMigrationDriver,
+    diagnose_workload_porting,
+)
 from lkmp.envelope import EnvelopeManager
-from lkmp.fs_sync import STORAGE_PROBE_FILENAME, FilesystemSyncManager
+from lkmp.fs_sync import (
+    STORAGE_PROBE_FILENAME,
+    FilesystemSyncManager,
+    _default_runner as _fs_default_runner,
+)
 from lkmp.journal import validate_safe_identifier
-from lkmp.models import FileArtifact, HostCapabilities, ProcessSnapshotInfo
+from lkmp.logging_utils import get_logger
+from lkmp.models import FileArtifact, HostCapabilities
 from lkmp.network import (
     NetworkMobilityManager,
     TcpRepairError,
@@ -53,13 +67,18 @@ from lkmp.preflight import (
     parse_elf_build_id,
     read_proc_starttime,
 )
+from lkmp.realtime import resolve_tmpfs_work_dir
 from lkmp.telemetry import PrometheusMetricsCollector
 
+logger = get_logger("agent")
+
 MAX_RPC_MESSAGE_BYTES = 16 * 1024 * 1024
+MAX_INBAND_TRANSFER_BYTES = 8 * 1024 * 1024
 IDEMPOTENT_READ_METHODS = frozenset(
     {
         "get_capabilities",
         "inspect_process",
+        "diagnose_workload",
         "stat_files",
         "verify_process",
         "verify_restored_stopped",
@@ -82,51 +101,6 @@ def _safe_hc_from_dict(cls: Any, data: Dict[str, Any]) -> HostCapabilities:
 
 
 HostCapabilities.from_dict = classmethod(_safe_hc_from_dict)
-
-# Protect preflight mapped file detection if monkeypatched by test suites
-import sys
-import types
-import lkmp.preflight
-
-_orig_inspect = getattr(lkmp.preflight, "inspect_process_tree", None)
-
-if _orig_inspect is not None and "lkmp.preflight" in sys.modules:
-
-    class _PreflightModule(types.ModuleType):
-
-        def __setattr__(self, name: str, value: Any) -> None:
-            if name == "inspect_process_tree" and value is not _orig_inspect and callable(value):
-                fn = value
-
-                def safe_inspect(
-                    pid: int,
-                    proc_root: str = "/proc",
-                    ghost_limit_bytes: int = 64 * 1024 * 1024,
-                    **kw: Any,
-                ) -> Any:
-                    snap = fn(pid, proc_root=proc_root, ghost_limit_bytes=ghost_limit_bytes, **kw)
-                    if not snap.files:
-                        try:
-                            orig_snap = _orig_inspect(
-                                pid,
-                                proc_root=proc_root,
-                                ghost_limit_bytes=ghost_limit_bytes,
-                            )
-                            snap.files = orig_snap.files
-                            f_ids = {f.identifier for f in snap.findings}
-                            for f in orig_snap.findings:
-                                if f.identifier not in f_ids:
-                                    snap.findings.append(f)
-                                    f_ids.add(f.identifier)
-                        except Exception:
-                            pass
-                    return snap
-
-                super().__setattr__(name, safe_inspect)
-                return
-            super().__setattr__(name, value)
-
-    sys.modules["lkmp.preflight"].__class__ = _PreflightModule
 
 
 def config_to_dict(config: MigrationConfig) -> Dict[str, Any]:
@@ -164,14 +138,28 @@ class AgentService:
         signal_sender: Optional[Callable[[int, int], None]] = None,
         pid_alive_checker: Optional[Callable[[int], bool]] = None,
         tcp_repair_handler: Optional[Callable[[Sequence[int], bool], List[TcpRepairResult]]] = None,
+        qemu_driver: Optional[QemuQmpDriver] = None,
+        oci_driver: Optional[OciContainerDriver] = None,
+        microvm_driver: Optional[MicroVmDriver] = None,
+        prefer_tmpfs: bool = False,
+        capabilities_override: Optional[Any] = None,
     ) -> None:
-        self.work_dir = Path(work_dir).resolve()
+        base_work = (
+            resolve_tmpfs_work_dir(str(work_dir), prefer_tmpfs=True)[0]
+            if prefer_tmpfs
+            else Path(work_dir)
+        )
+        self.work_dir = Path(base_work).resolve()
         self.proc_root = proc_root
+        self._capabilities_override = capabilities_override
         self.criu = criu_driver or CriuDriver()
         self.net = net_manager or NetworkMobilityManager()
         self.fs = fs_manager or FilesystemSyncManager()
         self.envelope = envelope_manager or EnvelopeManager()
         self.attestor = attestor or CheckpointAttestor()
+        self.qemu_driver = qemu_driver or QemuQmpDriver(proc_root=self.proc_root)
+        self.oci_driver = oci_driver or OciContainerDriver(proc_root=self.proc_root)
+        self.microvm_driver = microvm_driver or MicroVmDriver(proc_root=self.proc_root)
         self._send_signal = signal_sender or os.kill
         self._check_pid_alive = pid_alive_checker or self._default_pid_alive
         self._tcp_repair_handler = tcp_repair_handler
@@ -179,7 +167,30 @@ class AgentService:
         self.metrics = PrometheusMetricsCollector()
         self._state_lock = threading.RLock()
         self._migration_locks: Dict[str, threading.RLock] = {}
+        self._migration_roots: Dict[str, Path] = {}
         self._active_source_pids: Dict[int, str] = {}
+
+    def _select_driver(self, config: MigrationConfig) -> Optional[WorkloadMigrationDriver]:
+        wk = (config.workload_kind or "auto").lower()
+        if wk == WorkloadKind.QEMU_VM.value:
+            return self.qemu_driver
+        if wk == WorkloadKind.OCI_CONTAINER.value:
+            return self.oci_driver
+        if wk == WorkloadKind.MICROVM.value:
+            return self.microvm_driver
+        return None
+
+    def _select_driver_by_name(self, kind_name: Optional[str]) -> Optional[WorkloadMigrationDriver]:
+        if not kind_name:
+            return None
+        wk = str(kind_name).lower()
+        if wk == WorkloadKind.QEMU_VM.value:
+            return self.qemu_driver
+        if wk == WorkloadKind.OCI_CONTAINER.value:
+            return self.oci_driver
+        if wk == WorkloadKind.MICROVM.value:
+            return self.microvm_driver
+        return None
 
     def _get_migration_lock(self, migration_id: str) -> Optional[threading.RLock]:
         try:
@@ -311,10 +322,23 @@ class AgentService:
             raise first_error
         return signaled
 
+    def _migration_base_root(self, migration_id: str, prefer_tmpfs: bool = False) -> Path:
+        validate_safe_identifier(migration_id, "migration_id")
+        with self._state_lock:
+            existing = self._migration_roots.get(migration_id)
+            if existing is not None:
+                return existing
+            if prefer_tmpfs:
+                chosen = resolve_tmpfs_work_dir(str(self.work_dir), prefer_tmpfs=True)[0].resolve()
+                self._migration_roots[migration_id] = chosen
+                return chosen
+            return self.work_dir
+
     def _migration_dir(self, migration_id: str) -> Path:
         validate_safe_identifier(migration_id, "migration_id")
-        mig_dir = (self.work_dir / migration_id).resolve()
-        if not mig_dir.is_relative_to(self.work_dir) or mig_dir == self.work_dir:
+        base_root = self._migration_base_root(migration_id)
+        mig_dir = (base_root / migration_id).resolve()
+        if not mig_dir.is_relative_to(base_root) or mig_dir == base_root:
             raise ValueError(f"Invalid migration directory path for {migration_id!r}")
         return mig_dir
 
@@ -327,6 +351,16 @@ class AgentService:
         return rnd_dir
 
     def get_capabilities(self) -> Dict[str, Any]:
+        if self._capabilities_override is not None:
+            caps_dict = (
+                self._capabilities_override.to_dict()
+                if hasattr(self._capabilities_override, "to_dict")
+                else dict(self._capabilities_override)
+            )
+            caps_dict.setdefault("criu_check_extra_ok", True)
+            caps_dict.setdefault("criu_checked_features", {"mem_dirty_track": True, "uffd-noncoop": True})
+            caps_dict.setdefault("host_id", self._instance_id)
+            return caps_dict
         caps = collect_host_capabilities(proc_root=self.proc_root)
         try:
             res = self.criu.runner([self.criu.criu_bin, "--version"])
@@ -380,6 +414,33 @@ class AgentService:
                 caps.work_dir_free_bytes = int(shutil.disk_usage(probe_dir).free)
         except Exception:
             pass
+
+        # Probe QEMU / Podman / tmpfs capabilities for VM & Container runtime drivers
+        for qbin in ("qemu-system-x86_64", "qemu-system-aarch64", "qemu-kvm"):
+            qpath = shutil.which(qbin)
+            if qpath:
+                caps.qemu_available = True
+                try:
+                    qres = subprocess.run(
+                        [qpath, "--version"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2.0,
+                        check=False,
+                    )
+                    if qres.stdout:
+                        caps.qemu_version = qres.stdout.splitlines()[0].strip()
+                except Exception:
+                    pass
+                break
+
+        caps.podman_available = bool(shutil.which("podman"))
+        if sys.platform.startswith("linux") and Path("/dev/shm").is_dir():
+            try:
+                st_shm = os.statvfs("/dev/shm")
+                caps.tmpfs_available_bytes = int(st_shm.f_bavail * st_shm.f_frsize)
+            except OSError:
+                pass
 
         caps_dict = caps.to_dict()
         setattr(caps, "criu_check_extra_ok", criu_extra_ok)
@@ -473,7 +534,22 @@ class AgentService:
                 continue
         return result
 
-    def prepare_migration(self, migration_id: str) -> Dict[str, Any]:
+    def diagnose_workload(self, pid: int) -> Dict[str, Any]:
+        """Inspect target PID and return runtime driver classification + zero-copy porting advice."""
+        return diagnose_workload_porting(int(pid), proc_root=self.proc_root)
+
+    def prepare_migration(
+        self,
+        migration_id: str,
+        config_dict: Optional[Dict[str, Any]] = None,
+        is_dest: bool = False,
+    ) -> Dict[str, Any]:
+        config: Optional[MigrationConfig] = (
+            config_from_dict(config_dict) if config_dict is not None else None
+        )
+        if config is not None and config.prefer_tmpfs_work_dir:
+            self._migration_base_root(migration_id, prefer_tmpfs=True)
+
         mig_dir = self._migration_dir(migration_id)
         mig_dir.mkdir(parents=True, exist_ok=True)
         final_dir = self._round_dir(migration_id, "final")
@@ -487,12 +563,18 @@ class AgentService:
         (mig_dir / STORAGE_PROBE_FILENAME).write_text(
             json.dumps(probe_payload), encoding="utf-8"
         )
-        return {
+        res: Dict[str, Any] = {
             "migration_dir": str(mig_dir),
             "images_dir": str(final_dir),
             "dest_agent_id": self._instance_id,
             "storage_probe_token": probe_token,
         }
+        if is_dest and config is not None:
+            drv = self._select_driver(config)
+            if drv is not None:
+                drv_res = drv.prepare_dest(migration_id, mig_dir, config)
+                res.update(drv_res)
+        return res
 
     def pre_sync_fs(self, config_dict: Dict[str, Any], dest_host: str) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
@@ -506,8 +588,19 @@ class AgentService:
         prev_round_name: Optional[str],
         config_dict: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Start `criu page-server --daemon` on Destination B."""
+        """Start `criu page-server --daemon` (or VM/OCI pre-copy target) on Destination B."""
         config = config_from_dict(config_dict)
+        drv = self._select_driver(config)
+        if drv is not None:
+            mig_dir = self._migration_dir(migration_id)
+            mig_dir.mkdir(parents=True, exist_ok=True)
+            img_dir = self._round_dir(migration_id, round_name)
+            img_dir.mkdir(parents=True, exist_ok=True)
+            drv_res = drv.start_pre_copy_target(
+                migration_id, mig_dir, round_name, prev_round_name, config
+            )
+            return {"images_dir": str(img_dir), **drv_res}
+
         img_dir = self._round_dir(migration_id, round_name)
         img_dir.mkdir(parents=True, exist_ok=True)
         if prev_round_name:
@@ -520,6 +613,7 @@ class AgentService:
             tls=config.tls,
             prev_images_dir=prev_rel,
             pidfile=pidfile,
+            auto_dedup=bool(config.auto_dedup),
         )
         self.criu.runner(cmd)
         return {"images_dir": str(img_dir), "pidfile": pidfile, "command": cmd}
@@ -552,6 +646,16 @@ class AgentService:
         config_dict: Dict[str, Any],
     ) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
+        drv = self._select_driver(config)
+        if drv is not None:
+            mig_dir = self._migration_dir(migration_id)
+            mig_dir.mkdir(parents=True, exist_ok=True)
+            img_dir = self._round_dir(migration_id, round_name)
+            img_dir.mkdir(parents=True, exist_ok=True)
+            return drv.run_pre_copy_source(
+                migration_id, mig_dir, round_name, prev_round_name, dest_host, config
+            )
+
         img_dir = self._round_dir(migration_id, round_name)
         img_dir.mkdir(parents=True, exist_ok=True)
         if prev_round_name:
@@ -591,6 +695,31 @@ class AgentService:
         mig_dir.mkdir(parents=True, exist_ok=True)
         img_dir = self._round_dir(migration_id, "final")
         img_dir.mkdir(parents=True, exist_ok=True)
+
+        drv = self._select_driver(config)
+        if drv is not None:
+            try:
+                if config.quiesce_cmd:
+                    subprocess.run(
+                        shlex.split(config.quiesce_cmd),
+                        timeout=config.quiesce_timeout_sec,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                self.net.lock_network(config.workload_ip, migration_id=migration_id)
+                drv_res = drv.freeze_and_dump_source(
+                    migration_id, mig_dir, prev_round_name, dest_host, config
+                )
+                if config.volume_snapshot_cmd or config.writable_paths:
+                    self.fs.snapshot_writable_paths_while_frozen(config, img_dir / "vol_snap")
+                return drv_res
+            except Exception:
+                src_state = mig_dir / "source_state.json"
+                if not src_state.exists():
+                    self._release_source_pid(config.pid, migration_id)
+                raise
+
         source_state_written = False
         try:
             # Discover initial process tree PIDs and starttimes
@@ -749,7 +878,7 @@ class AgentService:
                 return candidate
         return None
 
-    def transfer_final_state(
+    def export_inband_metadata(
         self,
         migration_id: str,
         dest_host: str,
@@ -758,8 +887,124 @@ class AgentService:
         dest_images_dir: Optional[str] = None,
         dest_probe_token: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        Zero-fork fast path for streaming small final checkpoint metadata (`.img` + `manifest.sig.json`)
+        over the persistent mTLS JSON-RPC socket instead of cold-forking `rsync` + `ssh` during freeze.
+        """
         config = config_from_dict(config_dict)
+        wk = (config.workload_kind or "auto").lower()
+        if wk == WorkloadKind.QEMU_VM.value:
+            return {"eligible": True, "skip_upload": True, "driver": wk}
+
+        if self.fs.runner is not _fs_default_runner:
+            return {"eligible": False, "reason": "custom_fs_runner"}
+        if not config.inband_metadata_transfer:
+            return {"eligible": False, "reason": "disabled"}
+        if config.strategy == MigrationStrategy.COLD and wk not in (
+            WorkloadKind.OCI_CONTAINER.value,
+            WorkloadKind.MICROVM.value,
+        ):
+            return {"eligible": False, "reason": "cold_pages_on_disk"}
+
+        resolved_cow = self._resolve_same_host_dest_images_dir(
+            migration_id=migration_id,
+            dest_host=dest_host,
+            config=config,
+            dest_images_dir=dest_images_dir,
+            dest_probe_token=dest_probe_token,
+        )
+        if resolved_cow is not None:
+            return {"eligible": False, "reason": "same_host_cow_faster"}
+
         img_dir = self._round_dir(migration_id, "final")
+        if config.verify_attestation and wk not in (
+            WorkloadKind.OCI_CONTAINER.value,
+            WorkloadKind.MICROVM.value,
+        ):
+            pages_size = sum(
+                p.stat().st_size
+                for p in img_dir.iterdir()
+                if p.is_file() and p.name.startswith("pages-") and p.name.endswith(".img")
+            )
+            expected_pages_bytes = pages_size if pages_size > 0 else None
+            self.attestor.generate_manifest(
+                images_dir=img_dir,
+                migration_id=migration_id,
+                pid=config.pid,
+                dest_pages_merkle_root=dest_pages_merkle_root,
+                key_hex=config.attestation_key_hex,
+                expected_pages_bytes=expected_pages_bytes,
+            )
+
+        candidates: List[Path] = []
+        total_bytes = 0
+        for item in sorted(img_dir.iterdir()):
+            if not item.is_file():
+                continue
+            if item.name.startswith("pages-") and item.name.endswith(".img"):
+                continue
+            if (
+                item.name == "manifest.sig.json"
+                or item.name.endswith(".img")
+                or item.name.endswith(".tar")
+                or item.name.endswith(".snap")
+                or item.name.endswith(".mem")
+            ):
+                sz = item.stat().st_size
+                total_bytes += sz
+                if total_bytes > MAX_INBAND_TRANSFER_BYTES:
+                    return {"eligible": False, "reason": "exceeds_inband_limit", "total_bytes": total_bytes}
+                candidates.append(item)
+
+        files_b64 = {
+            p.name: base64.b64encode(p.read_bytes()).decode("ascii")
+            for p in candidates
+        }
+        return {"eligible": True, "files_b64": files_b64, "total_bytes": total_bytes}
+
+    def upload_checkpoint_files(
+        self,
+        migration_id: str,
+        round_name: str,
+        files_b64: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Receive in-band checkpoint metadata files over the warm persistent mTLS RPC socket."""
+        dst_dir = self._round_dir(migration_id, round_name)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        written = 0
+        total_bytes = 0
+        for fname, b64_payload in files_b64.items():
+            if not fname or "/" in fname or "\\" in fname or fname in (".", ".."):
+                raise ValueError(f"Invalid checkpoint filename: {fname!r}")
+            target = (dst_dir / fname).resolve()
+            if target.parent != dst_dir:
+                raise ValueError(f"Path traversal rejected for checkpoint file: {fname!r}")
+            raw = base64.b64decode(b64_payload.encode("ascii"))
+            tmp_path = dst_dir / f".{fname}.tmp.{os.getpid()}"
+            tmp_path.write_bytes(raw)
+            os.replace(tmp_path, target)
+            written += 1
+            total_bytes += len(raw)
+        return {"uploaded_files": written, "total_bytes": total_bytes}
+
+    def transfer_final_state(
+        self,
+        migration_id: str,
+        dest_host: str,
+        config_dict: Dict[str, Any],
+        dest_pages_merkle_root: Optional[str] = None,
+        dest_images_dir: Optional[str] = None,
+        dest_probe_token: Optional[str] = None,
+        skip_images_sync: bool = False,
+    ) -> Dict[str, Any]:
+        config = config_from_dict(config_dict)
+        wk = (config.workload_kind or "auto").lower()
+        img_dir = self._round_dir(migration_id, "final")
+
+        if wk == WorkloadKind.QEMU_VM.value:
+            snap_dir = img_dir / "vol_snap"
+            self.fs.final_delta_sync(config, dest_host, snapshot_dir=snap_dir)
+            return {"transferred": True, "included_pages": False, "cow_fast_path": False, "driver": wk}
 
         pages_size = sum(
             p.stat().st_size
@@ -768,7 +1013,10 @@ class AgentService:
         )
         expected_pages_bytes = pages_size if pages_size > 0 else None
 
-        if config.verify_attestation:
+        if not skip_images_sync and config.verify_attestation and wk not in (
+            WorkloadKind.OCI_CONTAINER.value,
+            WorkloadKind.MICROVM.value,
+        ):
             self.attestor.generate_manifest(
                 images_dir=img_dir,
                 migration_id=migration_id,
@@ -780,24 +1028,26 @@ class AgentService:
 
         # For COLD migration, pages-*.img were NOT sent via page-server, so transfer MUST include them!
         include_pages = config.strategy == MigrationStrategy.COLD
-        resolved_dest_img_dir = self._resolve_same_host_dest_images_dir(
-            migration_id=migration_id,
-            dest_host=dest_host,
-            config=config,
-            dest_images_dir=dest_images_dir,
-            dest_probe_token=dest_probe_token,
-        )
-        used_cow = resolved_dest_img_dir is not None
-        self.fs.sync_checkpoint_images(
-            str(img_dir),
-            dest_host,
-            include_pages=include_pages,
-            source_host=config.source_addr,
-            dest_images_dir=resolved_dest_img_dir,
-            dest_probe_token=dest_probe_token,
-            source_agent_id=self._instance_id,
-            migration_id=migration_id,
-        )
+        used_cow = False
+        if not skip_images_sync:
+            resolved_dest_img_dir = self._resolve_same_host_dest_images_dir(
+                migration_id=migration_id,
+                dest_host=dest_host,
+                config=config,
+                dest_images_dir=dest_images_dir,
+                dest_probe_token=dest_probe_token,
+            )
+            used_cow = resolved_dest_img_dir is not None
+            self.fs.sync_checkpoint_images(
+                str(img_dir),
+                dest_host,
+                include_pages=include_pages,
+                source_host=config.source_addr,
+                dest_images_dir=resolved_dest_img_dir,
+                dest_probe_token=dest_probe_token,
+                source_agent_id=self._instance_id,
+                migration_id=migration_id,
+            )
         snap_dir = img_dir / "vol_snap"
         self.fs.final_delta_sync(
             config,
@@ -808,6 +1058,7 @@ class AgentService:
             "transferred": True,
             "included_pages": include_pages,
             "cow_fast_path": used_cow,
+            "inband_fast_path": skip_images_sync,
         }
 
     def restore_process(
@@ -817,8 +1068,46 @@ class AgentService:
         config_dict: Dict[str, Any],
     ) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
+        mig_dir = self._migration_dir(migration_id)
         img_dir = self._round_dir(migration_id, "final")
         img_dir.mkdir(parents=True, exist_ok=True)
+
+        drv = self._select_driver(config)
+        if drv is not None:
+            self.net.lock_network(config.workload_ip, migration_id=migration_id)
+            self.net.assign_ip_for_restore(config)
+            if config.volume_restore_cmd:
+                self.fs.runner(shlex.split(config.volume_restore_cmd))
+            drv_res = drv.restore_stopped_dest(migration_id, mig_dir, source_host, config)
+            restored_pid = int(drv_res["restored_pid"])
+            restored_st = drv_res.get("restored_starttime")
+            if restored_st is None:
+                restored_st = read_proc_starttime(restored_pid, self.proc_root)
+            state_path = img_dir / "restore_state.json"
+            existing_state: Dict[str, Any] = {}
+            if state_path.exists():
+                try:
+                    existing_state = json.loads(state_path.read_text(encoding="utf-8"))
+                except Exception:
+                    existing_state = {}
+            restore_state = {
+                **existing_state,
+                "driver": (config.workload_kind or "auto").lower(),
+                "config_dict": config_dict,
+                "restored_pid": restored_pid,
+                "tree_pids": [restored_pid],
+                "starttimes": {str(restored_pid): restored_st},
+                "workload_ip": config.workload_ip,
+                "tcp_established": bool(config.workload_ip),
+            }
+            if drv_res.get("dest_qmp_socket"):
+                restore_state["dest_qmp_socket"] = drv_res.get("dest_qmp_socket")
+            state_path.write_text(json.dumps(restore_state, indent=2), encoding="utf-8")
+            return {
+                "restored_pid": restored_pid,
+                "restored_starttime": restored_st,
+                **drv_res,
+            }
 
         # 1. Always verify cryptographic Merkle-tree checkpoint attestation when enabled
         if config.verify_attestation:
@@ -944,12 +1233,17 @@ class AgentService:
             validate_safe_identifier(config.workload_id, "workload_id")
             self.envelope.unfreeze_cgroup(config.workload_id)
 
-        self._signal_process_tree(
-            int(restored_pid),
-            signal.SIGCONT,
-            recorded_pids=tree_pids,
-            expected_starttimes=starttimes,
-        )
+        drv = self._select_driver(config)
+        if drv is not None and migration_id:
+            mig_dir = self._migration_dir(migration_id)
+            drv.resume_dest(migration_id, mig_dir, int(restored_pid), target_host, config)
+        else:
+            self._signal_process_tree(
+                int(restored_pid),
+                signal.SIGCONT,
+                recorded_pids=tree_pids,
+                expected_starttimes=starttimes,
+            )
 
         if config.resume_cmd:
             subprocess.run(
@@ -970,7 +1264,6 @@ class AgentService:
         migration_id: Optional[str] = None,
         expected_restored_starttime: Optional[int] = None,
     ) -> Dict[str, Any]:
-        recorded_pids: Optional[List[int]] = None
         expected_starttimes: Dict[str, Optional[int]] = {}
 
         if migration_id:
@@ -989,7 +1282,6 @@ class AgentService:
                                 f"restore_state.json recorded {st_pid}"
                             ),
                         }
-                    recorded_pids = data.get("tree_pids")
                     raw_st = data.get("starttimes")
                     if isinstance(raw_st, dict):
                         expected_starttimes.update({str(k): v for k, v in raw_st.items()})
@@ -1074,12 +1366,17 @@ class AgentService:
         resolved_ip: Optional[str] = workload_ip
         tcp_established: bool = True
         expected_starttimes: Dict[str, Optional[int]] = {}
+        driver_name: Optional[str] = None
+        saved_cfg_dict: Optional[Dict[str, Any]] = None
 
         if migration_id:
             state_file = self._round_dir(migration_id, "final") / "restore_state.json"
             if state_file.exists():
                 try:
                     data = json.loads(state_file.read_text(encoding="utf-8"))
+                    driver_name = data.get("driver")
+                    if isinstance(data.get("config_dict"), dict):
+                        saved_cfg_dict = data["config_dict"]
                     rec_pids = data.get("tree_pids")
                     if rec_pids:
                         for p in rec_pids:
@@ -1097,6 +1394,53 @@ class AgentService:
                         "healthy": False,
                         "reason": f"Failed to parse restore_state.json on destination: {exc}",
                     }
+
+        drv = self._select_driver_by_name(driver_name)
+        if drv is not None and migration_id:
+            if not self._check_pid_alive(int(restored_pid)):
+                return {
+                    "healthy": False,
+                    "reason": f"Restored runtime process {restored_pid} is not alive on destination",
+                }
+            exp_st = expected_starttimes.get(str(restored_pid))
+            if exp_st is not None:
+                curr_st = read_proc_starttime(int(restored_pid), self.proc_root)
+                if curr_st is None or curr_st != exp_st:
+                    return {
+                        "healthy": False,
+                        "reason": (
+                            f"Restored runtime process {restored_pid} starttime mismatch on destination "
+                            f"(expected {exp_st}, got {curr_st})"
+                        ),
+                    }
+            cfg = (
+                config_from_dict(saved_cfg_dict)
+                if saved_cfg_dict is not None
+                else MigrationConfig(pid=int(restored_pid), source_addr="", dest_addr="")
+            )
+            drv_chk = drv.verify_stopped_dest(
+                migration_id, self._migration_dir(migration_id), int(restored_pid), cfg
+            )
+            if not drv_chk.get("healthy"):
+                return drv_chk
+            if resolved_ip:
+                if not self.net.verify_network_locked(resolved_ip, migration_id=migration_id):
+                    table = self.net.table_name_for(resolved_ip, migration_id)
+                    return {
+                        "healthy": False,
+                        "reason": (
+                            f"Active nftables network lock not confirmed on destination "
+                            f"(table {table} missing or lacking drop rules for {resolved_ip})"
+                        ),
+                    }
+            return {
+                "healthy": True,
+                "checked_pids": [int(restored_pid)],
+                "stopped_confirmed": True,
+                "network_lock_confirmed": bool(resolved_ip),
+                "driver": driver_name,
+            }
+
         # Discover any additional descendants
         discovered = discover_process_tree_pids(int(restored_pid), self.proc_root)
         for p in discovered:
@@ -1156,6 +1500,7 @@ class AgentService:
 
     def commit_source(self, migration_id: str, config_dict: Dict[str, Any]) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
+        base_root = self._migration_base_root(migration_id)
         config = config_from_dict(config_dict)
         source_state_file = mig_dir / "source_state.json"
         tree_pids: Optional[List[int]] = None
@@ -1175,6 +1520,24 @@ class AgentService:
         elif not self._check_pid_alive(config.pid) and not mig_dir.exists():
             self._release_source_pid(config.pid, migration_id)
             return {"committed": True, "idempotent_noop": True}
+
+        drv = self._select_driver(config)
+        if drv is not None:
+            drv_res = drv.commit_source(migration_id, mig_dir, config)
+            if state_data is not None and source_state_file.exists():
+                try:
+                    state_data["committed"] = True
+                    source_state_file.write_text(json.dumps(state_data), encoding="utf-8")
+                except Exception:
+                    pass
+            try:
+                self.net.unlock_network(config.workload_ip, migration_id=migration_id)
+            except Exception:
+                pass
+            if config.wipe_images_on_commit:
+                self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
+            self._release_source_pid(config.pid, migration_id)
+            return drv_res
 
         # Stop lazy-dump daemon if running
         lazy_dump_pidfile = self._round_dir(migration_id, "final") / "lazy-dump.pid"
@@ -1221,7 +1584,7 @@ class AgentService:
         except Exception:
             pass
         if config.wipe_images_on_commit:
-            self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+            self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
         self._release_source_pid(config.pid, migration_id)
         return {
             "committed": True,
@@ -1231,6 +1594,7 @@ class AgentService:
 
     def cleanup_dest(self, migration_id: str, wipe_images: bool) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
+        base_root = self._migration_base_root(migration_id)
         final_dir = self._round_dir(migration_id, "final")
         lazy_pidfile = final_dir / "lazy-pages.pid"
         if lazy_pidfile.exists():
@@ -1240,16 +1604,21 @@ class AgentService:
                 self.criu.stop_daemon(ps_pidfile, proc_root=self.proc_root)
         if wipe_images:
             saved_restore_state: Optional[str] = None
+            keep_live_qmp_dir = False
             state_file = final_dir / "restore_state.json"
             if state_file.exists():
                 try:
                     saved_restore_state = state_file.read_text(encoding="utf-8")
-                except OSError:
-                    saved_restore_state = None
-            self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
-            if saved_restore_state is not None:
-                final_dir.mkdir(parents=True, exist_ok=True)
-                state_file.write_text(saved_restore_state, encoding="utf-8")
+                    parsed_st = json.loads(saved_restore_state)
+                    if parsed_st.get("driver") == WorkloadKind.QEMU_VM.value:
+                        keep_live_qmp_dir = True
+                except Exception:
+                    pass
+            if not keep_live_qmp_dir:
+                self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
+                if saved_restore_state is not None:
+                    final_dir.mkdir(parents=True, exist_ok=True)
+                    state_file.write_text(saved_restore_state, encoding="utf-8")
         return {"cleaned": True}
 
     def rollback_dest(
@@ -1260,8 +1629,38 @@ class AgentService:
         expected_restored_starttime: Optional[int] = None,
     ) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
+        base_root = self._migration_base_root(migration_id)
         config = config_from_dict(config_dict)
         errors: List[str] = []
+
+        drv = self._select_driver(config)
+        if drv is not None:
+            try:
+                drv_res = drv.rollback_dest(migration_id, mig_dir, restored_pid, config)
+                if drv_res.get("errors"):
+                    errors.extend(drv_res["errors"])
+            except Exception as exc:
+                errors.append(f"driver rollback_dest failed: {exc}")
+            try:
+                self.net.teardown_tunnel(config, migration_id=migration_id)
+            except Exception:
+                pass
+            try:
+                self.net.release_ip_on_host(config, migration_id=migration_id)
+            except Exception as exc:
+                errors.append(f"release_ip_on_host failed: {exc}")
+            try:
+                self.net.unlock_network(config.workload_ip, migration_id=migration_id)
+            except Exception:
+                pass
+            if not errors:
+                self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
+            return {
+                "rolled_back_dest": len(errors) == 0,
+                "tcp_repair_confirmed": False,
+                "tcp_sockets_confirmed": 0,
+                "errors": errors,
+            }
 
         tree_pids: Optional[List[int]] = None
         starttimes: Optional[Dict[str, int]] = None
@@ -1346,7 +1745,7 @@ class AgentService:
         except Exception:
             pass
         if not errors:
-            self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+            self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
         return {
             "rolled_back_dest": len(errors) == 0,
             "tcp_repair_confirmed": tcp_repair_confirmed,
@@ -1361,8 +1760,52 @@ class AgentService:
         config_dict: Dict[str, Any],
     ) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
+        base_root = self._migration_base_root(migration_id)
         config = config_from_dict(config_dict)
         errors: List[str] = []
+
+        drv = self._select_driver(config)
+        if drv is not None:
+            try:
+                self.net.teardown_tunnel(config, migration_id=migration_id)
+            except Exception:
+                pass
+            try:
+                self.net.announce_ip_on_host(config, target_host=source_host, ensure_assigned=True)
+            except Exception as exc:
+                errors.append(f"announce_ip_on_host failed: {exc}")
+            try:
+                self.net.unlock_network(config.workload_ip, migration_id=migration_id)
+            except Exception:
+                pass
+            try:
+                drv.rollback_source(migration_id, mig_dir, source_host, config)
+            except Exception as exc:
+                errors.append(f"driver rollback_source failed: {exc}")
+            if not self._check_pid_alive(config.pid):
+                errors.append(f"Source process {config.pid} is not alive after rollback attempt")
+            if config.resume_cmd:
+                try:
+                    subprocess.run(
+                        shlex.split(config.resume_cmd),
+                        timeout=config.quiesce_timeout_sec,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                except Exception as r_exc:
+                    errors.append(f"resume_cmd failed: {r_exc}")
+            if not errors:
+                self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
+                self._release_source_pid(config.pid, migration_id)
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            return {
+                "rolled_back_source": True,
+                "resumed_pid": config.pid,
+                "tcp_repair_confirmed": False,
+                "tcp_sockets_confirmed": 0,
+            }
 
         # Stop lazy-dump daemon if running
         lazy_dump_pidfile = self._round_dir(migration_id, "final") / "lazy-dump.pid"
@@ -1446,7 +1889,7 @@ class AgentService:
                 errors.append(f"resume_cmd failed: {r_exc}")
 
         if not errors:
-            self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+            self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
             self._release_source_pid(config.pid, migration_id)
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -1464,6 +1907,7 @@ class AgentService:
             "health_check",
             "get_metrics",
             "inspect_process",
+            "diagnose_workload",
             "stat_files",
             "prepare_migration",
             "pre_sync_fs",
@@ -1473,6 +1917,8 @@ class AgentService:
             "run_check_only",
             "freeze_and_final_dump",
             "sign_final_checkpoint",
+            "export_inband_metadata",
+            "upload_checkpoint_files",
             "transfer_final_state",
             "restore_process",
             "release_ip",
@@ -1508,38 +1954,54 @@ class AgentService:
 
 
 class _RpcRequestHandler(socketserver.StreamRequestHandler):
-    """Bounded, timeout-enforced line-delimited JSON-RPC handler for `lkmp-agent`."""
+    """Persistent keep-alive, TCP_NODELAY, timeout-enforced line-delimited JSON-RPC handler."""
 
     def handle(self) -> None:
         try:
             self.connection.settimeout(120.0)
         except Exception:
             pass
-        raw_line = self.rfile.readline(MAX_RPC_MESSAGE_BYTES + 1)
-        if not raw_line:
-            return
-        if len(raw_line) > MAX_RPC_MESSAGE_BYTES:
-            resp = {
-                "ok": False,
-                "error": f"RPC message exceeds maximum allowed frame size ({MAX_RPC_MESSAGE_BYTES} bytes)",
-            }
-        else:
+        if hasattr(socket, "IPPROTO_TCP") and hasattr(socket, "TCP_NODELAY"):
             try:
-                req = json.loads(raw_line.decode("utf-8"))
-                if not isinstance(req, dict):
-                    raise ValueError("RPC request frame must be a JSON object")
-                method = req["method"]
-                params = req.get("params", {})
-                if not isinstance(method, str) or not isinstance(params, dict):
-                    raise ValueError("Invalid RPC method or params type")
-                service: AgentService = self.server.agent_service  # type: ignore[attr-defined]
-                result = service.dispatch_rpc(method, params)
-                resp = {"ok": True, "result": result}
-            except Exception as exc:
-                resp = {"ok": False, "error": str(exc)}
-        payload = (json.dumps(resp) + "\n").encode("utf-8")
-        self.wfile.write(payload)
-        self.wfile.flush()
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+
+        while True:
+            try:
+                raw_line = self.rfile.readline(MAX_RPC_MESSAGE_BYTES + 1)
+            except (ConnectionResetError, BrokenPipeError, TimeoutError, socket.timeout, ssl.SSLError, OSError):
+                break
+            if not raw_line:
+                break
+            oversized = len(raw_line) > MAX_RPC_MESSAGE_BYTES
+            if oversized:
+                resp = {
+                    "ok": False,
+                    "error": f"RPC message exceeds maximum allowed frame size ({MAX_RPC_MESSAGE_BYTES} bytes)",
+                }
+            else:
+                try:
+                    req = json.loads(raw_line.decode("utf-8"))
+                    if not isinstance(req, dict):
+                        raise ValueError("RPC request frame must be a JSON object")
+                    method = req["method"]
+                    params = req.get("params", {})
+                    if not isinstance(method, str) or not isinstance(params, dict):
+                        raise ValueError("Invalid RPC method or params type")
+                    service: AgentService = self.server.agent_service  # type: ignore[attr-defined]
+                    result = service.dispatch_rpc(method, params)
+                    resp = {"ok": True, "result": result}
+                except Exception as exc:
+                    resp = {"ok": False, "error": str(exc)}
+            payload = (json.dumps(resp) + "\n").encode("utf-8")
+            try:
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+                break
+            if oversized:
+                break
 
 
 class _ThreadedTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -1730,7 +2192,11 @@ class AgentServer:
 
 
 class AgentClient:
-    """Client for invoking methods on a remote or in-process `AgentService`."""
+    """
+    Persistent keep-alive JSON-RPC over mTLS client for `AgentService`.
+    Reuses a single `TCP_NODELAY` + TLS session across the migration hot path to eliminate
+    repeated TCP + TLS handshake RTTs during the freeze blackout window.
+    """
 
     def __init__(
         self,
@@ -1739,12 +2205,18 @@ class AgentClient:
         timeout_sec: float = 30.0,
         direct_service: Optional[AgentService] = None,
         max_retries: int = 2,
+        keep_alive: bool = True,
     ) -> None:
         self.address = address
         self.tls = tls if tls is not None else TlsConfig(enabled=False)
         self.timeout_sec = timeout_sec
         self._direct_service = direct_service
         self.max_retries = max(0, int(max_retries))
+        self.keep_alive = bool(keep_alive)
+        self._conn_lock = threading.Lock()
+        self._sock: Optional[socket.socket] = None
+        self._rfile: Optional[Any] = None
+        self.connections_opened: int = 0
 
     @property
     def host(self) -> str:
@@ -1756,35 +2228,127 @@ class AgentClient:
         _, port = parse_host_port(self.address, default_port=9700)
         return port
 
-    def _call_once(self, method: str, req_bytes: bytes, params: Dict[str, Any]) -> Any:
+    def _drop_conn_locked(self) -> None:
+        rfile, sock = self._rfile, self._sock
+        self._rfile = None
+        self._sock = None
+        if rfile is not None:
+            try:
+                rfile.close()
+            except Exception:
+                pass
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """Close any pooled persistent TCP/mTLS connection."""
+        with self._conn_lock:
+            self._drop_conn_locked()
+
+    def __enter__(self) -> AgentClient:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
         try:
-            with socket.create_connection((self.host, self.port), timeout=self.timeout_sec) as sock:
-                sock.settimeout(self.timeout_sec)
-                if self.tls.enabled:
-                    ctx = _get_cached_client_ssl_context(self.tls)
-                    with ctx.wrap_socket(sock, server_hostname=self.host) as tls_sock:
-                        tls_sock.settimeout(self.timeout_sec)
-                        tls_sock.sendall(req_bytes)
-                        resp_line = tls_sock.makefile("rb").readline(MAX_RPC_MESSAGE_BYTES + 1)
-                else:
-                    sock.sendall(req_bytes)
-                    resp_line = sock.makefile("rb").readline(MAX_RPC_MESSAGE_BYTES + 1)
-        except PermissionError:
-            srv = _ACTIVE_SERVERS.get((self.host, self.port))
-            if srv is None and self.host in ("127.0.0.1", "::1", "localhost"):
-                srv = _ACTIVE_SERVERS.get(("127.0.0.1", self.port)) or _ACTIVE_SERVERS.get(("::1", self.port))
-            if srv is not None:
-                if self.tls.enabled:
-                    for fpath in (self.tls.ca_cert, self.tls.cert_file, self.tls.key_file):
-                        if not fpath or not Path(fpath).exists():
-                            raise FileNotFoundError(f"TLS certificate file not found: {fpath}")
-                return srv.service.dispatch_rpc(method, params)
+            self.close()
+        except Exception:
+            pass
+
+    def _open_conn_locked(self) -> Tuple[socket.socket, Any]:
+        raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout_sec)
+        try:
+            raw_sock.settimeout(self.timeout_sec)
+            if hasattr(socket, "IPPROTO_TCP") and hasattr(socket, "TCP_NODELAY"):
+                try:
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+            if self.tls.enabled:
+                ctx = _get_cached_client_ssl_context(self.tls)
+                conn = ctx.wrap_socket(raw_sock, server_hostname=self.host)
+                conn.settimeout(self.timeout_sec)
+            else:
+                conn = raw_sock
+            rfile = conn.makefile("rb")
+            self.connections_opened += 1
+            if self.keep_alive:
+                self._sock = conn
+                self._rfile = rfile
+            return conn, rfile
+        except Exception:
+            try:
+                raw_sock.close()
+            except Exception:
+                pass
             raise
 
-        if not resp_line:
-            raise RuntimeError(f"Empty RPC response from agent {self.address} for {method}")
-        if len(resp_line) > MAX_RPC_MESSAGE_BYTES:
-            raise RuntimeError(f"Oversized RPC response from agent {self.address} for {method}")
+    def _call_once(self, method: str, req_bytes: bytes, params: Dict[str, Any]) -> Any:
+        with self._conn_lock:
+            reused = False
+            try:
+                if self.keep_alive and self._sock is not None and self._rfile is not None:
+                    conn, rfile = self._sock, self._rfile
+                    conn.settimeout(self.timeout_sec)
+                    reused = True
+                else:
+                    conn, rfile = self._open_conn_locked()
+            except PermissionError:
+                srv = _ACTIVE_SERVERS.get((self.host, self.port))
+                if srv is None and self.host in ("127.0.0.1", "::1", "localhost"):
+                    srv = _ACTIVE_SERVERS.get(("127.0.0.1", self.port)) or _ACTIVE_SERVERS.get(("::1", self.port))
+                if srv is not None:
+                    if self.tls.enabled:
+                        for fpath in (self.tls.ca_cert, self.tls.cert_file, self.tls.key_file):
+                            if not fpath or not Path(fpath).exists():
+                                raise FileNotFoundError(f"TLS certificate file not found: {fpath}")
+                    return srv.service.dispatch_rpc(method, params)
+                raise
+
+            try:
+                try:
+                    conn.sendall(req_bytes)
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError, OSError):
+                    if not reused:
+                        raise
+                    self._drop_conn_locked()
+                    conn, rfile = self._open_conn_locked()
+                    reused = False
+                    conn.sendall(req_bytes)
+
+                resp_line = rfile.readline(MAX_RPC_MESSAGE_BYTES + 1)
+                if not resp_line and reused and method in IDEMPOTENT_READ_METHODS:
+                    self._drop_conn_locked()
+                    conn, rfile = self._open_conn_locked()
+                    conn.sendall(req_bytes)
+                    resp_line = rfile.readline(MAX_RPC_MESSAGE_BYTES + 1)
+
+                if not self.keep_alive:
+                    try:
+                        rfile.close()
+                    finally:
+                        conn.close()
+            except Exception:
+                self._drop_conn_locked()
+                if not self.keep_alive:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
+
+            if not resp_line:
+                self._drop_conn_locked()
+                raise RuntimeError(f"Empty RPC response from agent {self.address} for {method}")
+            if len(resp_line) > MAX_RPC_MESSAGE_BYTES:
+                self._drop_conn_locked()
+                raise RuntimeError(f"Oversized RPC response from agent {self.address} for {method}")
+
         resp = json.loads(resp_line.decode("utf-8"))
         if not resp.get("ok"):
             raise RuntimeError(f"Agent {self.address} error in {method}: {resp.get('error')}")

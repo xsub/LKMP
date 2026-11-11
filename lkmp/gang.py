@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 from lkmp.agent import AgentClient, config_to_dict
 from lkmp.config import MigrationConfig
@@ -15,8 +15,12 @@ from lkmp.journal import (
     open_migration_journal,
     validate_safe_identifier,
 )
+from lkmp.logging_utils import migration_log_context
 from lkmp.models import MigrationResult, MigrationState
 from lkmp.orchestrator import MigrationOrchestrator
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 
 @dataclass
@@ -78,8 +82,17 @@ class GangMigrationCoordinator:
         members: List[Tuple[MigrationConfig, AgentClient, AgentClient]],
         journal_dir: Optional[str | Path] = None,
         require_persistent_journal: bool = True,
+        parallel: Optional[bool] = None,
     ) -> None:
         self.gang_id = validate_safe_identifier(gang_id, "gang_id")
+        if parallel is None:
+            self.parallel = any(
+                getattr(src, "_direct_service", None) is None
+                or getattr(dst, "_direct_service", None) is None
+                for _cfg, src, dst in members
+            )
+        else:
+            self.parallel = bool(parallel)
         j_dir = (
             journal_dir
             or (members[0][0].journal_dir if members else None)
@@ -106,6 +119,13 @@ class GangMigrationCoordinator:
             )
             for idx, (cfg, src, dst) in enumerate(members, start=1)
         ]
+
+    def _map_members(self, items: List[_T], fn: Callable[[_T], _R]) -> List[_R]:
+        if not self.parallel or len(items) <= 1:
+            return [fn(it) for it in items]
+        with ThreadPoolExecutor(max_workers=min(len(items), 16)) as pool:
+            futures = [pool.submit(fn, it) for it in items]
+            return [fut.result() for fut in futures]
 
     def execute(self) -> GangMigrationResult:
         """Alias for `execute_atomic()`."""
@@ -139,130 +159,163 @@ class GangMigrationCoordinator:
         )
 
         # 1. Global Preflight Barrier: all members must pass preflight before any member freezes
-        for orch in self.orchestrators:
-            report = orch.run_preflight()
-            if not report.compatible:
+        with migration_log_context(gang_id=self.gang_id):
+            if self.parallel and len(self.orchestrators) > 1:
+                preflight_reports = self._map_members(
+                    self.orchestrators, lambda o: (o, o.run_preflight())
+                )
+            else:
+                preflight_reports = []
+                for orch in self.orchestrators:
+                    rep = orch.run_preflight()
+                    preflight_reports.append((orch, rep))
+                    if not rep.compatible:
+                        break
+
+            for orch, report in preflight_reports:
+                if not report.compatible:
+                    self.journal.append(
+                        state=MigrationState.ABORTED,
+                        commit_decision="ABORTING",
+                        note="Preflight failed",
+                        member_ids=self.member_ids,
+                        member_configs=member_configs,
+                    )
+                    results: List[MigrationResult] = []
+                    for o in self.orchestrators:
+                        o._transition(MigrationState.ABORTED, commit_decision="ABORTING")
+                        results.append(
+                            MigrationResult(
+                                migration_id=o.migration_id,
+                                success=False,
+                                final_state=MigrationState.ABORTED,
+                                error_message=f"Gang preflight barrier aborted by {orch.migration_id}",
+                                state_history=list(o.state_history),
+                            )
+                        )
+                    return GangMigrationResult(
+                        gang_id=self.gang_id,
+                        all_committed=False,
+                        atomic_rollback_triggered=False,
+                        member_results=results,
+                    )
+
+            # Refresh member_configs after preflight enrichment (e.g. workload_kind / runtime_metadata)
+            member_configs = [config_to_dict(o.config) for o in self.orchestrators]
+
+            # Reset state history before Phase 1 prepare execution
+            for orch in self.orchestrators:
+                orch.state = MigrationState.INIT
+                orch.state_history = [MigrationState.INIT]
+
+            self.journal.append(
+                state=MigrationState.PREPARE,
+                commit_decision="PREPARING",
+                member_ids=self.member_ids,
+                member_configs=member_configs,
+            )
+
+            # 2. Phase 1 (Prepare & Verify): stops at VERIFY with keep_stopped_on_prepare=True
+            # Process on B stays stopped and network-fenced; source process on A is alive and frozen
+            prepared_orchestrators: List[MigrationOrchestrator] = []
+            failed_results: List[MigrationResult] = []
+
+            if self.parallel and len(self.orchestrators) > 1:
+                phase1_pairs = self._map_members(
+                    self.orchestrators,
+                    lambda o: (o, o.execute_prepare_phase(keep_stopped_on_prepare=True)),
+                )
+                for orch, res in phase1_pairs:
+                    if not res.success or res.final_state != MigrationState.VERIFY:
+                        failed_results.append(res)
+                    else:
+                        prepared_orchestrators.append(orch)
+            else:
+                for orch in self.orchestrators:
+                    res = orch.execute_prepare_phase(keep_stopped_on_prepare=True)
+                    if not res.success or res.final_state != MigrationState.VERIFY:
+                        failed_results.append(res)
+                        break
+                    prepared_orchestrators.append(orch)
+
+            # 3. Phase 2a (Global Abort / Rollback): If any member failed Phase 1, roll back all prepared members
+            if failed_results:
                 self.journal.append(
                     state=MigrationState.ABORTED,
                     commit_decision="ABORTING",
-                    note="Preflight failed",
-                    member_ids=self.member_ids,
-                    member_configs=member_configs,
+                    note="Phase 1 prepare failure",
                 )
-                results: List[MigrationResult] = []
-                for o in self.orchestrators:
-                    o._transition(MigrationState.ABORTED, commit_decision="ABORTING")
-                    results.append(
-                        MigrationResult(
-                            migration_id=o.migration_id,
-                            success=False,
-                            final_state=MigrationState.ABORTED,
-                            error_message=f"Gang preflight barrier aborted by {orch.migration_id}",
-                            state_history=list(o.state_history),
-                        )
+                rolled_back_results = self._map_members(
+                    prepared_orchestrators,
+                    lambda o: o.rollback("Rolled back by 2PC Gang Coordinator due to peer failure"),
+                )
+                rolled_back_results.extend(failed_results)
+
+                all_rolled_back = bool(rolled_back_results) and all(
+                    r.rolled_back for r in rolled_back_results
+                )
+                if all_rolled_back:
+                    self.journal.append(state=MigrationState.ROLLBACK, commit_decision="ROLLED_BACK")
+                    err_msg = None
+                else:
+                    failed_rb_ids = [
+                        r.migration_id for r in rolled_back_results if not r.rolled_back
+                    ]
+                    err_msg = (
+                        f"Incomplete gang rollback: members {failed_rb_ids} did not confirm rolled_back=True"
+                    )
+                    self.journal.append(
+                        state=MigrationState.ROLLBACK,
+                        commit_decision="ABORTING",
+                        note=err_msg,
                     )
                 return GangMigrationResult(
                     gang_id=self.gang_id,
                     all_committed=False,
+                    atomic_rollback_triggered=all_rolled_back,
+                    member_results=rolled_back_results,
+                    error_message=err_msg,
+                )
+
+            # 4. Phase 2b (Global Commit): All members prepared and verified stopped on B
+            # Step 1: Write and fsync COMMITTED to GangJournal and each member's WAL
+            self.journal.append(state=MigrationState.COMMIT, commit_decision="COMMITTED")
+            for orch in prepared_orchestrators:
+                orch._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
+
+            try:
+                # Step 2: Fence/Kill Source A concurrently across all members first
+                self._map_members(
+                    prepared_orchestrators,
+                    lambda o: o.source.call(
+                        "commit_source",
+                        migration_id=o.migration_id,
+                        config_dict=config_to_dict(o.config),
+                    ),
+                )
+
+                # Step 3: Resume and verify on Destination B concurrently (O(1) gang blackout!)
+                def _switchover_and_commit(o: MigrationOrchestrator) -> MigrationResult:
+                    o.complete_switchover_and_verify()
+                    return o.commit()
+
+                committed_results = self._map_members(prepared_orchestrators, _switchover_and_commit)
+
+                return GangMigrationResult(
+                    gang_id=self.gang_id,
+                    all_committed=True,
                     atomic_rollback_triggered=False,
-                    member_results=results,
+                    member_results=committed_results,
                 )
-
-        # Reset state history before Phase 1 prepare execution
-        for orch in self.orchestrators:
-            orch.state = MigrationState.INIT
-            orch.state_history = [MigrationState.INIT]
-
-        self.journal.append(
-            state=MigrationState.PREPARE,
-            commit_decision="PREPARING",
-            member_ids=self.member_ids,
-            member_configs=member_configs,
-        )
-
-        # 2. Phase 1 (Prepare & Verify): stops at VERIFY with keep_stopped_on_prepare=True
-        # Process on B stays stopped and network-fenced; source process on A is alive and frozen
-        prepared_orchestrators: List[MigrationOrchestrator] = []
-        failed_result: MigrationResult | None = None
-
-        for orch in self.orchestrators:
-            res = orch.execute_prepare_phase(keep_stopped_on_prepare=True)
-            if not res.success or res.final_state != MigrationState.VERIFY:
-                failed_result = res
-                break
-            prepared_orchestrators.append(orch)
-
-        # 3. Phase 2a (Global Abort / Rollback): If any member failed Phase 1, roll back all prepared members
-        if failed_result is not None:
-            self.journal.append(state=MigrationState.ABORTED, commit_decision="ABORTING", note="Phase 1 prepare failure")
-            rolled_back_results: List[MigrationResult] = []
-            for orch in prepared_orchestrators:
-                rb_res = orch.rollback("Rolled back by 2PC Gang Coordinator due to peer failure")
-                rolled_back_results.append(rb_res)
-            rolled_back_results.append(failed_result)
-
-            all_rolled_back = bool(rolled_back_results) and all(
-                r.rolled_back for r in rolled_back_results
-            )
-            if all_rolled_back:
-                self.journal.append(state=MigrationState.ROLLBACK, commit_decision="ROLLED_BACK")
-                err_msg = None
-            else:
-                failed_rb_ids = [
-                    r.migration_id for r in rolled_back_results if not r.rolled_back
-                ]
-                err_msg = (
-                    f"Incomplete gang rollback: members {failed_rb_ids} did not confirm rolled_back=True"
+            except Exception as exc:
+                # Step 4: Honest Mid-Commit Failure: do NOT claim atomic_rollback_triggered=True!
+                return GangMigrationResult(
+                    gang_id=self.gang_id,
+                    all_committed=False,
+                    atomic_rollback_triggered=False,
+                    partial_commit_error=True,
+                    error_message=f"Mid-commit failure after irrevocable decision: {exc}",
                 )
-                self.journal.append(
-                    state=MigrationState.ROLLBACK,
-                    commit_decision="ABORTING",
-                    note=err_msg,
-                )
-            return GangMigrationResult(
-                gang_id=self.gang_id,
-                all_committed=False,
-                atomic_rollback_triggered=all_rolled_back,
-                member_results=rolled_back_results,
-                error_message=err_msg,
-            )
-
-        # 4. Phase 2b (Global Commit): All members prepared and verified stopped on B
-        # Step 1: Write and fsync COMMITTED to GangJournal and each member's WAL
-        self.journal.append(state=MigrationState.COMMIT, commit_decision="COMMITTED")
-        for orch in prepared_orchestrators:
-            orch._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
-
-        try:
-            # Step 2: Fence/Kill Source A first so no source process can ever run concurrently with B
-            for orch in prepared_orchestrators:
-                orch.source.call(
-                    "commit_source",
-                    migration_id=orch.migration_id,
-                    config_dict=config_to_dict(orch.config),
-                )
-
-            # Step 3: Resume and verify on Destination B, then finalize commit
-            committed_results: List[MigrationResult] = []
-            for orch in prepared_orchestrators:
-                orch.complete_switchover_and_verify()
-                committed_results.append(orch.commit())
-
-            return GangMigrationResult(
-                gang_id=self.gang_id,
-                all_committed=True,
-                atomic_rollback_triggered=False,
-                member_results=committed_results,
-            )
-        except Exception as exc:
-            # Step 4: Honest Mid-Commit Failure: do NOT claim atomic_rollback_triggered=True!
-            return GangMigrationResult(
-                gang_id=self.gang_id,
-                all_committed=False,
-                atomic_rollback_triggered=False,
-                partial_commit_error=True,
-                error_message=f"Mid-commit failure after irrevocable decision: {exc}",
-            )
 
     @classmethod
     def recover_from_journal(

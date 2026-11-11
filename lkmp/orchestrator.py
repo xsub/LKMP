@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -14,66 +13,25 @@ from lkmp.agent import AgentClient, config_from_dict, config_to_dict
 from lkmp.attestation import generate_ephemeral_key_hex
 from lkmp.config import FilesystemMode, IpMobilityMode, MigrationConfig, MigrationStrategy
 from lkmp.convergence import PreCopyConvergenceTracker
-from lkmp.fs_sync import is_same_host_or_shared_storage
+from lkmp.drivers import WorkloadKind
 from lkmp.journal import MigrationJournal, open_migration_journal, validate_safe_identifier
+from lkmp.logging_utils import get_logger, migration_log_context
 from lkmp.models import (
     FileArtifact,
     HostCapabilities,
     MigrationResult,
     MigrationState,
+    PortabilityReport,
+    PortabilityStatus,
     PreCopyIterationStats,
     PreflightReport,
     ProcessSnapshotInfo,
-    ResourceClassification,
-    ResourceFinding,
 )
 from lkmp.pagemap import select_optimal_strategy
-from lkmp.preflight import evaluate_compatibility
+from lkmp.preflight import evaluate_compatibility, evaluate_portability
 from lkmp.telemetry import PrometheusMetricsCollector
 
-try:
-    from lkmp.models import PortabilityReport, PortabilityStatus
-except ImportError:
-    from dataclasses import asdict, dataclass, field
-    from enum import Enum
-
-    class PortabilityStatus(str, Enum):
-        BLOCKED = "BLOCKED"
-        PREPARE = "PREPARE"
-        UNKNOWN = "UNKNOWN"
-        VERIFIED = "VERIFIED"
-
-    @dataclass
-    class PortabilityReport:
-        compatible: bool
-        overall_status: PortabilityStatus
-        same_host_fast_path_available: bool = False
-        check_only_passed: Optional[bool] = None
-        trial_restore_passed: Optional[bool] = None
-        findings: List[ResourceFinding] = field(default_factory=list)
-        required_criu_flags: List[str] = field(default_factory=list)
-        estimated_cold_downtime_ms: float = 0.0
-        estimated_live_downtime_ms: float = 0.0
-
-        def to_dict(self) -> Dict[str, Any]:
-            st = self.overall_status.value if hasattr(self.overall_status, "value") else str(self.overall_status)
-            return {
-                "status": st,
-                "overall_status": st,
-                "compatible": self.compatible,
-                "same_host_fast_path_available": self.same_host_fast_path_available,
-                "check_only_passed": self.check_only_passed,
-                "trial_restore_passed": self.trial_restore_passed,
-                "findings": [f.to_dict() for f in self.findings],
-                "required_criu_flags": self.required_criu_flags,
-                "estimated_cold_downtime_ms": self.estimated_cold_downtime_ms,
-                "estimated_live_downtime_ms": self.estimated_live_downtime_ms,
-            }
-
-try:
-    from lkmp.preflight import evaluate_portability
-except ImportError:
-    evaluate_portability = None
+logger = get_logger("orchestrator")
 
 
 class MigrationOrchestrator:
@@ -120,6 +78,7 @@ class MigrationOrchestrator:
             self.config.attestation_key_hex = generate_ephemeral_key_hex()
 
         self._t_start: float = 0.0
+        self._freeze_start_ts: Optional[float] = None
         self._freeze_downtime_ms: float = 0.0
         self._precopy_stats: List[PreCopyIterationStats] = []
         self._restored_pid: Optional[int] = None
@@ -149,6 +108,31 @@ class MigrationOrchestrator:
                 note=note,
             )
 
+    def _enrich_runtime_profile(self, snapshot: ProcessSnapshotInfo) -> None:
+        """Populate `workload_kind` and `runtime_metadata` from source process-tree fingerprint."""
+        if (self.config.workload_kind or "auto").lower() == WorkloadKind.AUTO.value:
+            self.config.workload_kind = (snapshot.workload_kind or WorkloadKind.POSIX_TREE.value).lower()
+
+        prof = snapshot.runtime_profile or {}
+        if not prof:
+            return
+        meta = dict(self.config.runtime_metadata or {})
+        if prof.get("control_socket") and "qmp_socket" not in meta:
+            meta["qmp_socket"] = prof["control_socket"]
+        if prof.get("control_socket") and "control_socket" not in meta:
+            meta["control_socket"] = prof["control_socket"]
+        if prof.get("cmdline") and "qemu_cmdline" not in meta:
+            meta["qemu_cmdline"] = list(prof["cmdline"])
+        if prof.get("container_id") and "container_id" not in meta:
+            meta["container_id"] = prof["container_id"]
+        if prof.get("container_engine") and "container_engine" not in meta:
+            meta["container_engine"] = prof["container_engine"]
+        if prof.get("subkind") and "subkind" not in meta:
+            meta["subkind"] = prof["subkind"]
+        if prof.get("overlay_upperdir") and "overlay_upperdir" not in meta:
+            meta["overlay_upperdir"] = prof["overlay_upperdir"]
+        self.config.runtime_metadata = meta
+
     def run_preflight(self) -> PreflightReport:
         """Execute Phase 1 (Preflight) without modifying either host."""
         self._transition(MigrationState.PREFLIGHT, commit_decision="PREPARING")
@@ -165,6 +149,7 @@ class MigrationOrchestrator:
             ghost_limit_bytes=self.config.ghost_limit_bytes,
         )
         snapshot = ProcessSnapshotInfo.from_dict(snap_raw)
+        self._enrich_runtime_profile(snapshot)
 
         file_paths = [f.path for f in snapshot.files if not f.is_deleted]
         dst_files_raw = self.dest.call("stat_files", paths=file_paths)
@@ -173,13 +158,16 @@ class MigrationOrchestrator:
         }
 
         if self.config.strategy == MigrationStrategy.AUTO:
-            chosen_strategy, _reason = select_optimal_strategy(
-                rss_bytes=snapshot.rss_bytes,
-                dirty_rate_bytes_per_sec=snapshot.dirty_rate_bytes_per_sec,
-                bandwidth_mbps=self.config.estimated_bandwidth_mbps,
-                has_userfaultfd=dst_caps.has_userfaultfd,
-            )
-            self.config.strategy = chosen_strategy
+            if (self.config.workload_kind or "").lower() == WorkloadKind.QEMU_VM.value:
+                self.config.strategy = MigrationStrategy.PRE_COPY
+            else:
+                chosen_strategy, _reason = select_optimal_strategy(
+                    rss_bytes=snapshot.rss_bytes,
+                    dirty_rate_bytes_per_sec=snapshot.dirty_rate_bytes_per_sec,
+                    bandwidth_mbps=self.config.estimated_bandwidth_mbps,
+                    has_userfaultfd=dst_caps.has_userfaultfd,
+                )
+                self.config.strategy = chosen_strategy
 
         report = evaluate_compatibility(
             config=self.config,
@@ -230,6 +218,7 @@ class MigrationOrchestrator:
             active_sample_ms=getattr(self.config, "active_sample_ms", 0),
         )
         snapshot = ProcessSnapshotInfo.from_dict(snap_raw)
+        self._enrich_runtime_profile(snapshot)
 
         file_paths = [f.path for f in snapshot.files if not f.is_deleted]
         dst_files_raw = self.dest.call("stat_files", paths=file_paths)
@@ -396,179 +385,281 @@ class MigrationOrchestrator:
 
         cfg_dict = config_to_dict(self.config)
         prev_round: Optional[str] = None
-
-        try:
-            # Phase 2: Prepare
-            self._transition(MigrationState.PREPARE, commit_decision="PREPARING")
-            self.source.call("prepare_migration", migration_id=self.migration_id)
-            dst_prep = self.dest.call("prepare_migration", migration_id=self.migration_id)
-            dest_images_dir = (
-                dst_prep.get("images_dir")
-                if isinstance(dst_prep, dict) and self.config.same_host_cow
-                else None
+        use_driver_prepare = (
+            (self.config.workload_kind or "auto").lower()
+            in (
+                WorkloadKind.QEMU_VM.value,
+                WorkloadKind.OCI_CONTAINER.value,
+                WorkloadKind.MICROVM.value,
             )
-            dest_probe_token = (
-                dst_prep.get("storage_probe_token")
-                if isinstance(dst_prep, dict) and self.config.same_host_cow
-                else None
-            )
+            or bool(self.config.prefer_tmpfs_work_dir)
+        )
 
-            if self.config.fs_mode == FilesystemMode.RSYNC:
-                self.source.call(
-                    "pre_sync_fs",
-                    config_dict=cfg_dict,
-                    dest_host=self.dest.host,
-                )
-
-            # Phase 3: Iterative Pre-Copy (if PRE_COPY or HYBRID)
-            if self.config.strategy in (MigrationStrategy.PRE_COPY, MigrationStrategy.HYBRID):
-                tracker = PreCopyConvergenceTracker(
-                    bandwidth_mbps=self.config.estimated_bandwidth_mbps,
-                    target_downtime_ms=self.config.target_downtime_ms,
-                    min_shrink_ratio=self.config.min_shrink_ratio,
-                    max_iterations=self.config.max_precopy_iterations,
-                )
-                for iteration in range(1, self.config.max_precopy_iterations + 1):
-                    self._transition(MigrationState.PRE_COPY, commit_decision="PREPARING")
-                    round_name = str(iteration)
-                    self.dest.call(
-                        "start_page_server",
+        with migration_log_context(
+            migration_id=self.migration_id,
+            gang_id=self.gang_id,
+            pid=self.config.pid,
+            driver=self.config.workload_kind,
+        ):
+            try:
+                # Phase 2: Prepare
+                self._transition(MigrationState.PREPARE, commit_decision="PREPARING")
+                if use_driver_prepare:
+                    self.source.call(
+                        "prepare_migration",
                         migration_id=self.migration_id,
-                        round_name=round_name,
-                        prev_round_name=prev_round,
                         config_dict=cfg_dict,
+                        is_dest=False,
                     )
-                    predump_res = self.source.call(
-                        "run_pre_dump",
+                    dst_prep = self.dest.call(
+                        "prepare_migration",
                         migration_id=self.migration_id,
-                        round_name=round_name,
-                        prev_round_name=prev_round,
+                        config_dict=cfg_dict,
+                        is_dest=True,
+                    )
+                else:
+                    self.source.call("prepare_migration", migration_id=self.migration_id)
+                    dst_prep = self.dest.call("prepare_migration", migration_id=self.migration_id)
+                dest_images_dir = (
+                    dst_prep.get("images_dir")
+                    if isinstance(dst_prep, dict) and self.config.same_host_cow
+                    else None
+                )
+                dest_probe_token = (
+                    dst_prep.get("storage_probe_token")
+                    if isinstance(dst_prep, dict) and self.config.same_host_cow
+                    else None
+                )
+
+                if self.config.fs_mode == FilesystemMode.RSYNC:
+                    self.source.call(
+                        "pre_sync_fs",
+                        config_dict=cfg_dict,
                         dest_host=self.dest.host,
-                        config_dict=cfg_dict,
                     )
-                    if not predump_res or "dirty_bytes" not in predump_res:
-                        break
-                    ps_final = self.dest.call(
-                        "finalize_page_server_round",
-                        migration_id=self.migration_id,
-                        round_name=round_name,
-                    )
-                    prev_round = round_name
-                    # Prefer actual received page-server bytes on B, fallback to local A size
-                    dirty_bytes = max(
-                        int(ps_final.get("received_dirty_bytes", 0)) if ps_final else 0,
-                        int(predump_res["dirty_bytes"]),
-                    )
-                    duration_ms = float(predump_res.get("duration_ms", 0.0))
 
-                    decision = tracker.evaluate(
-                        iteration=iteration,
-                        dirty_bytes=dirty_bytes,
-                        duration_ms=duration_ms,
+                # Phase 3: Iterative Pre-Copy (if PRE_COPY or HYBRID)
+                if self.config.strategy in (MigrationStrategy.PRE_COPY, MigrationStrategy.HYBRID):
+                    tracker = PreCopyConvergenceTracker(
+                        bandwidth_mbps=self.config.estimated_bandwidth_mbps,
+                        target_downtime_ms=self.config.target_downtime_ms,
+                        min_shrink_ratio=self.config.min_shrink_ratio,
+                        max_iterations=self.config.max_precopy_iterations,
                     )
-                    self._precopy_stats.append(
-                        PreCopyIterationStats(
+                    for iteration in range(1, self.config.max_precopy_iterations + 1):
+                        self._transition(MigrationState.PRE_COPY, commit_decision="PREPARING")
+                        round_name = str(iteration)
+                        self.dest.call(
+                            "start_page_server",
+                            migration_id=self.migration_id,
+                            round_name=round_name,
+                            prev_round_name=prev_round,
+                            config_dict=cfg_dict,
+                        )
+                        predump_res = self.source.call(
+                            "run_pre_dump",
+                            migration_id=self.migration_id,
+                            round_name=round_name,
+                            prev_round_name=prev_round,
+                            dest_host=self.dest.host,
+                            config_dict=cfg_dict,
+                        )
+                        if not predump_res or "dirty_bytes" not in predump_res:
+                            break
+                        ps_final = self.dest.call(
+                            "finalize_page_server_round",
+                            migration_id=self.migration_id,
+                            round_name=round_name,
+                        )
+                        prev_round = round_name
+                        # Prefer actual received page-server bytes on B, fallback to local A size
+                        dirty_bytes = max(
+                            int(ps_final.get("received_dirty_bytes", 0)) if ps_final else 0,
+                            int(predump_res["dirty_bytes"]),
+                        )
+                        duration_ms = float(predump_res.get("duration_ms", 0.0))
+
+                        decision = tracker.evaluate(
                             iteration=iteration,
                             dirty_bytes=dirty_bytes,
                             duration_ms=duration_ms,
-                            converged=decision.converged,
-                            stop_reason=decision.reason if decision.should_stop else None,
                         )
+                        self._precopy_stats.append(
+                            PreCopyIterationStats(
+                                iteration=iteration,
+                                dirty_bytes=dirty_bytes,
+                                duration_ms=duration_ms,
+                                converged=decision.converged,
+                                stop_reason=decision.reason if decision.should_stop else None,
+                            )
+                        )
+                        if decision.should_stop:
+                            if (
+                                decision.recommend_hybrid_upgrade
+                                and self.config.allow_hybrid_upgrade
+                                and self._dest_has_userfaultfd
+                                and self.config.strategy == MigrationStrategy.PRE_COPY
+                            ):
+                                self.config.strategy = MigrationStrategy.HYBRID
+                                cfg_dict = config_to_dict(self.config)
+                            break
+
+                # Pre-spawn final page-server BEFORE freeze_start so daemon startup is outside blackout!
+                if self.config.strategy == MigrationStrategy.PRE_COPY:
+                    self.dest.call(
+                        "start_page_server",
+                        migration_id=self.migration_id,
+                        round_name="final",
+                        prev_round_name=prev_round,
+                        config_dict=cfg_dict,
                     )
-                    if decision.should_stop:
-                        if (
-                            decision.recommend_hybrid_upgrade
-                            and self.config.allow_hybrid_upgrade
-                            and self._dest_has_userfaultfd
-                            and self.config.strategy == MigrationStrategy.PRE_COPY
-                        ):
-                            self.config.strategy = MigrationStrategy.HYBRID
-                            cfg_dict = config_to_dict(self.config)
-                        break
 
-            # Phase 4: Freeze & Final Dump (Downtime begins)
-            self._transition(MigrationState.FREEZE, commit_decision="PREPARING")
-            freeze_start = time.monotonic()
+                # Phase 4: Freeze & Final Dump (Downtime begins)
+                self._transition(MigrationState.FREEZE, commit_decision="PREPARING")
+                freeze_start = time.monotonic()
+                self._freeze_start_ts = freeze_start
 
-            if self.config.strategy == MigrationStrategy.PRE_COPY:
-                self.dest.call(
-                    "start_page_server",
+                self._transition(MigrationState.FINAL_DUMP, commit_decision="PREPARING")
+                self.source.call(
+                    "freeze_and_final_dump",
                     migration_id=self.migration_id,
-                    round_name="final",
                     prev_round_name=prev_round,
+                    dest_host=self.dest.host,
                     config_dict=cfg_dict,
                 )
 
-            self._transition(MigrationState.FINAL_DUMP, commit_decision="PREPARING")
-            self.source.call(
-                "freeze_and_final_dump",
-                migration_id=self.migration_id,
-                prev_round_name=prev_round,
-                dest_host=self.dest.host,
-                config_dict=cfg_dict,
-            )
+                dest_pages_merkle_root: Optional[str] = None
+                if (
+                    self.config.strategy == MigrationStrategy.PRE_COPY
+                    and self.config.verify_attestation
+                    and (self.config.workload_kind or "auto").lower()
+                    not in (
+                        WorkloadKind.QEMU_VM.value,
+                        WorkloadKind.OCI_CONTAINER.value,
+                        WorkloadKind.MICROVM.value,
+                    )
+                ):
+                    ps_final = self.dest.call(
+                        "finalize_page_server_round",
+                        migration_id=self.migration_id,
+                        round_name="final",
+                    )
+                    dest_pages_merkle_root = ps_final.get("dest_pages_merkle_root") if ps_final else None
 
-            dest_pages_merkle_root: Optional[str] = None
-            if self.config.strategy == MigrationStrategy.PRE_COPY and self.config.verify_attestation:
-                ps_final = self.dest.call(
-                    "finalize_page_server_round",
+                # Phase 5: Transfer metadata, manifest.sig.json & final filesystem delta
+                self._transition(MigrationState.TRANSFER, commit_decision="PREPARING")
+                transfer_kwargs: Dict[str, object] = {
+                    "migration_id": self.migration_id,
+                    "dest_host": self.dest.host,
+                    "config_dict": cfg_dict,
+                    "dest_pages_merkle_root": dest_pages_merkle_root,
+                }
+                if dest_images_dir:
+                    transfer_kwargs["dest_images_dir"] = dest_images_dir
+                if dest_probe_token:
+                    transfer_kwargs["dest_probe_token"] = dest_probe_token
+
+                inband_done = False
+                if self.config.inband_metadata_transfer:
+                    try:
+                        inband_res = self.source.call("export_inband_metadata", **transfer_kwargs)
+                        if isinstance(inband_res, dict) and inband_res.get("eligible"):
+                            if not inband_res.get("skip_upload"):
+                                self.dest.call(
+                                    "upload_checkpoint_files",
+                                    migration_id=self.migration_id,
+                                    round_name="final",
+                                    files_b64=inband_res.get("files_b64") or {},
+                                )
+                            if self.config.writable_paths or self.config.volume_snapshot_cmd:
+                                self.source.call(
+                                    "transfer_final_state",
+                                    **transfer_kwargs,
+                                    skip_images_sync=True,
+                                )
+                            inband_done = True
+                    except Exception:
+                        inband_done = False
+
+                if not inband_done:
+                    self.source.call("transfer_final_state", **transfer_kwargs)
+
+                # Phase 6: Release IP on Source A (while locked) & Restore on Destination B
+                # Note: `restore_process` assigns the IP on B BEFORE running `criu restore --tcp-established`
+                self._transition(MigrationState.RESTORE, commit_decision="PREPARING")
+                self.source.call(
+                    "release_ip",
+                    config_dict=cfg_dict,
                     migration_id=self.migration_id,
-                    round_name="final",
                 )
-                dest_pages_merkle_root = ps_final.get("dest_pages_merkle_root") if ps_final else None
+                restore_res = self.dest.call(
+                    "restore_process",
+                    migration_id=self.migration_id,
+                    source_host=self.source.host,
+                    config_dict=cfg_dict,
+                )
+                self._restored_pid = int(restore_res["restored_pid"])
+                raw_rst_st = restore_res.get("restored_starttime")
+                self._restored_starttime = int(raw_rst_st) if raw_rst_st is not None else None
+                if self.journal is not None:
+                    self.journal.append(
+                        state=MigrationState.RESTORE,
+                        commit_decision="PREPARING",
+                        restored_pid=self._restored_pid,
+                        restored_starttime=self._restored_starttime,
+                        note="Restore completed, pid recorded",
+                    )
 
-            # Phase 5: Transfer metadata, manifest.sig.json & final filesystem delta
-            self._transition(MigrationState.TRANSFER, commit_decision="PREPARING")
-            transfer_kwargs: Dict[str, object] = {
-                "migration_id": self.migration_id,
-                "dest_host": self.dest.host,
-                "config_dict": cfg_dict,
-                "dest_pages_merkle_root": dest_pages_merkle_root,
-            }
-            if dest_images_dir:
-                transfer_kwargs["dest_images_dir"] = dest_images_dir
-            if dest_probe_token:
-                transfer_kwargs["dest_probe_token"] = dest_probe_token
-            self.source.call("transfer_final_state", **transfer_kwargs)
+                if keep_stopped_on_prepare:
+                    # Keep process stopped and network-fenced on Destination B for gang coordination
+                    verify_res = self.dest.call(
+                        "verify_restored_stopped",
+                        restored_pid=self._restored_pid,
+                        migration_id=self.migration_id,
+                    )
+                    if not verify_res.get("healthy"):
+                        raise RuntimeError(
+                            f"Destination stopped verification failed: {verify_res.get('reason')}"
+                        )
+                    self._transition(MigrationState.VERIFY, commit_decision="PREPARED_STOPPED")
+                    return MigrationResult(
+                        migration_id=self.migration_id,
+                        success=True,
+                        final_state=MigrationState.VERIFY,
+                        restored_pid=self._restored_pid,
+                        total_duration_ms=round((time.monotonic() - self._t_start) * 1000.0, 2),
+                        freeze_downtime_ms=round(self._freeze_downtime_ms, 2),
+                        precopy_iterations=list(self._precopy_stats),
+                        rolled_back=False,
+                        state_history=list(self.state_history),
+                    )
 
-            # Phase 6: Release IP on Source A (while locked) & Restore on Destination B
-            # Note: `restore_process` assigns the IP on B BEFORE running `criu restore --tcp-established`
-            self._transition(MigrationState.RESTORE, commit_decision="PREPARING")
-            self.source.call(
-                "release_ip",
-                config_dict=cfg_dict,
-                migration_id=self.migration_id,
-            )
-            restore_res = self.dest.call(
-                "restore_process",
-                migration_id=self.migration_id,
-                source_host=self.source.host,
-                config_dict=cfg_dict,
-            )
-            self._restored_pid = int(restore_res["restored_pid"])
-            raw_rst_st = restore_res.get("restored_starttime")
-            self._restored_starttime = int(raw_rst_st) if raw_rst_st is not None else None
-            if self.journal is not None:
-                self.journal.append(
-                    state=MigrationState.RESTORE,
-                    commit_decision="PREPARING",
+                # Phase 7: Switchover (announce GARP/BGP, unlock network on B, resume process on B)
+                self._transition(MigrationState.SWITCHOVER, commit_decision="PREPARING")
+                self.dest.call(
+                    "claim_ip_and_resume",
                     restored_pid=self._restored_pid,
-                    restored_starttime=self._restored_starttime,
-                    note="Restore completed, pid recorded",
+                    target_host=self.dest.host,
+                    config_dict=cfg_dict,
+                    migration_id=self.migration_id,
                 )
+                self._freeze_downtime_ms = (time.monotonic() - freeze_start) * 1000.0
 
-            if keep_stopped_on_prepare:
-                # Keep process stopped and network-fenced on Destination B for gang coordination
+                # Phase 8: Verify on Destination B (Source A still frozen and alive!)
+                self._transition(MigrationState.VERIFY, commit_decision="PREPARING")
                 verify_res = self.dest.call(
-                    "verify_restored_stopped",
+                    "verify_process",
                     restored_pid=self._restored_pid,
+                    health_check_cmd=self.config.health_check_cmd,
+                    timeout_sec=self.config.health_check_timeout_sec,
                     migration_id=self.migration_id,
+                    expected_restored_starttime=self._restored_starttime,
                 )
                 if not verify_res.get("healthy"):
                     raise RuntimeError(
-                        f"Destination stopped verification failed: {verify_res.get('reason')}"
+                        f"Destination verification failed: {verify_res.get('reason')}"
                     )
-                self._transition(MigrationState.VERIFY, commit_decision="PREPARED_STOPPED")
+
                 return MigrationResult(
                     migration_id=self.migration_id,
                     success=True,
@@ -581,48 +672,10 @@ class MigrationOrchestrator:
                     state_history=list(self.state_history),
                 )
 
-            # Phase 7: Switchover (announce GARP/BGP, unlock network on B, resume process on B)
-            self._transition(MigrationState.SWITCHOVER, commit_decision="PREPARING")
-            self.dest.call(
-                "claim_ip_and_resume",
-                restored_pid=self._restored_pid,
-                target_host=self.dest.host,
-                config_dict=cfg_dict,
-                migration_id=self.migration_id,
-            )
-            self._freeze_downtime_ms = (time.monotonic() - freeze_start) * 1000.0
-
-            # Phase 8: Verify on Destination B (Source A still frozen and alive!)
-            self._transition(MigrationState.VERIFY, commit_decision="PREPARING")
-            verify_res = self.dest.call(
-                "verify_process",
-                restored_pid=self._restored_pid,
-                health_check_cmd=self.config.health_check_cmd,
-                timeout_sec=self.config.health_check_timeout_sec,
-                migration_id=self.migration_id,
-                expected_restored_starttime=self._restored_starttime,
-            )
-            if not verify_res.get("healthy"):
-                raise RuntimeError(
-                    f"Destination verification failed: {verify_res.get('reason')}"
-                )
-
-            return MigrationResult(
-                migration_id=self.migration_id,
-                success=True,
-                final_state=MigrationState.VERIFY,
-                restored_pid=self._restored_pid,
-                total_duration_ms=round((time.monotonic() - self._t_start) * 1000.0, 2),
-                freeze_downtime_ms=round(self._freeze_downtime_ms, 2),
-                precopy_iterations=list(self._precopy_stats),
-                rolled_back=False,
-                state_history=list(self.state_history),
-            )
-
-        except Exception as exc:
-            if freeze_start is not None and self._freeze_downtime_ms == 0.0:
-                self._freeze_downtime_ms = (time.monotonic() - freeze_start) * 1000.0
-            return self.rollback(str(exc))
+            except Exception as exc:
+                if freeze_start is not None and self._freeze_downtime_ms == 0.0:
+                    self._freeze_downtime_ms = (time.monotonic() - freeze_start) * 1000.0
+                return self.rollback(str(exc))
 
     def complete_switchover_and_verify(self) -> None:
         """
@@ -638,6 +691,8 @@ class MigrationOrchestrator:
             config_dict=cfg_dict,
             migration_id=self.migration_id,
         )
+        if self._freeze_start_ts is not None and self._freeze_downtime_ms == 0.0:
+            self._freeze_downtime_ms = (time.monotonic() - self._freeze_start_ts) * 1000.0
         self._transition(MigrationState.VERIFY, commit_decision="COMMITTED")
         verify_kwargs: Dict[str, object] = {
             "restored_pid": self._restored_pid,

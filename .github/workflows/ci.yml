@@ -24,6 +24,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install Ruff and run strict static lint gate
+        run: |
+          python3 -m pip install ruff
+          ruff check lkmp/ tests/ scripts/
+
       - name: Run unit & two-agent TCP RPC test suite
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
 
@@ -47,10 +52,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies & CRIU 4.2+ (iproute2, nftables, rsync, CRIU)
+      - name: Install system dependencies & CRIU 4.2+ (iproute2, nftables, rsync, QEMU, CRIU)
         run: |
           sudo apt-get update
-          sudo apt-get install -y iproute2 nftables rsync
+          sudo apt-get install -y iproute2 nftables rsync qemu-system-x86
           if ! sudo apt-get install -y criu || ! sudo criu check; then
             sudo bash scripts/install_criu_on_linux.sh
           fi
@@ -83,3 +88,6 @@ jobs:
 
       - name: Run real Linux CRIU E2E verification
         run: sudo python3 scripts/linux_criu_e2e.py
+
+      - name: Run real Linux QEMU & Heterogeneous 2PC Gang E2E verification
+        run: sudo python3 scripts/linux_qemu_e2e.py

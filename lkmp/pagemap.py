@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from lkmp.config import MigrationStrategy
 

@@ -76,6 +76,7 @@ class CriuDriver:
         tls: TlsConfig,
         prev_images_dir: Optional[str] = None,
         pidfile: Optional[str] = None,
+        auto_dedup: bool = False,
     ) -> List[str]:
         """
         Build `criu page-server --daemon` command so the RPC call returns immediately
@@ -95,6 +96,8 @@ class CriuDriver:
         ]
         if prev_images_dir:
             cmd.extend(["--prev-images-dir", prev_images_dir])
+            if auto_dedup:
+                cmd.append("--auto-dedup")
         cmd.extend(self._tls_args(tls))
         return cmd
 
@@ -116,6 +119,8 @@ class CriuDriver:
         ]
         if prev_images_dir:
             cmd.extend(["--prev-images-dir", prev_images_dir])
+            if config.auto_dedup:
+                cmd.append("--auto-dedup")
         if dest_host:
             cmd.extend(
                 [
@@ -149,6 +154,8 @@ class CriuDriver:
         ]
         if prev_images_dir:
             cmd.extend(["--prev-images-dir", prev_images_dir, "--track-mem"])
+            if config.auto_dedup:
+                cmd.append("--auto-dedup")
         elif config.strategy in (MigrationStrategy.PRE_COPY, MigrationStrategy.HYBRID):
             cmd.append("--track-mem")
 

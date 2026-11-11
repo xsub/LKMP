@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hmac
 import json
 import os
@@ -12,9 +13,55 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
-from lkmp.config import FilesystemMode, MigrationConfig, MigrationStrategy
+from lkmp.config import FilesystemMode, MigrationConfig
 
 STORAGE_PROBE_FILENAME = ".lkmp_storage_probe.json"
+FICLONE_IOCTL = 0x40049409  # Linux <linux/fs.h> _IOW(0x94, 9, int)
+
+
+def native_reflink_or_copy_file(src: Path, dst: Path) -> str:
+    """
+    Zero-fork kernel file clone:
+    1. Attempts `ioctl(dst_fd, FICLONE, src_fd)` on Linux (zero-copy CoW extent share on Btrfs/XFS/OCFS2).
+    2. Falls back to `os.copy_file_range` (in-kernel splice copy with zero userspace buffer transitions).
+    3. Falls back to `shutil.copy2` on platforms without `copy_file_range`.
+    Returns the mechanism used: `'ficlone'`, `'copy_file_range'`, or `'copy2'`.
+    """
+    st = src.stat()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform.startswith("linux"):
+        src_fd = os.open(src, os.O_RDONLY)
+        try:
+            dst_fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, st.st_mode & 0o7777)
+            try:
+                try:
+                    fcntl.ioctl(dst_fd, FICLONE_IOCTL, src_fd)
+                    shutil.copystat(src, dst, follow_symlinks=False)
+                    return "ficlone"
+                except OSError:
+                    pass
+
+                copy_range = getattr(os, "copy_file_range", None)
+                if callable(copy_range) and st.st_size > 0:
+                    remaining = st.st_size
+                    while remaining > 0:
+                        copied = copy_range(src_fd, dst_fd, min(remaining, 16 * 1024 * 1024))
+                        if copied <= 0:
+                            break
+                        remaining -= copied
+                    if remaining == 0:
+                        shutil.copystat(src, dst, follow_symlinks=False)
+                        return "copy_file_range"
+                elif st.st_size == 0:
+                    shutil.copystat(src, dst, follow_symlinks=False)
+                    return "copy_file_range"
+            finally:
+                os.close(dst_fd)
+        finally:
+            os.close(src_fd)
+
+    shutil.copy2(src, dst)
+    return "copy2"
 
 
 def _strip_endpoint(endpoint: str) -> str:
@@ -186,16 +233,19 @@ class FilesystemSyncManager:
             if not include_pages and item.name.startswith("pages-") and item.name.endswith(".img"):
                 continue
             dst_file = dst / item.name
-            if sys.platform == "darwin":
-                cmd = ["cp", "-c", str(item), str(dst_file)]
+            if self.runner is _default_runner:
+                native_reflink_or_copy_file(item, dst_file)
             else:
-                cmd = ["cp", "--reflink=auto", str(item), str(dst_file)]
-            try:
-                self.runner(cmd)
-                if not dst_file.exists():
+                if sys.platform == "darwin":
+                    cmd = ["cp", "-c", str(item), str(dst_file)]
+                else:
+                    cmd = ["cp", "--reflink=auto", str(item), str(dst_file)]
+                try:
+                    self.runner(cmd)
+                    if not dst_file.exists():
+                        shutil.copy2(item, dst_file)
+                except Exception:
                     shutil.copy2(item, dst_file)
-            except Exception:
-                shutil.copy2(item, dst_file)
             cloned.append(str(dst_file))
         return cloned
 

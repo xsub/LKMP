@@ -8,6 +8,7 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import tempfile
 import unittest
 import urllib.request
@@ -28,16 +29,12 @@ from lkmp.config import (
     MigrationStrategy,
     TlsConfig,
 )
-import subprocess
 from lkmp.convergence import PreCopyConvergenceTracker
 from lkmp.criu_driver import CriuDriver
-
-CommandResult = subprocess.CompletedProcess
 from lkmp.envelope import EnvelopeManager
-from tests.test_orchestrator_fsm import _FakeClusterHarness
 from lkmp.fs_sync import FilesystemSyncManager, format_rsync_remote
-from lkmp.journal import MigrationJournal, inspect_journal_file
-from lkmp.models import HostCapabilities, MigrationState, ProcessSnapshotInfo, ResourceClassification
+from lkmp.journal import inspect_journal_file
+from lkmp.models import HostCapabilities, ProcessSnapshotInfo, ResourceClassification
 from lkmp.network import NetworkMobilityManager, format_host_port, parse_host_port
 from lkmp.pagemap import (
     PAGE_SIZE,
@@ -47,6 +44,9 @@ from lkmp.pagemap import (
 )
 from lkmp.pki import generate_mtls_pki
 from lkmp.preflight import evaluate_portability
+from tests.test_orchestrator_fsm import _FakeClusterHarness
+
+CommandResult = subprocess.CompletedProcess
 
 
 def _loopback_tcp_allowed() -> bool:
@@ -73,7 +73,7 @@ def _loopback_ipv6_allowed() -> bool:
 
 class ComprehensiveEnhancementsTests(unittest.TestCase):
     def test_01_public_sdk_exports_and_version(self) -> None:
-        self.assertEqual(lkmp.__version__, "0.2.0")
+        self.assertEqual(lkmp.__version__, "0.3.0")
         self.assertTrue((Path(lkmp.__file__).parent / "py.typed").exists())
         for sym in (
             "AgentClient",

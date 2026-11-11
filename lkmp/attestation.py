@@ -10,7 +10,7 @@ import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -75,14 +75,18 @@ def compute_merkle_root(leaf_hashes: List[str]) -> str:
 
 
 def _hash_file(path: Path) -> str:
-    h = hashlib.sha256()
+    """Compute SHA-256 using C/OpenSSL GIL-releasing `hashlib.file_digest` when available."""
+    file_digest = getattr(hashlib, "file_digest", None)
     with path.open("rb") as f:
+        if callable(file_digest):
+            return file_digest(f, "sha256").hexdigest()
+        h = hashlib.sha256()
         while True:
-            chunk = f.read(65536)
+            chunk = f.read(262144)
             if not chunk:
                 break
             h.update(chunk)
-    return h.hexdigest()
+        return h.hexdigest()
 
 
 def compute_directory_img_digests(
