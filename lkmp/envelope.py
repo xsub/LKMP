@@ -50,7 +50,22 @@ class EnvelopeManager:
         if config.rootfs:
             cmd.extend(["--root", config.rootfs])
         cmd.append("--")
-        cmd.extend(config.command)
+        if config.hostname or config.bind_mounts:
+            import shlex
+
+            setup_steps: List[str] = []
+            for bm in config.bind_mounts:
+                if ":" not in bm:
+                    raise ValueError(f"Invalid bind_mount specification {bm!r}; expected 'src:dst'")
+                src_m, dst_m = bm.split(":", 1)
+                setup_steps.append(f"mkdir -p {shlex.quote(dst_m)} && mount --bind {shlex.quote(src_m)} {shlex.quote(dst_m)}")
+            if config.hostname:
+                setup_steps.append(f"hostname {shlex.quote(config.hostname)}")
+            exec_cmd = " ".join(shlex.quote(arg) for arg in config.command)
+            setup_steps.append(f"exec {exec_cmd}")
+            cmd.extend(["/bin/sh", "-c", " && ".join(setup_steps)])
+        else:
+            cmd.extend(config.command)
         return cmd
 
     def setup_cgroup(self, workload_id: str, pid: Optional[int] = None) -> Path:
@@ -129,6 +144,18 @@ class EnvelopeManager:
         """Load persisted metadata for an envelope."""
         meta_path = self.state_dir / f"{workload_id}.json"
         return json.loads(meta_path.read_text(encoding="utf-8"))
+
+    def list_envelopes(self) -> List[dict]:
+        """List all persisted workload envelopes sorted by `workload_id`."""
+        if not self.state_dir.exists():
+            return []
+        items: List[dict] = []
+        for meta_file in sorted(self.state_dir.glob("*.json")):
+            try:
+                items.append(json.loads(meta_file.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+        return items
 
     def launch(self, config: EnvelopeConfig) -> int:
         """Launch a process inside its migration envelope, attach cgroup v2, and record metadata."""

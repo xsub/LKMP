@@ -88,6 +88,7 @@ class MigrationOrchestrator:
         metrics: Optional[PrometheusMetricsCollector] = None,
         journal_dir: Optional[str | Path] = None,
         gang_id: Optional[str] = None,
+        require_persistent_journal: bool = True,
     ) -> None:
         self.config = config
         self.source = source_client
@@ -107,6 +108,7 @@ class MigrationOrchestrator:
                 j_dir,
                 self.migration_id,
                 gang_id=self.gang_id,
+                require_persistent=require_persistent_journal,
             )
 
         # Ensure an ephemeral per-migration attestation key is set if not already provided
@@ -459,7 +461,11 @@ class MigrationOrchestrator:
                     )
                     duration_ms = float(predump_res.get("duration_ms", 0.0))
 
-                    decision = tracker.evaluate(iteration=iteration, dirty_bytes=dirty_bytes)
+                    decision = tracker.evaluate(
+                        iteration=iteration,
+                        dirty_bytes=dirty_bytes,
+                        duration_ms=duration_ms,
+                    )
                     self._precopy_stats.append(
                         PreCopyIterationStats(
                             iteration=iteration,

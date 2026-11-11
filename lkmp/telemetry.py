@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from lkmp.models import (
     MigrationResult,
@@ -16,33 +17,62 @@ from lkmp.models import (
 
 
 class PrometheusMetricsCollector:
-    """In-memory OpenMetrics / Prometheus metrics collector for `lkmp-agent` and controller."""
+    """Thread-safe OpenMetrics / Prometheus metrics collector for `lkmp-agent` and controller."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.migrations_by_label: Dict[Tuple[str, str], int] = defaultdict(int)
         self.rollbacks_total: int = 0
         self.last_freeze_downtime_ms: float = 0.0
         self.last_total_duration_ms: float = 0.0
         self.last_precopy_rounds: int = 0
         self.precopy_dirty_bytes_total: int = 0
+        self.rpc_requests_by_method: Dict[str, int] = defaultdict(int)
+        self.rpc_errors_by_method: Dict[str, int] = defaultdict(int)
+        self.rpc_duration_ms_by_method: Dict[str, float] = defaultdict(float)
+        self.active_migrations: int = 0
 
     def record_migration(self, strategy: str, result: MigrationResult) -> None:
-        self.migrations_by_label[(strategy, result.final_state.value)] += 1
-        if result.rolled_back:
-            self.rollbacks_total += 1
-        self.last_freeze_downtime_ms = result.freeze_downtime_ms
-        self.last_total_duration_ms = result.total_duration_ms
-        self.last_precopy_rounds = len(result.precopy_iterations)
-        for it in result.precopy_iterations:
-            self.precopy_dirty_bytes_total += it.dirty_bytes
+        with self._lock:
+            self.migrations_by_label[(strategy, result.final_state.value)] += 1
+            if result.rolled_back:
+                self.rollbacks_total += 1
+            self.last_freeze_downtime_ms = result.freeze_downtime_ms
+            self.last_total_duration_ms = result.total_duration_ms
+            self.last_precopy_rounds = len(result.precopy_iterations)
+            for it in result.precopy_iterations:
+                self.precopy_dirty_bytes_total += it.dirty_bytes
+
+    def record_rpc(self, method: str, duration_ms: float, error: bool = False) -> None:
+        with self._lock:
+            self.rpc_requests_by_method[method] += 1
+            self.rpc_duration_ms_by_method[method] += max(0.0, duration_ms)
+            if error:
+                self.rpc_errors_by_method[method] += 1
+
+    def set_active_migrations(self, count: int) -> None:
+        with self._lock:
+            self.active_migrations = max(0, int(count))
 
     def export_prometheus_text(self) -> str:
         """Render collected telemetry in standard Prometheus / OpenMetrics text format."""
+        with self._lock:
+            mig_items = sorted(self.migrations_by_label.items())
+            rollbacks = self.rollbacks_total
+            last_freeze = self.last_freeze_downtime_ms
+            last_total = self.last_total_duration_ms
+            last_rounds = self.last_precopy_rounds
+            dirty_total = self.precopy_dirty_bytes_total
+            rpc_reqs = sorted(self.rpc_requests_by_method.items())
+            rpc_errs = sorted(self.rpc_errors_by_method.items())
+            rpc_durs = sorted(self.rpc_duration_ms_by_method.items())
+            active_migs = self.active_migrations
+
         lines: List[str] = [
             "# HELP lkmp_migrations_total Total process migrations attempted by strategy and final state.",
             "# TYPE lkmp_migrations_total counter",
         ]
-        for (strategy, state), count in sorted(self.migrations_by_label.items()):
+        for (strategy, state), count in mig_items:
             lines.append(
                 f'lkmp_migrations_total{{strategy="{strategy}",final_state="{state}"}} {count}'
             )
@@ -50,21 +80,44 @@ class PrometheusMetricsCollector:
             [
                 "# HELP lkmp_rollbacks_total Total migrations that triggered transactional rollback.",
                 "# TYPE lkmp_rollbacks_total counter",
-                f"lkmp_rollbacks_total {self.rollbacks_total}",
+                f"lkmp_rollbacks_total {rollbacks}",
                 "# HELP lkmp_last_freeze_downtime_milliseconds Freeze window downtime of the most recent migration.",
                 "# TYPE lkmp_last_freeze_downtime_milliseconds gauge",
-                f"lkmp_last_freeze_downtime_milliseconds {self.last_freeze_downtime_ms:.2f}",
+                f"lkmp_last_freeze_downtime_milliseconds {last_freeze:.2f}",
                 "# HELP lkmp_last_total_duration_milliseconds Total wall-clock duration of the most recent migration.",
                 "# TYPE lkmp_last_total_duration_milliseconds gauge",
-                f"lkmp_last_total_duration_milliseconds {self.last_total_duration_ms:.2f}",
+                f"lkmp_last_total_duration_milliseconds {last_total:.2f}",
                 "# HELP lkmp_last_precopy_rounds Number of iterative pre-dump rounds in the most recent migration.",
                 "# TYPE lkmp_last_precopy_rounds gauge",
-                f"lkmp_last_precopy_rounds {self.last_precopy_rounds}",
+                f"lkmp_last_precopy_rounds {last_rounds}",
                 "# HELP lkmp_precopy_dirty_bytes_total Cumulative dirty memory bytes streamed across pre-dump rounds.",
                 "# TYPE lkmp_precopy_dirty_bytes_total counter",
-                f"lkmp_precopy_dirty_bytes_total {self.precopy_dirty_bytes_total}",
+                f"lkmp_precopy_dirty_bytes_total {dirty_total}",
+                "# HELP lkmp_active_migrations Currently frozen/in-flight source migrations on this agent.",
+                "# TYPE lkmp_active_migrations gauge",
+                f"lkmp_active_migrations {active_migs}",
+                "# HELP lkmp_rpc_requests_total Total control-plane RPC requests handled by method.",
+                "# TYPE lkmp_rpc_requests_total counter",
             ]
         )
+        for method, count in rpc_reqs:
+            lines.append(f'lkmp_rpc_requests_total{{method="{method}"}} {count}')
+        lines.extend(
+            [
+                "# HELP lkmp_rpc_errors_total Total control-plane RPC errors by method.",
+                "# TYPE lkmp_rpc_errors_total counter",
+            ]
+        )
+        for method, count in rpc_errs:
+            lines.append(f'lkmp_rpc_errors_total{{method="{method}"}} {count}')
+        lines.extend(
+            [
+                "# HELP lkmp_rpc_duration_milliseconds_total Cumulative RPC execution duration in milliseconds by method.",
+                "# TYPE lkmp_rpc_duration_milliseconds_total counter",
+            ]
+        )
+        for method, dur in rpc_durs:
+            lines.append(f'lkmp_rpc_duration_milliseconds_total{{method="{method}"}} {dur:.2f}')
         return "\n".join(lines) + "\n"
 
 
@@ -196,4 +249,106 @@ def render_portability_report(report: PortabilityReport) -> str:
             flag_info = f" -> suggested flag: {f.suggested_flag}" if f.suggested_flag else ""
             lines.append(f"  • [{tag}] {f.resource_type} ({f.identifier}): {f.reason}{flag_info}")
 
+    return "\n".join(lines)
+
+
+def render_gang_migration_report(result: Any) -> str:
+    """Render a terminal summary table for `lkmp gang-migrate` or `lkmp recover --gang-journal`."""
+    data = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+    gang_id = str(data.get("gang_id", "unknown"))
+    all_committed = bool(data.get("all_committed"))
+    rollback_triggered = bool(data.get("atomic_rollback_triggered"))
+    outcome = (
+        "ALL MEMBERS COMMITTED (2PC)"
+        if all_committed
+        else ("ATOMIC ROLLBACK COMPLETE" if rollback_triggered else "PARTIAL / ERROR")
+    )
+    members = data.get("member_results") or []
+    dur_str = f"{float(data.get('total_duration_ms', 0.0)):.2f} ms"
+    lines = [
+        "┌──────────────────────────────────────────────────────────────────────────┐",
+        "│ LKMP 2PC GANG MIGRATION SUMMARY                                          │",
+        "├──────────────────────────────┬───────────────────────────────────────────┤",
+        f"│ Gang ID                      │ {gang_id:<41} │",
+        f"│ Outcome                      │ {outcome:<41} │",
+        f"│ Member Count                 │ {len(members):<41} │",
+        f"│ Total Duration               │ {dur_str:<41} │",
+        "└──────────────────────────────┴───────────────────────────────────────────┘",
+    ]
+    if members:
+        lines.append("\nMembers:")
+        for idx, m in enumerate(members):
+            mid = m.get("migration_id", f"m{idx}")
+            st = m.get("final_state", "unknown")
+            rpid = m.get("restored_pid")
+            rpid_str = f"restored_pid={rpid}" if rpid is not None else "source_active"
+            lines.append(f"  • [{idx}] {mid}: state={st} ({rpid_str})")
+    if data.get("failed_member_index") is not None:
+        lines.append(
+            f"\nFailure Index {data['failed_member_index']}: {data.get('failure_reason') or 'unknown'}"
+        )
+    return "\n".join(lines)
+
+
+def render_wal_inspection_report(report: Any) -> str:
+    """Render a terminal diagnostic summary for `lkmp wal-inspect`."""
+    data = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+    verdict = "VALID" if data.get("valid") else "CORRUPTED / INCOMPLETE"
+    csum_ok = "OK" if (data.get("checksums_ok") and data.get("monotonic_seq_ok")) else "FAIL"
+    rpid_val = data.get("restored_pid")
+    rpid_str = (
+        f"{rpid_val} ({data.get('restored_starttime')})"
+        if rpid_val is not None
+        else "none"
+    )
+    lines = [
+        "┌──────────────────────────────────────────────────────────────────────────┐",
+        "│ LKMP WAL JOURNAL DIAGNOSTIC REPORT                                       │",
+        "├──────────────────────────────┬───────────────────────────────────────────┤",
+        f"│ Verdict                      │ {verdict:<41} │",
+        f"│ Migration / Gang ID          │ {str(data.get('migration_id') or 'N/A'):<41} │",
+        f"│ Coupled Gang ID              │ {str(data.get('coupled_gang_id') or 'none'):<41} │",
+        f"│ Valid Entries                │ {int(data.get('entry_count', 0)):<41} │",
+        f"│ Checksums & Monotonic Seq    │ {csum_ok:<41} │",
+        f"│ Discarded Torn Tail          │ {str(bool(data.get('discarded_torn_tail'))):<41} │",
+        f"│ Last Commit Decision         │ {str(data.get('last_commit_decision') or 'N/A'):<41} │",
+        f"│ Restored PID (starttime)     │ {rpid_str:<41} │",
+        "└──────────────────────────────┴───────────────────────────────────────────┘",
+    ]
+    if data.get("expected_member_ids"):
+        lines.append(f"\nExpected Gang Members: {', '.join(data['expected_member_ids'])}")
+    if data.get("missing_member_wals"):
+        lines.append("Missing Member WALs:")
+        for p in data["missing_member_wals"]:
+            lines.append(f"  • {p}")
+    if data.get("entries"):
+        lines.append("\nJournal Sequence:")
+        for e in data["entries"]:
+            lines.append(
+                f"  seq={e['seq']:>2} | decision={e['commit_decision']:<16} | state={e['state']:<18} | sha256={e['checksum_prefix']}..."
+            )
+    if data.get("corruption_error"):
+        lines.append(f"\nDiagnostic Error:\n  {data['corruption_error']}")
+    return "\n".join(lines)
+
+
+def render_agent_status_report(status: Dict[str, Any]) -> str:
+    """Render a formatted terminal scorecard for `lkmp status`."""
+    caps = status.get("capabilities") or {}
+    free_b = caps.get("work_dir_free_bytes")
+    free_str = format_bytes(int(free_b)) if isinstance(free_b, int) else "unknown"
+    arch_kern = f"{caps.get('arch', '?')} / {caps.get('kernel_release', '?')}"
+    criu_str = f"{caps.get('criu_available', False)} ({caps.get('criu_version') or 'N/A'})"
+    lines = [
+        "┌──────────────────────────────────────────────────────────────────────────┐",
+        "│ LKMP AGENT NODE HEALTH & CAPABILITIES                                    │",
+        "├──────────────────────────────┬───────────────────────────────────────────┤",
+        f"│ Status                       │ {str(status.get('status', 'unknown')).upper():<41} │",
+        f"│ Hostname                     │ {str(caps.get('hostname', status.get('hostname', 'unknown'))):<41} │",
+        f"│ Architecture / Kernel        │ {arch_kern:<41} │",
+        f"│ CRIU Available / Version     │ {criu_str:<41} │",
+        f"│ Active Frozen Migrations     │ {str(status.get('active_migrations', 0)):<41} │",
+        f"│ Work Dir Free Space          │ {free_str:<41} │",
+        "└──────────────────────────────┴───────────────────────────────────────────┘",
+    ]
     return "\n".join(lines)

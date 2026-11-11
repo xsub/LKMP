@@ -102,6 +102,7 @@ class HostCapabilities:
     criu_check_extra_ok: Optional[bool] = None
     criu_checked_features: Dict[str, bool] = field(default_factory=dict)
     host_id: Optional[str] = None
+    work_dir_free_bytes: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

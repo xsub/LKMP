@@ -25,6 +25,55 @@ class TcpRepairError(RuntimeError):
     """Raised when kernel TCP_REPAIR state cannot be applied and confirmed on a target PID."""
 
 
+def parse_host_port(address: str, default_port: int = 9700) -> tuple[str, int]:
+    """
+    Parse an endpoint string into `(bare_host, port)` supporting IPv4, hostnames,
+    bracketed IPv6 (`[::1]:9700`, `[2001:db8::1]`), and bare IPv6 (`2001:db8::1`, `::1`).
+    """
+    raw = address.strip()
+    if not raw:
+        raise ValueError("Endpoint address cannot be empty")
+
+    if raw.startswith("["):
+        close_idx = raw.find("]")
+        if close_idx == -1:
+            raise ValueError(f"Malformed bracketed IPv6 endpoint: {address!r}")
+        host = raw[1:close_idx]
+        rest = raw[close_idx + 1 :]
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":") or not rest[1:].isdigit():
+            raise ValueError(f"Malformed port in endpoint: {address!r}")
+        port = int(rest[1:])
+        if not (0 <= port <= 65535):
+            raise ValueError(f"Port out of range in endpoint: {address!r}")
+        return host, port
+
+    if raw.count(":") > 1:
+        # Bare IPv6 literal without port (e.g. "2001:db8::1" or "::1")
+        ipaddress.ip_address(raw)
+        return raw, default_port
+
+    if ":" in raw:
+        host_part, port_part = raw.rsplit(":", 1)
+        if not port_part.isdigit():
+            raise ValueError(f"Invalid numeric port in endpoint: {address!r}")
+        port = int(port_part)
+        if not (0 <= port <= 65535):
+            raise ValueError(f"Port out of range in endpoint: {address!r}")
+        return host_part, port
+
+    return raw, default_port
+
+
+def format_host_port(host: str, port: int) -> str:
+    """Format `(host, port)` with RFC 3986 brackets when `host` is an IPv6 literal."""
+    clean_host = host.strip("[]")
+    if ":" in clean_host:
+        return f"[{clean_host}]:{port}"
+    return f"{clean_host}:{port}"
+
+
 @dataclass(frozen=True)
 class TcpRepairResult:
     """Verified outcome of applying and reading back TCP_REPAIR across a process's sockets."""
@@ -453,16 +502,41 @@ class NetworkMobilityManager:
         if config.ip_mobility == IpMobilityMode.BGP:
             af = "ipv6" if addr.version == 6 else "ipv4"
             host_route = f"{bare_ip}/128" if addr.version == 6 else f"{bare_ip}/32"
-            cmds.append(["gobgp", "global", "rib", "del", "-a", af, host_route])
+            if config.bgp_daemon_cmd:
+                src_host, _ = parse_host_port(config.source_addr)
+                formatted = config.bgp_daemon_cmd.format(
+                    action="del",
+                    op="withdraw",
+                    ip=bare_ip,
+                    prefix=host_route,
+                    af=af,
+                    host=src_host,
+                    interface=config.net_interface,
+                )
+                cmds.append(shlex.split(formatted))
+            else:
+                cmds.append(["gobgp", "global", "rib", "del", "-a", af, host_route])
         elif config.ip_mobility == IpMobilityMode.TUNNEL:
-            dest_host = config.dest_addr.split(":", 1)[0]
+            dest_host, _ = parse_host_port(config.dest_addr)
             host_route = f"{bare_ip}/128" if addr.version == 6 else f"{bare_ip}/32"
             tun_dev = self.tunnel_dev_for(migration_id)
+            use_v6_tun = addr.version == 6
+            if not use_v6_tun:
+                try:
+                    use_v6_tun = ipaddress.ip_address(dest_host).version == 6
+                except ValueError:
+                    use_v6_tun = False
+            if use_v6_tun:
+                tun_add_cmd = ["ip", "-6", "tunnel", "add", tun_dev, "mode", "ip6ip6", "remote", dest_host]
+                route_cmd = ["ip", "-6", "route", "replace", host_route, "dev", tun_dev]
+            else:
+                tun_add_cmd = ["ip", "tunnel", "add", tun_dev, "mode", "ipip", "remote", dest_host]
+                route_cmd = ["ip", "route", "replace", host_route, "dev", tun_dev]
             cmds.extend(
                 [
-                    ["ip", "tunnel", "add", tun_dev, "mode", "ipip", "remote", dest_host],
+                    tun_add_cmd,
                     ["ip", "link", "set", tun_dev, "up"],
-                    ["ip", "route", "replace", host_route, "dev", tun_dev],
+                    route_cmd,
                 ]
             )
 
@@ -473,8 +547,40 @@ class NetworkMobilityManager:
                 err_text = f"{exc.stderr or ''} {exc.stdout or ''}"
                 if cmd[:3] == ["ip", "addr", "del"] and "Cannot assign requested address" in err_text:
                     continue
+                if "tunnel" in cmd and "add" in cmd and ("File exists" in err_text or "exist" in err_text.lower()):
+                    tun_dev = self.tunnel_dev_for(migration_id)
+                    try:
+                        self.runner(["ip", "link", "del", tun_dev])
+                    except subprocess.CalledProcessError:
+                        pass
+                    self.runner(cmd)
+                    continue
                 raise
         return cmds
+
+    def teardown_tunnel(
+        self,
+        config: MigrationConfig,
+        migration_id: Optional[str] = None,
+    ) -> List[List[str]]:
+        """Idempotently remove any temporary IPIP/IP6IP6 forwarding tunnel device for `migration_id`."""
+        if config.ip_mobility != IpMobilityMode.TUNNEL:
+            return []
+        tun_dev = self.tunnel_dev_for(migration_id)
+        cmd = ["ip", "link", "del", tun_dev]
+        try:
+            self.runner(cmd)
+        except subprocess.CalledProcessError as exc:
+            err_text = f"{exc.stderr or ''} {exc.stdout or ''}".lower()
+            if (
+                "cannot find device" in err_text
+                or "does not exist" in err_text
+                or "no such device" in err_text
+                or exc.returncode in (1, 2)
+            ):
+                return [cmd]
+            raise
+        return [cmd]
 
     def announce_ip_on_host(
         self,
@@ -511,7 +617,20 @@ class NetworkMobilityManager:
         elif config.ip_mobility == IpMobilityMode.BGP:
             af = "ipv6" if addr.version == 6 else "ipv4"
             host_route = f"{bare_ip}/128" if addr.version == 6 else f"{bare_ip}/32"
-            cmds.append(["gobgp", "global", "rib", "add", "-a", af, host_route])
+            if config.bgp_daemon_cmd:
+                clean_target, _ = parse_host_port(target_host)
+                formatted = config.bgp_daemon_cmd.format(
+                    action="add",
+                    op="announce",
+                    ip=bare_ip,
+                    prefix=host_route,
+                    af=af,
+                    host=clean_target,
+                    interface=config.net_interface,
+                )
+                cmds.append(shlex.split(formatted))
+            else:
+                cmds.append(["gobgp", "global", "rib", "add", "-a", af, host_route])
         elif config.ip_mobility == IpMobilityMode.CLOUD:
             if not config.cloud_move_cmd:
                 raise ValueError("IpMobilityMode.CLOUD requires cloud_move_cmd")

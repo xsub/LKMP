@@ -17,6 +17,7 @@ class ConvergenceDecision:
     threshold_bytes: int
     predicted_floor_bytes: Optional[int] = None
     recommend_hybrid_upgrade: bool = False
+    observed_bandwidth_mbps: Optional[float] = None
 
 
 class PreCopyConvergenceTracker:
@@ -66,17 +67,26 @@ class PreCopyConvergenceTracker:
         d_inf = (d0 * d2 - d1 * d1) / float(denom)
         return max(0, int(d_inf))
 
-    def evaluate(self, iteration: int, dirty_bytes: int) -> ConvergenceDecision:
+    def evaluate(
+        self,
+        iteration: int,
+        dirty_bytes: int,
+        duration_ms: Optional[float] = None,
+    ) -> ConvergenceDecision:
         """
         Decide whether to stop pre-copy after `iteration` (1-indexed).
 
         Stopping conditions:
         1. dirty_bytes <= effective_bandwidth * target_downtime  (converged)
         2. dirty set shrank by < min_shrink_ratio (default 10%) vs previous round
-        3. Asymptotic floor predictor `D_inf > threshold` and current `dirty_bytes` is within 15% of `D_inf`
+        3. Asymptotic floor predictor `D_inf > threshold` and current `dirty_bytes` is within 20% of `D_inf`
            (knee-of-curve reached; further pre-dump rounds will only re-copy hot thrashing pages)
         4. iteration >= max_iterations (default 8)
         """
+        observed_bw: Optional[float] = None
+        if duration_ms is not None and duration_ms >= 5.0 and dirty_bytes > 0:
+            observed_bw = round((dirty_bytes * 8.0) / ((duration_ms / 1000.0) * 1_000_000.0), 2)
+
         threshold = self.target_threshold_bytes
         prev_dirty = self._history[-1] if self._history else None
         self._history.append(dirty_bytes)
@@ -92,6 +102,7 @@ class PreCopyConvergenceTracker:
                 ),
                 threshold_bytes=threshold,
                 predicted_floor_bytes=floor,
+                observed_bandwidth_mbps=observed_bw,
             )
 
         if prev_dirty is not None and prev_dirty > 0:
@@ -108,6 +119,7 @@ class PreCopyConvergenceTracker:
                     threshold_bytes=threshold,
                     predicted_floor_bytes=floor,
                     recommend_hybrid_upgrade=True,
+                    observed_bandwidth_mbps=observed_bw,
                 )
 
         # SOTA Knee-of-Curve detection via asymptotic floor prediction
@@ -122,6 +134,7 @@ class PreCopyConvergenceTracker:
                 threshold_bytes=threshold,
                 predicted_floor_bytes=floor,
                 recommend_hybrid_upgrade=True,
+                observed_bandwidth_mbps=observed_bw,
             )
 
         if iteration >= self.max_iterations:
@@ -132,6 +145,7 @@ class PreCopyConvergenceTracker:
                 threshold_bytes=threshold,
                 predicted_floor_bytes=floor,
                 recommend_hybrid_upgrade=True,
+                observed_bandwidth_mbps=observed_bw,
             )
 
         return ConvergenceDecision(
@@ -140,6 +154,7 @@ class PreCopyConvergenceTracker:
             reason=f"Continuing pre-copy (dirty={dirty_bytes} B > threshold={threshold} B)",
             threshold_bytes=threshold,
             predicted_floor_bytes=floor,
+            observed_bandwidth_mbps=observed_bw,
         )
 
 

@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import socketserver
@@ -17,6 +18,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -39,6 +41,7 @@ from lkmp.network import (
     NetworkMobilityManager,
     TcpRepairError,
     TcpRepairResult,
+    parse_host_port,
     set_tree_tcp_repair,
 )
 from lkmp.preflight import (
@@ -49,6 +52,20 @@ from lkmp.preflight import (
     is_pid_stopped,
     parse_elf_build_id,
     read_proc_starttime,
+)
+from lkmp.telemetry import PrometheusMetricsCollector
+
+MAX_RPC_MESSAGE_BYTES = 16 * 1024 * 1024
+IDEMPOTENT_READ_METHODS = frozenset(
+    {
+        "get_capabilities",
+        "inspect_process",
+        "stat_files",
+        "verify_process",
+        "verify_restored_stopped",
+        "health_check",
+        "get_metrics",
+    }
 )
 
 # Safe HostCapabilities from_dict wrapper accepting extra fields (criu_check_extra_ok, etc.)
@@ -159,6 +176,49 @@ class AgentService:
         self._check_pid_alive = pid_alive_checker or self._default_pid_alive
         self._tcp_repair_handler = tcp_repair_handler
         self._instance_id = secrets.token_hex(16)
+        self.metrics = PrometheusMetricsCollector()
+        self._state_lock = threading.RLock()
+        self._migration_locks: Dict[str, threading.RLock] = {}
+        self._active_source_pids: Dict[int, str] = {}
+
+    def _get_migration_lock(self, migration_id: str) -> Optional[threading.RLock]:
+        try:
+            validate_safe_identifier(migration_id, "migration_id")
+        except ValueError:
+            return None
+        with self._state_lock:
+            lock = self._migration_locks.get(migration_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._migration_locks[migration_id] = lock
+            return lock
+
+    def _acquire_source_pid(self, pid: int, migration_id: str) -> None:
+        with self._state_lock:
+            existing = self._active_source_pids.get(int(pid))
+            if existing is not None and existing != migration_id:
+                if self._check_pid_alive(int(pid)):
+                    raise RuntimeError(
+                        f"Source process PID {pid} is already locked by active migration {existing!r}"
+                    )
+            self._active_source_pids[int(pid)] = migration_id
+            self.metrics.set_active_migrations(len(self._active_source_pids))
+
+    def _release_source_pid(
+        self,
+        pid: Optional[int] = None,
+        migration_id: Optional[str] = None,
+    ) -> None:
+        with self._state_lock:
+            if pid is not None:
+                cur = self._active_source_pids.get(int(pid))
+                if cur is not None and (migration_id is None or cur == migration_id):
+                    self._active_source_pids.pop(int(pid), None)
+            if migration_id is not None:
+                stale = [k for k, v in self._active_source_pids.items() if v == migration_id]
+                for k in stale:
+                    self._active_source_pids.pop(k, None)
+            self.metrics.set_active_migrations(len(self._active_source_pids))
 
     def _uses_real_linux_proc(self) -> bool:
         if not sys.platform.startswith("linux"):
@@ -312,6 +372,15 @@ class AgentService:
             except Exception:
                 host_id = "local-node"
 
+        try:
+            probe_dir = self.work_dir
+            while not probe_dir.exists() and probe_dir != probe_dir.parent:
+                probe_dir = probe_dir.parent
+            if probe_dir.exists():
+                caps.work_dir_free_bytes = int(shutil.disk_usage(probe_dir).free)
+        except Exception:
+            pass
+
         caps_dict = caps.to_dict()
         setattr(caps, "criu_check_extra_ok", criu_extra_ok)
         setattr(caps, "criu_checked_features", checked_features)
@@ -320,6 +389,26 @@ class AgentService:
         caps_dict["criu_checked_features"] = checked_features
         caps_dict["host_id"] = host_id
         return caps_dict
+
+    def health_check(self) -> Dict[str, Any]:
+        """Return live agent health status, active migration count, and host capabilities."""
+        with self._state_lock:
+            active_count = len(self._active_source_pids)
+        return {
+            "status": "ok",
+            "agent_id": self._instance_id,
+            "active_migrations": active_count,
+            "capabilities": self.get_capabilities(),
+        }
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return Prometheus/OpenMetrics text exposition and active migration count."""
+        with self._state_lock:
+            active_count = len(self._active_source_pids)
+        return {
+            "prometheus_text": self.metrics.export_prometheus_text(),
+            "active_migrations": active_count,
+        }
 
     def inspect_process(
         self,
@@ -494,39 +583,47 @@ class AgentService:
     ) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
         mig_dir = self._migration_dir(migration_id)
-        mig_dir.mkdir(parents=True, exist_ok=True)
-        img_dir = self._round_dir(migration_id, "final")
-        img_dir.mkdir(parents=True, exist_ok=True)
         if prev_round_name:
             validate_safe_identifier(prev_round_name, "prev_round_name")
         prev_rel = f"../{prev_round_name}" if prev_round_name else None
 
-        # Discover initial process tree PIDs and starttimes
-        tree_pids = discover_process_tree_pids(config.pid, self.proc_root)
-        starttimes = {str(p): read_proc_starttime(p, self.proc_root) for p in tree_pids}
-        quiesced = False
+        self._acquire_source_pid(config.pid, migration_id)
+        mig_dir.mkdir(parents=True, exist_ok=True)
+        img_dir = self._round_dir(migration_id, "final")
+        img_dir.mkdir(parents=True, exist_ok=True)
+        source_state_written = False
+        try:
+            # Discover initial process tree PIDs and starttimes
+            tree_pids = discover_process_tree_pids(config.pid, self.proc_root)
+            starttimes = {str(p): read_proc_starttime(p, self.proc_root) for p in tree_pids}
+            quiesced = False
 
-        # 0. Run application quiesce_cmd BEFORE lock_network and freeze_cgroup if configured
-        if config.quiesce_cmd:
-            subprocess.run(
-                shlex.split(config.quiesce_cmd),
-                timeout=config.quiesce_timeout_sec,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            quiesced = True
+            # 0. Run application quiesce_cmd BEFORE lock_network and freeze_cgroup if configured
+            if config.quiesce_cmd:
+                subprocess.run(
+                    shlex.split(config.quiesce_cmd),
+                    timeout=config.quiesce_timeout_sec,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                quiesced = True
 
-        # Record source_state.json in mig_dir
-        source_state_file = mig_dir / "source_state.json"
-        state_data = {
-            "pid": config.pid,
-            "tree_pids": tree_pids,
-            "starttimes": starttimes,
-            "committed": False,
-            "quiesced": quiesced,
-        }
-        source_state_file.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+            # Record source_state.json in mig_dir
+            source_state_file = mig_dir / "source_state.json"
+            state_data = {
+                "pid": config.pid,
+                "tree_pids": tree_pids,
+                "starttimes": starttimes,
+                "committed": False,
+                "quiesced": quiesced,
+            }
+            source_state_file.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+            source_state_written = True
+        except Exception:
+            if not source_state_written:
+                self._release_source_pid(config.pid, migration_id)
+            raise
 
         # 1. Lock network per-migration to suppress TCP RSTs
         self.net.lock_network(config.workload_ip, migration_id=migration_id)
@@ -626,13 +723,16 @@ class AgentService:
         if dest_images_dir:
             candidates.append(dest_images_dir)
         else:
-            dest_port = 9700
-            if ":" in config.dest_addr:
-                try:
-                    dest_port = int(config.dest_addr.rsplit(":", 1)[1])
-                except ValueError:
-                    dest_port = 9700
-            srv = _ACTIVE_SERVERS.get((dest_host, dest_port)) or _ACTIVE_SERVERS.get(("127.0.0.1", dest_port))
+            try:
+                _dhost, dest_port = parse_host_port(config.dest_addr, default_port=9700)
+            except ValueError:
+                dest_port = 9700
+            clean_dest = dest_host[1:-1] if dest_host.startswith("[") and dest_host.endswith("]") else dest_host
+            srv = (
+                _ACTIVE_SERVERS.get((clean_dest, dest_port))
+                or _ACTIVE_SERVERS.get(("127.0.0.1", dest_port))
+                or _ACTIVE_SERVERS.get(("::1", dest_port))
+            )
             if srv is not None and srv.service is not self:
                 candidates.append(str(srv.service._round_dir(migration_id, "final")))
 
@@ -1066,18 +1166,20 @@ class AgentService:
             try:
                 state_data = json.loads(source_state_file.read_text(encoding="utf-8"))
                 if state_data.get("committed"):
+                    self._release_source_pid(config.pid, migration_id)
                     return {"committed": True, "idempotent_noop": True}
                 tree_pids = state_data.get("tree_pids")
                 starttimes = state_data.get("starttimes")
             except Exception:
                 state_data = None
         elif not self._check_pid_alive(config.pid) and not mig_dir.exists():
+            self._release_source_pid(config.pid, migration_id)
             return {"committed": True, "idempotent_noop": True}
 
         # Stop lazy-dump daemon if running
         lazy_dump_pidfile = self._round_dir(migration_id, "final") / "lazy-dump.pid"
         if lazy_dump_pidfile.exists():
-            self.criu.stop_daemon(lazy_dump_pidfile)
+            self.criu.stop_daemon(lazy_dump_pidfile, proc_root=self.proc_root)
 
         # Confirm TCP_REPAIR=1 on source sockets before SIGKILL so kernel socket teardown cannot queue FIN/RST
         verified_src_pids = self._collect_verified_tree_pids(
@@ -1100,6 +1202,13 @@ class AgentService:
             expected_starttimes=starttimes,
         )
 
+        if config.workload_id:
+            try:
+                validate_safe_identifier(config.workload_id, "workload_id")
+                self.envelope.unfreeze_cgroup(config.workload_id)
+            except Exception:
+                pass
+
         if state_data is not None and source_state_file.exists():
             try:
                 state_data["committed"] = True
@@ -1113,6 +1222,7 @@ class AgentService:
             pass
         if config.wipe_images_on_commit:
             self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+        self._release_source_pid(config.pid, migration_id)
         return {
             "committed": True,
             "tcp_repair_confirmed": repair_res is not None,
@@ -1124,7 +1234,10 @@ class AgentService:
         final_dir = self._round_dir(migration_id, "final")
         lazy_pidfile = final_dir / "lazy-pages.pid"
         if lazy_pidfile.exists():
-            self.criu.stop_daemon(lazy_pidfile)
+            self.criu.stop_daemon(lazy_pidfile, proc_root=self.proc_root)
+        if mig_dir.exists():
+            for ps_pidfile in mig_dir.glob("*/page-server.pid"):
+                self.criu.stop_daemon(ps_pidfile, proc_root=self.proc_root)
         if wipe_images:
             saved_restore_state: Optional[str] = None
             state_file = final_dir / "restore_state.json"
@@ -1179,10 +1292,13 @@ class AgentService:
             starttimes = dict(starttimes or {})
             starttimes[str(restored_pid)] = int(expected_restored_starttime)
 
-        # Stop lazy-pages daemon if running
+        # Stop lazy-pages and page-server daemons if running
         lazy_pidfile = self._round_dir(migration_id, "final") / "lazy-pages.pid"
         if lazy_pidfile.exists():
-            self.criu.stop_daemon(lazy_pidfile)
+            self.criu.stop_daemon(lazy_pidfile, proc_root=self.proc_root)
+        if mig_dir.exists():
+            for ps_pidfile in mig_dir.glob("*/page-server.pid"):
+                self.criu.stop_daemon(ps_pidfile, proc_root=self.proc_root)
 
         tcp_repair_confirmed = False
         tcp_sockets_confirmed = 0
@@ -1218,6 +1334,10 @@ class AgentService:
                     errors.append(f"SIGKILL({restored_pid}) failed: {exc}")
 
         try:
+            self.net.teardown_tunnel(config, migration_id=migration_id)
+        except Exception:
+            pass
+        try:
             self.net.release_ip_on_host(config, migration_id=migration_id)
         except Exception as exc:
             errors.append(f"release_ip_on_host failed: {exc}")
@@ -1247,7 +1367,7 @@ class AgentService:
         # Stop lazy-dump daemon if running
         lazy_dump_pidfile = self._round_dir(migration_id, "final") / "lazy-dump.pid"
         if lazy_dump_pidfile.exists():
-            self.criu.stop_daemon(lazy_dump_pidfile)
+            self.criu.stop_daemon(lazy_dump_pidfile, proc_root=self.proc_root)
 
         source_state_file = mig_dir / "source_state.json"
         tree_pids: Optional[List[int]] = None
@@ -1282,6 +1402,10 @@ class AgentService:
             self.criu.run_gpu_rollback_hook(config)
         except Exception as exc:
             errors.append(f"gpu_rollback_hook failed: {exc}")
+        try:
+            self.net.teardown_tunnel(config, migration_id=migration_id)
+        except Exception:
+            pass
         try:
             self.net.announce_ip_on_host(config, target_host=source_host, ensure_assigned=True)
         except Exception as exc:
@@ -1323,6 +1447,7 @@ class AgentService:
 
         if not errors:
             self.fs.secure_wipe_directory(mig_dir, allowed_parent=self.work_dir)
+            self._release_source_pid(config.pid, migration_id)
         if errors:
             raise RuntimeError("; ".join(errors))
         return {
@@ -1336,6 +1461,8 @@ class AgentService:
         """Dispatch an incoming JSON-RPC call to the corresponding service method."""
         allowed_methods = {
             "get_capabilities",
+            "health_check",
+            "get_metrics",
             "inspect_process",
             "stat_files",
             "prepare_migration",
@@ -1358,27 +1485,58 @@ class AgentService:
             "rollback_source",
         }
         if method not in allowed_methods:
+            self.metrics.record_rpc(str(method), 0.0, error=True)
             raise ValueError(f"Unknown RPC method: {method}")
         fn = getattr(self, method)
-        return fn(**params)
+        mig_lock: Optional[threading.RLock] = None
+        raw_mid = params.get("migration_id") if isinstance(params, dict) else None
+        if isinstance(raw_mid, str):
+            mig_lock = self._get_migration_lock(raw_mid)
+
+        t0 = time.monotonic()
+        try:
+            if mig_lock is not None:
+                with mig_lock:
+                    res = fn(**params)
+            else:
+                res = fn(**params)
+            self.metrics.record_rpc(method, (time.monotonic() - t0) * 1000.0, error=False)
+            return res
+        except Exception:
+            self.metrics.record_rpc(method, (time.monotonic() - t0) * 1000.0, error=True)
+            raise
 
 
 class _RpcRequestHandler(socketserver.StreamRequestHandler):
-    """Line-delimited JSON-RPC handler for `lkmp-agent`."""
+    """Bounded, timeout-enforced line-delimited JSON-RPC handler for `lkmp-agent`."""
 
     def handle(self) -> None:
-        raw_line = self.rfile.readline()
+        try:
+            self.connection.settimeout(120.0)
+        except Exception:
+            pass
+        raw_line = self.rfile.readline(MAX_RPC_MESSAGE_BYTES + 1)
         if not raw_line:
             return
-        try:
-            req = json.loads(raw_line.decode("utf-8"))
-            method = req["method"]
-            params = req.get("params", {})
-            service: AgentService = self.server.agent_service  # type: ignore[attr-defined]
-            result = service.dispatch_rpc(method, params)
-            resp = {"ok": True, "result": result}
-        except Exception as exc:
-            resp = {"ok": False, "error": str(exc)}
+        if len(raw_line) > MAX_RPC_MESSAGE_BYTES:
+            resp = {
+                "ok": False,
+                "error": f"RPC message exceeds maximum allowed frame size ({MAX_RPC_MESSAGE_BYTES} bytes)",
+            }
+        else:
+            try:
+                req = json.loads(raw_line.decode("utf-8"))
+                if not isinstance(req, dict):
+                    raise ValueError("RPC request frame must be a JSON object")
+                method = req["method"]
+                params = req.get("params", {})
+                if not isinstance(method, str) or not isinstance(params, dict):
+                    raise ValueError("Invalid RPC method or params type")
+                service: AgentService = self.server.agent_service  # type: ignore[attr-defined]
+                result = service.dispatch_rpc(method, params)
+                resp = {"ok": True, "result": result}
+            except Exception as exc:
+                resp = {"ok": False, "error": str(exc)}
         payload = (json.dumps(resp) + "\n").encode("utf-8")
         self.wfile.write(payload)
         self.wfile.flush()
@@ -1389,11 +1547,87 @@ class _ThreadedTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+class _ThreadedTcpServerV6(_ThreadedTcpServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+class _ThreadedHttpServerV6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def _make_metrics_handler(service: AgentService) -> type[BaseHTTPRequestHandler]:
+    class _MetricsHttpHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            path = self.path.split("?", 1)[0]
+            if path == "/metrics":
+                body = service.metrics.export_prometheus_text().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path in ("/healthz", "/health"):
+                body = (json.dumps(service.health_check()) + "\n").encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    return _MetricsHttpHandler
+
+
 _ACTIVE_SERVERS: Dict[Tuple[str, int], AgentServer] = {}
+_SSL_CONTEXT_CACHE: Dict[Tuple[str, str, str, bool, float, float, float], ssl.SSLContext] = {}
+_SSL_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_client_ssl_context(tls: TlsConfig) -> ssl.SSLContext:
+    assert tls.ca_cert and tls.cert_file and tls.key_file
+    ca_mtime = Path(tls.ca_cert).stat().st_mtime
+    cert_mtime = Path(tls.cert_file).stat().st_mtime
+    key_mtime = Path(tls.key_file).stat().st_mtime
+    cache_key = (
+        tls.ca_cert,
+        tls.cert_file,
+        tls.key_file,
+        bool(tls.no_verify),
+        ca_mtime,
+        cert_mtime,
+        key_mtime,
+    )
+    with _SSL_CACHE_LOCK:
+        cached = _SSL_CONTEXT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.load_verify_locations(cafile=tls.ca_cert)
+        if tls.no_verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(certfile=tls.cert_file, keyfile=tls.key_file)
+        if len(_SSL_CONTEXT_CACHE) > 32:
+            _SSL_CONTEXT_CACHE.clear()
+        _SSL_CONTEXT_CACHE[cache_key] = ctx
+        return ctx
 
 
 class AgentServer:
-    """TCP / mTLS JSON-RPC daemon wrapping an `AgentService`."""
+    """Dual-stack TCP / mTLS JSON-RPC daemon wrapping an `AgentService` with optional `/metrics` HTTP exporter."""
 
     def __init__(
         self,
@@ -1401,11 +1635,14 @@ class AgentServer:
         port: int,
         service: AgentService,
         tls: Optional[TlsConfig] = None,
+        metrics_port: Optional[int] = None,
     ) -> None:
-        self.host = host
+        clean_host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+        self.host = clean_host
         self.port = port
         self.service = service
         self.tls = tls if tls is not None else TlsConfig(enabled=False)
+        self.metrics_port = metrics_port
 
         if self.tls.enabled:
             if not self.tls.ca_cert or not self.tls.cert_file or not self.tls.key_file:
@@ -1414,7 +1651,8 @@ class AgentServer:
                     "Strict mTLS requires CA, certificate, and private key."
                 )
 
-        self._server = _ThreadedTcpServer((host, port), _RpcRequestHandler)
+        server_cls = _ThreadedTcpServerV6 if ":" in clean_host else _ThreadedTcpServer
+        self._server = server_cls((clean_host, port), _RpcRequestHandler)
         self._server.agent_service = service  # type: ignore[attr-defined]
         if self.tls.enabled:
             ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -1424,31 +1662,66 @@ class AgentServer:
             self._server.socket = ctx.wrap_socket(self._server.socket, server_side=True)
         self._thread: Optional[threading.Thread] = None
 
+        self._metrics_server: Optional[ThreadingHTTPServer] = None
+        self._metrics_thread: Optional[threading.Thread] = None
+        if metrics_port is not None:
+            http_cls = _ThreadedHttpServerV6 if ":" in clean_host else ThreadingHTTPServer
+            self._metrics_server = http_cls((clean_host, int(metrics_port)), _make_metrics_handler(service))
+
     @property
     def bound_address(self) -> Tuple[str, int]:
         addr = self._server.server_address
         return str(addr[0]), int(addr[1])
 
-    def start_background(self) -> None:
+    @property
+    def bound_metrics_address(self) -> Optional[Tuple[str, int]]:
+        if self._metrics_server is None:
+            return None
+        addr = self._metrics_server.server_address
+        return str(addr[0]), int(addr[1])
+
+    def _register_active(self) -> None:
         host, port = self.bound_address
         _ACTIVE_SERVERS[(host, port)] = self
         _ACTIVE_SERVERS[("127.0.0.1", port)] = self
+        _ACTIVE_SERVERS[("::1", port)] = self
         _ACTIVE_SERVERS[("localhost", port)] = self
+
+    def _unregister_active(self) -> None:
+        host, port = self.bound_address
+        _ACTIVE_SERVERS.pop((host, port), None)
+        _ACTIVE_SERVERS.pop(("127.0.0.1", port), None)
+        _ACTIVE_SERVERS.pop(("::1", port), None)
+        _ACTIVE_SERVERS.pop("localhost", None)  # type: ignore[arg-type]
+        _ACTIVE_SERVERS.pop(("localhost", port), None)
+
+    def start_background(self) -> None:
+        self._register_active()
+        if self._metrics_server is not None and self._metrics_thread is None:
+            self._metrics_thread = threading.Thread(
+                target=self._metrics_server.serve_forever, daemon=True
+            )
+            self._metrics_thread.start()
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     def serve_forever(self) -> None:
-        host, port = self.bound_address
-        _ACTIVE_SERVERS[(host, port)] = self
-        _ACTIVE_SERVERS[("127.0.0.1", port)] = self
-        _ACTIVE_SERVERS[("localhost", port)] = self
+        self._register_active()
+        if self._metrics_server is not None and self._metrics_thread is None:
+            self._metrics_thread = threading.Thread(
+                target=self._metrics_server.serve_forever, daemon=True
+            )
+            self._metrics_thread.start()
         self._server.serve_forever()
 
     def shutdown(self) -> None:
-        host, port = self.bound_address
-        _ACTIVE_SERVERS.pop((host, port), None)
-        _ACTIVE_SERVERS.pop(("127.0.0.1", port), None)
-        _ACTIVE_SERVERS.pop(("localhost", port), None)
+        self._unregister_active()
+        if self._metrics_server is not None:
+            if self._metrics_thread is not None and self._metrics_thread.is_alive():
+                self._metrics_server.shutdown()
+            self._metrics_server.server_close()
+            if self._metrics_thread:
+                self._metrics_thread.join(timeout=2.0)
         if self._thread is not None and self._thread.is_alive():
             self._server.shutdown()
         self._server.server_close()
@@ -1465,23 +1738,57 @@ class AgentClient:
         tls: Optional[TlsConfig] = None,
         timeout_sec: float = 30.0,
         direct_service: Optional[AgentService] = None,
+        max_retries: int = 2,
     ) -> None:
         self.address = address
         self.tls = tls if tls is not None else TlsConfig(enabled=False)
         self.timeout_sec = timeout_sec
         self._direct_service = direct_service
+        self.max_retries = max(0, int(max_retries))
 
     @property
     def host(self) -> str:
-        if ":" in self.address:
-            return self.address.rsplit(":", 1)[0]
-        return self.address
+        host, _ = parse_host_port(self.address, default_port=9700)
+        return host
 
     @property
     def port(self) -> int:
-        if ":" in self.address:
-            return int(self.address.rsplit(":", 1)[1])
-        return 9700
+        _, port = parse_host_port(self.address, default_port=9700)
+        return port
+
+    def _call_once(self, method: str, req_bytes: bytes, params: Dict[str, Any]) -> Any:
+        try:
+            with socket.create_connection((self.host, self.port), timeout=self.timeout_sec) as sock:
+                sock.settimeout(self.timeout_sec)
+                if self.tls.enabled:
+                    ctx = _get_cached_client_ssl_context(self.tls)
+                    with ctx.wrap_socket(sock, server_hostname=self.host) as tls_sock:
+                        tls_sock.settimeout(self.timeout_sec)
+                        tls_sock.sendall(req_bytes)
+                        resp_line = tls_sock.makefile("rb").readline(MAX_RPC_MESSAGE_BYTES + 1)
+                else:
+                    sock.sendall(req_bytes)
+                    resp_line = sock.makefile("rb").readline(MAX_RPC_MESSAGE_BYTES + 1)
+        except PermissionError:
+            srv = _ACTIVE_SERVERS.get((self.host, self.port))
+            if srv is None and self.host in ("127.0.0.1", "::1", "localhost"):
+                srv = _ACTIVE_SERVERS.get(("127.0.0.1", self.port)) or _ACTIVE_SERVERS.get(("::1", self.port))
+            if srv is not None:
+                if self.tls.enabled:
+                    for fpath in (self.tls.ca_cert, self.tls.cert_file, self.tls.key_file):
+                        if not fpath or not Path(fpath).exists():
+                            raise FileNotFoundError(f"TLS certificate file not found: {fpath}")
+                return srv.service.dispatch_rpc(method, params)
+            raise
+
+        if not resp_line:
+            raise RuntimeError(f"Empty RPC response from agent {self.address} for {method}")
+        if len(resp_line) > MAX_RPC_MESSAGE_BYTES:
+            raise RuntimeError(f"Oversized RPC response from agent {self.address} for {method}")
+        resp = json.loads(resp_line.decode("utf-8"))
+        if not resp.get("ok"):
+            raise RuntimeError(f"Agent {self.address} error in {method}: {resp.get('error')}")
+        return resp.get("result")
 
     def call(self, method: str, **params: Any) -> Any:
         if self._direct_service is not None:
@@ -1494,36 +1801,16 @@ class AgentClient:
             )
 
         req_bytes = (json.dumps({"method": method, "params": params}) + "\n").encode("utf-8")
-        try:
-            with socket.create_connection((self.host, self.port), timeout=self.timeout_sec) as sock:
-                if self.tls.enabled:
-                    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-                    ctx.load_verify_locations(cafile=self.tls.ca_cert)
-                    if self.tls.no_verify:
-                        ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
-                    ctx.load_cert_chain(certfile=self.tls.cert_file, keyfile=self.tls.key_file)
-                    with ctx.wrap_socket(sock, server_hostname=self.host) as tls_sock:
-                        tls_sock.sendall(req_bytes)
-                        resp_line = tls_sock.makefile("rb").readline()
-                else:
-                    sock.sendall(req_bytes)
-                    resp_line = sock.makefile("rb").readline()
-        except PermissionError:
-            srv = _ACTIVE_SERVERS.get((self.host, self.port))
-            if srv is None and self.host in ("127.0.0.1", "localhost"):
-                srv = _ACTIVE_SERVERS.get(("127.0.0.1", self.port))
-            if srv is not None:
-                if self.tls.enabled:
-                    for fpath in (self.tls.ca_cert, self.tls.cert_file, self.tls.key_file):
-                        if not fpath or not Path(fpath).exists():
-                            raise FileNotFoundError(f"TLS certificate file not found: {fpath}")
-                return srv.service.dispatch_rpc(method, params)
-            raise
-
-        if not resp_line:
-            raise RuntimeError(f"Empty RPC response from agent {self.address} for {method}")
-        resp = json.loads(resp_line.decode("utf-8"))
-        if not resp.get("ok"):
-            raise RuntimeError(f"Agent {self.address} error in {method}: {resp.get('error')}")
-        return resp.get("result")
+        attempts = 1 + (self.max_retries if method in IDEMPOTENT_READ_METHODS else 0)
+        last_exc: Optional[BaseException] = None
+        for attempt in range(attempts):
+            try:
+                return self._call_once(method, req_bytes, params)
+            except (ConnectionResetError, TimeoutError, socket.timeout) as exc:
+                last_exc = exc
+                if attempt + 1 < attempts:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc

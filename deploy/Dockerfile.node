@@ -6,18 +6,27 @@ WORKDIR /opt/lkmp
 COPY . /opt/lkmp
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
     iproute2 \
     iputils-arping \
     nftables \
-    rsync \
+    openssl \
     openssh-client \
     openssh-server \
     python3 \
+    rsync \
     stress-ng \
+    util-linux \
     && (apt-get install -y --no-install-recommends criu || bash /opt/lkmp/scripts/install_criu_on_linux.sh) \
     && rm -rf /var/lib/apt/lists/* \
-    && chmod +x /opt/lkmp/bin/lkmp && ln -sf /opt/lkmp/bin/lkmp /usr/local/bin/lkmp
+    && chmod +x /opt/lkmp/bin/lkmp /opt/lkmp/deploy/entrypoint.sh \
+    && ln -sf /opt/lkmp/bin/lkmp /usr/local/bin/lkmp
 
-EXPOSE 9440 27000 27001
+EXPOSE 9700 9701 27000 27001
 
-CMD ["lkmp", "agent", "--host", "0.0.0.0", "--port", "9440", "--work-dir", "/var/lib/lkmp", "--tls-ca", "/etc/lkmp/tls/ca.crt", "--tls-cert", "/etc/lkmp/tls/node.crt", "--tls-key", "/etc/lkmp/tls/node.key"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:9701/healthz >/dev/null || exit 1
+
+ENTRYPOINT ["/opt/lkmp/deploy/entrypoint.sh"]
+CMD ["lkmp", "agent", "--host", "0.0.0.0", "--port", "9700", "--metrics-port", "9701", "--work-dir", "/var/lib/lkmp/migrations", "--tls-ca", "/etc/lkmp/tls/ca.crt", "--tls-cert", "/etc/lkmp/tls/node.crt", "--tls-key", "/etc/lkmp/tls/node.key"]

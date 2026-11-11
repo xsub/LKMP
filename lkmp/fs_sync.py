@@ -19,13 +19,23 @@ STORAGE_PROBE_FILENAME = ".lkmp_storage_probe.json"
 
 def _strip_endpoint(endpoint: str) -> str:
     h = endpoint.strip()
+    if h.startswith("[") and "]" in h:
+        return h[1 : h.index("]")]
+    if h.count(":") > 1:
+        return h
     if ":" in h:
-        if h.startswith("[") and "]" in h:
-            return h[1 : h.index("]")]
         parts = h.split(":")
         if len(parts) == 2 and parts[1].isdigit():
             return parts[0]
     return h
+
+
+def format_rsync_remote(dest_host: str, dest_path: str) -> str:
+    """Format `host:path` for `rsync`, bracketing raw IPv6 literals per rsync syntax (`[ipv6]:path`)."""
+    clean_host = _strip_endpoint(dest_host)
+    if ":" in clean_host:
+        return f"[{clean_host}]:{dest_path}"
+    return f"{clean_host}:{dest_path}"
 
 
 def _locate_storage_probe_file(dir_path: Path) -> Optional[Path]:
@@ -262,10 +272,10 @@ class FilesystemSyncManager:
         local_p = Path(local_path)
         if local_p.exists() and local_p.is_file():
             src = local_path
-            dst = f"{dest_host}:{dest_path}"
+            dst = format_rsync_remote(dest_host, dest_path)
         else:
             src = local_path.rstrip("/") + "/"
-            dst = f"{dest_host}:{dest_path.rstrip('/')}/"
+            dst = format_rsync_remote(dest_host, f"{dest_path.rstrip('/')}/")
         return [
             "rsync",
             "-aHAX",
@@ -367,7 +377,7 @@ class FilesystemSyncManager:
             ]
 
         src = images_dir.rstrip("/") + "/"
-        dst = f"{dest_host}:{images_dir.rstrip('/')}/"
+        dst = format_rsync_remote(dest_host, f"{images_dir.rstrip('/')}/")
         cmd = [
             "rsync",
             "-a",

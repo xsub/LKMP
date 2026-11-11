@@ -512,3 +512,128 @@ def open_migration_journal(
 
     journal.sync_from_disk_if_exists()
     return journal
+
+
+@dataclass
+class JournalInspectionReport:
+    """Read-only diagnostic inspection summary for a `.wal.jsonl` file."""
+
+    path: str
+    exists: bool
+    valid: bool
+    entry_count: int = 0
+    monotonic_seq_ok: bool = True
+    checksums_ok: bool = True
+    discarded_torn_tail: bool = False
+    corruption_error: Optional[str] = None
+    migration_id: Optional[str] = None
+    coupled_gang_id: Optional[str] = None
+    expected_member_ids: List[str] = None  # type: ignore[assignment]
+    missing_member_wals: List[str] = None  # type: ignore[assignment]
+    has_committed_decision: bool = False
+    has_rolled_back_decision: bool = False
+    last_state: Optional[str] = None
+    last_commit_decision: Optional[str] = None
+    restored_pid: Optional[int] = None
+    restored_starttime: Optional[int] = None
+    entries: List[Dict[str, Any]] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.expected_member_ids is None:
+            self.expected_member_ids = []
+        if self.missing_member_wals is None:
+            self.missing_member_wals = []
+        if self.entries is None:
+            self.entries = []
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def inspect_journal_file(journal_path: str | Path) -> JournalInspectionReport:
+    """
+    Perform a non-destructive, read-only integrity and decision audit of a WAL file.
+    Never modifies or truncates the file on disk.
+    """
+    path = Path(journal_path)
+    if not path.exists():
+        return JournalInspectionReport(
+            path=str(path),
+            exists=False,
+            valid=False,
+            corruption_error=f"Journal file not found: {path}",
+        )
+
+    try:
+        journal = MigrationJournal.load(path, require_persistent=False)
+    except WalCorruptionError as exc:
+        err_text = str(exc)
+        return JournalInspectionReport(
+            path=str(path),
+            exists=True,
+            valid=False,
+            monotonic_seq_ok="Non-monotonic WAL seq" not in err_text,
+            checksums_ok="checksum mismatch" not in err_text,
+            corruption_error=err_text,
+        )
+    except Exception as exc:
+        return JournalInspectionReport(
+            path=str(path),
+            exists=True,
+            valid=False,
+            corruption_error=str(exc),
+        )
+
+    expected_members = journal.expected_member_ids or []
+    missing_members: List[str] = []
+    for mid in expected_members:
+        member_wal = path.parent / f"{mid}.wal.jsonl"
+        if not member_wal.exists():
+            missing_members.append(str(member_wal))
+
+    last = journal.last_entry
+    restored_pid: Optional[int] = None
+    restored_starttime: Optional[int] = None
+    for entry in reversed(journal.entries):
+        if restored_pid is None and entry.restored_pid is not None:
+            restored_pid = entry.restored_pid
+        if restored_starttime is None and entry.restored_starttime is not None:
+            restored_starttime = entry.restored_starttime
+
+    summary_entries = [
+        {
+            "seq": e.seq,
+            "timestamp_unix": e.timestamp_unix,
+            "state": e.state,
+            "commit_decision": e.commit_decision,
+            "restored_pid": e.restored_pid,
+            "restored_starttime": e.restored_starttime,
+            "note": e.note,
+            "checksum_prefix": (e.checksum or "")[:12],
+        }
+        for e in journal.entries
+    ]
+
+    return JournalInspectionReport(
+        path=str(path),
+        exists=True,
+        valid=len(missing_members) == 0,
+        entry_count=len(journal.entries),
+        monotonic_seq_ok=True,
+        checksums_ok=True,
+        discarded_torn_tail=journal.discarded_torn_tail,
+        corruption_error=(
+            f"Missing gang member WAL files: {missing_members}" if missing_members else None
+        ),
+        migration_id=journal.migration_id,
+        coupled_gang_id=journal.coupled_gang_id,
+        expected_member_ids=expected_members,
+        missing_member_wals=missing_members,
+        has_committed_decision=journal.has_committed_decision,
+        has_rolled_back_decision=journal.has_rolled_back_decision,
+        last_state=last.state if last else None,
+        last_commit_decision=last.commit_decision if last else None,
+        restored_pid=restored_pid,
+        restored_starttime=restored_starttime,
+        entries=summary_entries,
+    )

@@ -13,6 +13,7 @@ services:
       - SYS_PTRACE
     volumes:
       - shared-workload-fs:/shared
+      - lkmp-tls-pki:/etc/lkmp/tls
     networks:
       lkmp-l2-net:
         ipv4_address: 172.28.0.10
@@ -31,12 +32,14 @@ services:
       - SYS_PTRACE
     volumes:
       - shared-workload-fs:/shared
+      - lkmp-tls-pki:/etc/lkmp/tls
     networks:
       lkmp-l2-net:
         ipv4_address: 172.28.0.11
 
 volumes:
   shared-workload-fs:
+  lkmp-tls-pki:
 
 networks:
   lkmp-l2-net:

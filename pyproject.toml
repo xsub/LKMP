@@ -4,15 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lkmp"
-version = "0.1.0"
-description = "Linux Kernel/Process Migration Orchestrator built on top of CRIU"
+version = "0.2.0"
+description = "Linux Kernel/Process Live Migration Orchestrator built on top of CRIU"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "LKMP Contributors"}
 ]
+keywords = ["linux", "criu", "live-migration", "checkpoint-restore", "2pc", "process-migration"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Clustering",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
 dependencies = []
 
 [project.scripts]
 lkmp = "lkmp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lkmp*"]
+
+[tool.setuptools.package-data]
+lkmp = ["py.typed"]

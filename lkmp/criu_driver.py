@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from lkmp.config import GpuPlugin, MigrationConfig, MigrationStrategy, TlsConfig
 
@@ -233,8 +235,9 @@ class CriuDriver:
             except ValueError:
                 return 9001
 
-        stdout_dest = subprocess.DEVNULL
-        stderr_dest = subprocess.DEVNULL
+        stdout_dest: Any = subprocess.DEVNULL
+        stderr_dest: Any = subprocess.DEVNULL
+        log_handle = None
         if log_file:
             log_p = Path(log_file)
             log_p.parent.mkdir(parents=True, exist_ok=True)
@@ -242,12 +245,17 @@ class CriuDriver:
             stdout_dest = log_handle
             stderr_dest = log_handle
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=stdout_dest,
-            stderr=stderr_dest,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=stdout_dest,
+                stderr=stderr_dest,
+                start_new_session=True,
+            )
+        finally:
+            if log_handle is not None:
+                log_handle.close()
+
         time.sleep(0.05)
         rc = proc.poll()
         if rc is not None and rc != 0:
@@ -259,9 +267,30 @@ class CriuDriver:
         self._daemons[str(pidfile_path)] = proc
         return proc.pid
 
-    def stop_daemon(self, pidfile: str | Path) -> None:
-        """Terminate and clean up a supervised background daemon."""
+    def _is_verified_criu_pid(self, pid: int, proc_root: str = "/proc") -> bool:
+        """Verify that `pid` belongs to a CRIU daemon before signaling an untracked pidfile PID."""
+        proc_dir = Path(proc_root) / str(pid)
+        if not proc_dir.exists():
+            return False
+        try:
+            cmdline_file = proc_dir / "cmdline"
+            if cmdline_file.exists():
+                raw = cmdline_file.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                if "criu" in raw or Path(self.criu_bin).name in raw:
+                    return True
+            comm_file = proc_dir / "comm"
+            if comm_file.exists():
+                comm = comm_file.read_text(encoding="utf-8", errors="ignore").strip()
+                if "criu" in comm or Path(self.criu_bin).name in comm:
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def stop_daemon(self, pidfile: str | Path, proc_root: str = "/proc") -> None:
+        """Terminate and clean up a supervised or detached CRIU background daemon."""
         p_str = str(pidfile)
+        p_path = Path(pidfile)
         proc = self._daemons.pop(p_str, None)
         if proc is not None:
             try:
@@ -270,9 +299,23 @@ class CriuDriver:
             except Exception:
                 try:
                     proc.kill()
+                    proc.wait(timeout=0.5)
                 except Exception:
                     pass
-        p_path = Path(pidfile)
+        elif p_path.exists():
+            try:
+                recorded_pid = int(p_path.read_text(encoding="utf-8").strip())
+                if recorded_pid > 0 and self._is_verified_criu_pid(recorded_pid, proc_root=proc_root):
+                    os.kill(recorded_pid, signal.SIGTERM)
+                    deadline = time.monotonic() + 0.5
+                    while time.monotonic() < deadline:
+                        if not (Path(proc_root) / str(recorded_pid)).exists():
+                            break
+                        time.sleep(0.02)
+                    if (Path(proc_root) / str(recorded_pid)).exists():
+                        os.kill(recorded_pid, signal.SIGKILL)
+            except (ValueError, OSError):
+                pass
         if p_path.exists():
             try:
                 p_path.unlink()

@@ -921,6 +921,25 @@ def evaluate_portability(
             )
         )
 
+    # Destination checkpoint storage headroom check (when work_dir_free_bytes is reported)
+    if (
+        dest_caps.work_dir_free_bytes is not None
+        and snapshot.rss_bytes > 0
+        and config.strategy in (MigrationStrategy.COLD, MigrationStrategy.PRE_COPY)
+        and dest_caps.work_dir_free_bytes < snapshot.rss_bytes
+    ):
+        findings.append(
+            ResourceFinding(
+                resource_type="disk",
+                identifier="dest_work_dir",
+                classification=ResourceClassification.BLOCKER,
+                reason=(
+                    f"Destination work_dir free disk space ({dest_caps.work_dir_free_bytes} bytes) "
+                    f"is insufficient for process RSS checkpoint ({snapshot.rss_bytes} bytes)"
+                ),
+            )
+        )
+
     # 5. Envelope check
     if not snapshot.in_envelope and not config.unsafe_bare:
         findings.append(
@@ -1070,7 +1089,7 @@ def evaluate_portability(
     # Domain 2: files
     file_findings = [
         f for f in findings
-        if f.resource_type in ("file", "ghost_file")
+        if f.resource_type in ("file", "ghost_file", "disk")
     ]
     if any(f.classification == ResourceClassification.BLOCKER for f in file_findings):
         file_status = PortabilityStatus.BLOCKED

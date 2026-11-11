@@ -30,6 +30,33 @@ class GangMigrationResult:
     partial_commit_error: bool = False
     error_message: Optional[str] = None
 
+    def to_dict(self) -> Dict[str, object]:
+        members_list = []
+        for mr in self.member_results:
+            d = {
+                "migration_id": mr.migration_id,
+                "success": mr.success,
+                "final_state": mr.final_state.value if hasattr(mr.final_state, "value") else str(mr.final_state),
+                "restored_pid": mr.restored_pid,
+                "freeze_downtime_ms": mr.freeze_downtime_ms,
+                "total_duration_ms": mr.total_duration_ms,
+                "rolled_back": mr.rolled_back,
+                "error_message": mr.error_message,
+                "state_history": [
+                    s.value if hasattr(s, "value") else str(s) for s in mr.state_history
+                ],
+            }
+            members_list.append(d)
+        return {
+            "gang_id": self.gang_id,
+            "all_committed": self.all_committed,
+            "atomic_rollback_triggered": self.atomic_rollback_triggered,
+            "partial_commit_error": self.partial_commit_error,
+            "error_message": self.error_message,
+            "total_duration_ms": round(sum(m.total_duration_ms for m in self.member_results), 2),
+            "member_results": members_list,
+        }
+
 
 class GangMigrationCoordinator:
     """
@@ -50,6 +77,7 @@ class GangMigrationCoordinator:
         gang_id: str,
         members: List[Tuple[MigrationConfig, AgentClient, AgentClient]],
         journal_dir: Optional[str | Path] = None,
+        require_persistent_journal: bool = True,
     ) -> None:
         self.gang_id = validate_safe_identifier(gang_id, "gang_id")
         j_dir = (
@@ -63,6 +91,7 @@ class GangMigrationCoordinator:
             f"{self.gang_id}.gang",
             extra_ids=self.member_ids,
             member_ids=self.member_ids,
+            require_persistent=require_persistent_journal,
         )
 
         self.orchestrators: List[MigrationOrchestrator] = [
@@ -73,9 +102,14 @@ class GangMigrationCoordinator:
                 migration_id=f"{self.gang_id}-m{idx}",
                 journal_dir=self.journal.journal_dir,
                 gang_id=self.gang_id,
+                require_persistent_journal=require_persistent_journal,
             )
             for idx, (cfg, src, dst) in enumerate(members, start=1)
         ]
+
+    def execute(self) -> GangMigrationResult:
+        """Alias for `execute_atomic()`."""
+        return self.execute_atomic()
 
     def execute_atomic(self) -> GangMigrationResult:
         """

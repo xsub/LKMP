@@ -1,4 +1,4 @@
-"""Command-line interface for `lkmp` (run, agent, preflight, migrate, demo)."""
+"""Command-line interface for `lkmp` (run, agent, preflight, portability, migrate, gang-migrate, wal-inspect, tls-init, status, recover, demo, benchmark, acceptance)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from lkmp.agent import AgentClient, AgentServer, AgentService, config_from_dict, config_to_dict
 from lkmp.config import (
@@ -21,9 +21,16 @@ from lkmp.config import (
 )
 from lkmp.demo import run_live_demo, run_sota_benchmark_suite
 from lkmp.envelope import EnvelopeManager
-from lkmp.journal import MigrationJournal
+from lkmp.journal import MigrationJournal, inspect_journal_file
 from lkmp.orchestrator import MigrationOrchestrator, PortabilityReport, PortabilityStatus
-from lkmp.telemetry import render_migration_report, render_preflight_scorecard
+from lkmp.pki import generate_mtls_pki
+from lkmp.telemetry import (
+    render_agent_status_report,
+    render_gang_migration_report,
+    render_migration_report,
+    render_preflight_scorecard,
+    render_wal_inspection_report,
+)
 
 try:
     from lkmp.telemetry import render_portability_report
@@ -58,10 +65,15 @@ def _fallback_render_portability_report(report: Any) -> str:
 
 
 def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--pid", type=int, required=True, help="Root PID of process tree on Source A")
+    parser.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help="Root PID of process tree on Source A (auto-resolved if --workload-id is an active envelope)",
+    )
     parser.add_argument("--source", required=True, help="Source A agent address (host:port)")
     parser.add_argument("--dest", required=True, help="Destination B agent address (host:port)")
-    parser.add_argument("--workload-id", help="Envelope workload ID (for cgroup v2 freeze)")
+    parser.add_argument("--workload-id", help="Envelope workload ID (for cgroup v2 freeze & PID discovery)")
     parser.add_argument(
         "--strategy",
         choices=[s.value for s in MigrationStrategy],
@@ -83,13 +95,14 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--ip-mobility",
-        choices=["none", "arp", "bgp", "tunnel", "ebpf"],
+        choices=[m.value for m in IpMobilityMode],
         default="arp",
-        help="IP mobility mechanism during switchover: none, arp, bgp, tunnel, ebpf (default: arp)",
+        help="IP mobility mechanism during switchover: none, garp, arp, bgp, tunnel, ebpf, cloud (default: arp)",
     )
     parser.add_argument("--workload-ip", help="Dedicated workload IP (e.g. 10.10.0.50/24)")
     parser.add_argument("--iface", default="eth0", help="Network interface for IP mobility")
     parser.add_argument("--cloud-move-cmd", help="Command template for cloud IP reassignment")
+    parser.add_argument("--bgp-daemon-cmd", help="Custom BGP/FRR route command template ({action},{op},{ip},{prefix},{af},{host})")
     parser.add_argument(
         "--no-tcp-established",
         action="store_true",
@@ -168,6 +181,20 @@ def _add_common_migration_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_migration_config(args: argparse.Namespace) -> MigrationConfig:
+    resolved_pid = args.pid
+    resolved_ip = args.workload_ip
+    resolved_iface = args.iface
+    if resolved_pid is None and args.workload_id:
+        meta = EnvelopeManager().load_envelope_metadata(args.workload_id)
+        if meta and meta.get("host_pid") is not None:
+            resolved_pid = int(meta["host_pid"])
+            if not resolved_ip and meta.get("ip_address"):
+                resolved_ip = str(meta["ip_address"])
+            if resolved_iface == "eth0" and meta.get("net_interface"):
+                resolved_iface = str(meta["net_interface"])
+    if resolved_pid is None:
+        raise ValueError("Either --pid or an active --workload-id envelope is required")
+
     tls = TlsConfig(
         enabled=not args.no_tls,
         ca_cert=args.tls_ca,
@@ -175,7 +202,7 @@ def _build_migration_config(args: argparse.Namespace) -> MigrationConfig:
         key_file=args.tls_key,
     )
     return MigrationConfig(
-        pid=args.pid,
+        pid=resolved_pid,
         source_addr=args.source,
         dest_addr=args.dest,
         workload_id=args.workload_id,
@@ -183,9 +210,10 @@ def _build_migration_config(args: argparse.Namespace) -> MigrationConfig:
         fs_mode=FilesystemMode(args.fs_mode),
         writable_paths=list(args.writable_paths),
         ip_mobility=IpMobilityMode(args.ip_mobility),
-        workload_ip=args.workload_ip,
-        net_interface=args.iface,
+        workload_ip=resolved_ip,
+        net_interface=resolved_iface,
         cloud_move_cmd=args.cloud_move_cmd,
+        bgp_daemon_cmd=getattr(args, "bgp_daemon_cmd", None),
         tcp_established=not args.no_tcp_established,
         unsafe_bare=args.unsafe_bare,
         gpu_plugin=GpuPlugin(args.gpu_plugin),
@@ -206,6 +234,37 @@ def _build_migration_config(args: argparse.Namespace) -> MigrationConfig:
     )
 
 
+def _parse_member_spec(spec: str, default_tls: TlsConfig) -> MigrationConfig:
+    kv: Dict[str, str] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"Invalid --member key=value entry: {part!r}")
+        k, v = part.split("=", 1)
+        kv[k.strip()] = v.strip()
+    if "pid" not in kv or "source" not in kv or "dest" not in kv:
+        raise ValueError(f"--member spec requires at least pid=...,source=...,dest=...: {spec!r}")
+    unsafe_raw = kv.get("unsafe_bare", "false").lower() in ("1", "true", "yes")
+    cow_raw = kv.get("same_host_cow", "true").lower() in ("1", "true", "yes")
+    tcp_raw = kv.get("tcp_established", "true").lower() in ("1", "true", "yes")
+    return MigrationConfig(
+        pid=int(kv["pid"]),
+        source_addr=kv["source"],
+        dest_addr=kv["dest"],
+        workload_id=kv.get("workload_id"),
+        strategy=MigrationStrategy(kv.get("strategy", MigrationStrategy.PRE_COPY.value)),
+        fs_mode=FilesystemMode(kv.get("fs_mode", FilesystemMode.SHARED.value)),
+        ip_mobility=IpMobilityMode(kv.get("ip_mobility", IpMobilityMode.ARP.value)),
+        workload_ip=kv.get("workload_ip"),
+        tcp_established=tcp_raw,
+        unsafe_bare=unsafe_raw,
+        same_host_cow=cow_raw,
+        tls=default_tls,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lkmp",
@@ -217,6 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Launch a workload inside an isolated migration envelope")
     run_p.add_argument("--id", required=True, dest="workload_id", help="Unique workload identifier")
     run_p.add_argument("--rootfs", help="Optional chroot/pivot_root directory")
+    run_p.add_argument("--hostname", help="Optional UTS hostname inside namespace")
+    run_p.add_argument(
+        "--bind-mount",
+        action="append",
+        default=[],
+        dest="bind_mounts",
+        help="Bind mount specification src:dst inside mount namespace (repeatable)",
+    )
     run_p.add_argument("--ip", dest="ip_address", help="Dedicated IP/CIDR inside netns")
     run_p.add_argument("--iface", default="eth0", help="Network interface inside netns")
     run_p.add_argument("--no-time-ns", action="store_true", help="Disable time namespace isolation")
@@ -227,6 +294,12 @@ def build_parser() -> argparse.ArgumentParser:
     agent_p = sub.add_parser("agent", help="Run the privileged lkmp-agent daemon on a host")
     agent_p.add_argument("--host", default="0.0.0.0", help="Listen address (default: 0.0.0.0)")
     agent_p.add_argument("--port", type=int, default=9700, help="Listen port (default: 9700)")
+    agent_p.add_argument(
+        "--metrics-port",
+        type=int,
+        default=None,
+        help="Optional HTTP port serving Prometheus /metrics and JSON /healthz",
+    )
     agent_p.add_argument(
         "--work-dir",
         default="/var/lib/lkmp/migrations",
@@ -251,6 +324,78 @@ def build_parser() -> argparse.ArgumentParser:
     # 4. `lkmp migrate`
     mig_p = sub.add_parser("migrate", help="Execute live or cold process migration from A to B")
     _add_common_migration_args(mig_p)
+
+    # 4b. `lkmp gang-migrate`
+    gang_p = sub.add_parser(
+        "gang-migrate",
+        help="Execute coordinated 2-Phase Commit (2PC) gang migration across multiple process trees",
+    )
+    gang_p.add_argument("--gang-id", required=True, help="Unique identifier for the 2PC gang")
+    gang_p.add_argument("--manifest", help="Path to JSON gang manifest (array of member configs or {'members':[...]})")
+    gang_p.add_argument(
+        "--member",
+        action="append",
+        default=[],
+        dest="member_specs",
+        help="Inline member spec: pid=...,source=...,dest=...,strategy=... (repeatable)",
+    )
+    gang_p.add_argument(
+        "--journal-dir",
+        default="/var/lib/lkmp/journals",
+        help="Directory for durable gang & member Write-Ahead Logs",
+    )
+    gang_p.add_argument(
+        "--allow-volatile-journal",
+        action="store_true",
+        help="Allow journal directory on volatile tmpfs/ramfs (testing only)",
+    )
+    gang_p.add_argument("--no-tls", action="store_true", help="Disable TLS on agent & page-server links")
+    gang_p.add_argument("--tls-ca", help="Path to CA certificate bundle")
+    gang_p.add_argument("--tls-cert", help="Path to TLS certificate")
+    gang_p.add_argument("--tls-key", help="Path to TLS private key")
+    gang_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+
+    # 4c. `lkmp wal-inspect`
+    wal_p = sub.add_parser(
+        "wal-inspect",
+        help="Non-destructively verify checksums, sequence numbers, and 2PC decisions of a WAL journal",
+    )
+    wal_p.add_argument("journal", help="Path to .wal.jsonl or .gang.wal.jsonl file")
+    wal_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+
+    # 4d. `lkmp tls-init`
+    tls_p = sub.add_parser(
+        "tls-init",
+        help="Generate a Root CA and SAN-signed mTLS certificates for lkmp-agent and CRIU page-server",
+    )
+    tls_p.add_argument("--out-dir", required=True, help="Output directory for generated PKI files")
+    tls_p.add_argument(
+        "--host",
+        action="append",
+        default=[],
+        dest="san_hosts",
+        help="DNS name or IP SAN for certificate (repeatable; defaults to localhost, 127.0.0.1, ::1)",
+    )
+    tls_p.add_argument(
+        "--node",
+        action="append",
+        default=[],
+        dest="named_nodes",
+        help="Additional named node leaf certificate to issue under the same CA (repeatable)",
+    )
+    tls_p.add_argument("--days", type=int, default=365, help="Certificate validity in days (default: 365)")
+    tls_p.add_argument("--overwrite", action="store_true", help="Overwrite existing certificates in --out-dir")
+    tls_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+
+    # 4e. `lkmp status`
+    st_p = sub.add_parser("status", help="Query live health, capabilities, and metrics of an lkmp-agent node")
+    st_p.add_argument("--agent", required=True, help="Target lkmp-agent address (host:port or [ipv6]:port)")
+    st_p.add_argument("--prometheus", action="store_true", help="Include Prometheus OpenMetrics text output")
+    st_p.add_argument("--no-tls", action="store_true", help="Disable TLS")
+    st_p.add_argument("--tls-ca", help="Path to CA certificate bundle")
+    st_p.add_argument("--tls-cert", help="Path to TLS certificate")
+    st_p.add_argument("--tls-key", help="Path to TLS private key")
+    st_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
 
     # 5. `lkmp demo`
     demo_p = sub.add_parser(
@@ -349,6 +494,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             workload_id=args.workload_id,
             command=cmd,
             rootfs=args.rootfs,
+            hostname=args.hostname,
+            bind_mounts=list(args.bind_mounts),
             ip_address=args.ip_address,
             net_interface=args.iface,
             use_time_ns=not args.no_time_ns,
@@ -369,8 +516,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             key_file=args.tls_key,
         )
         service = AgentService(work_dir=args.work_dir)
-        server = AgentServer(host=args.host, port=args.port, service=service, tls=tls)
-        print(f"lkmp-agent listening on {args.host}:{args.port} (work_dir={args.work_dir})")
+        server = AgentServer(
+            host=args.host,
+            port=args.port,
+            service=service,
+            tls=tls,
+            metrics_port=args.metrics_port,
+        )
+        metrics_note = f", metrics_port={args.metrics_port}" if args.metrics_port else ""
+        print(f"lkmp-agent listening on {args.host}:{args.port} (work_dir={args.work_dir}{metrics_note})")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -447,6 +601,103 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             print(render_migration_report(result, orch.config.strategy.value))
         return 0 if result.success else 1
+
+    if args.subcommand == "gang-migrate":
+        from lkmp.gang import GangMigrationCoordinator
+
+        default_tls = TlsConfig(
+            enabled=not args.no_tls,
+            ca_cert=args.tls_ca,
+            cert_file=args.tls_cert,
+            key_file=args.tls_key,
+        )
+        member_configs: List[MigrationConfig] = []
+        if args.manifest:
+            raw_manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+            raw_list = raw_manifest["members"] if isinstance(raw_manifest, dict) else raw_manifest
+            if not isinstance(raw_list, list):
+                raise ValueError("--manifest must be a JSON list or an object with a 'members' list")
+            for item in raw_list:
+                if "tls" not in item:
+                    item = dict(item)
+                    item["tls"] = asdict(default_tls)
+                member_configs.append(config_from_dict(item))
+        for spec in args.member_specs:
+            member_configs.append(_parse_member_spec(spec, default_tls=default_tls))
+        if not member_configs:
+            parser.error("lkmp gang-migrate requires at least one --member or --manifest")
+
+        gang_members = [
+            (mc, AgentClient(mc.source_addr, tls=mc.tls), AgentClient(mc.dest_addr, tls=mc.tls))
+            for mc in member_configs
+        ]
+        coord = GangMigrationCoordinator(
+            gang_id=args.gang_id,
+            members=gang_members,
+            journal_dir=args.journal_dir,
+            require_persistent_journal=not args.allow_volatile_journal,
+        )
+        gang_res = coord.execute_atomic()
+        if args.json:
+            print(json.dumps(gang_res.to_dict(), indent=2))
+        else:
+            print(render_gang_migration_report(gang_res))
+        return 0 if gang_res.all_committed else 1
+
+    if args.subcommand == "wal-inspect":
+        report = inspect_journal_file(args.journal)
+        if args.json:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            print(render_wal_inspection_report(report))
+        return 0 if report.valid else 2
+
+    if args.subcommand == "tls-init":
+        bundle = generate_mtls_pki(
+            out_dir=args.out_dir,
+            hosts=args.san_hosts or ("127.0.0.1", "localhost"),
+            node_names=args.named_nodes or None,
+            validity_days=args.days,
+            overwrite=args.overwrite,
+        )
+        bundle_dict = bundle.to_dict()
+        if args.json:
+            print(json.dumps(bundle_dict, indent=2))
+        else:
+            print(f"Generated LKMP mTLS PKI bundle in {bundle.out_dir}:")
+            print(f"  Root CA   : {bundle.ca_cert}")
+            print(f"  Node Cert : {bundle.node_cert}")
+            print(f"  Node Key  : {bundle.node_key} (mode 0600)")
+            named_map = bundle_dict.get("named_nodes", {})
+            if isinstance(named_map, dict):
+                for n_name, pair in sorted(named_map.items()):
+                    print(f"  Node [{n_name}]: cert={pair['cert']} key={pair['key']}")
+        return 0
+
+    if args.subcommand == "status":
+        tls = TlsConfig(
+            enabled=not args.no_tls,
+            ca_cert=args.tls_ca,
+            cert_file=args.tls_cert,
+            key_file=args.tls_key,
+        )
+        client = AgentClient(args.agent, tls=tls)
+        health = client.call("health_check")
+        prom_text: Optional[str] = None
+        if args.prometheus:
+            m_res = client.call("get_metrics")
+            prom_text = m_res.get("prometheus_text", "")
+        if args.json:
+            out = dict(health)
+            if prom_text is not None:
+                out["prometheus_text"] = prom_text
+            print(json.dumps(out, indent=2))
+        else:
+            print(render_agent_status_report(health))
+            if prom_text is not None:
+                print("\nPrometheus Metrics (/metrics):")
+                print(prom_text.rstrip())
+        return 0 if health.get("status") == "ok" else 1
 
     if args.subcommand == "demo":
         result, resolved_strategy, metrics = run_live_demo(

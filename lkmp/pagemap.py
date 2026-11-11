@@ -159,6 +159,58 @@ def reset_soft_dirty_bits(pid: int, proc_root: str = "/proc") -> bool:
         return False
 
 
+def _discover_tree_pids_for_pagemap(root_pid: int, proc_root: str) -> List[int]:
+    """Discover `[root_pid, ...descendants]` inside `proc_root` for whole-tree pagemap sampling."""
+    proc_dir = Path(proc_root)
+    parent_to_children: dict[int, set[int]] = {}
+    if proc_dir.exists():
+        try:
+            for entry in proc_dir.iterdir():
+                if entry.is_dir() and entry.name.isdigit():
+                    c_pid = int(entry.name)
+                    stat_file = entry / "stat"
+                    if stat_file.is_file():
+                        try:
+                            content = stat_file.read_text(encoding="utf-8", errors="ignore")
+                            rparen = content.rfind(")")
+                            if rparen != -1:
+                                fields = content[rparen + 1 :].strip().split()
+                                if len(fields) >= 2:
+                                    ppid = int(fields[1])
+                                    parent_to_children.setdefault(ppid, set()).add(c_pid)
+                        except Exception:
+                            pass
+        except OSError:
+            pass
+
+    result = [root_pid]
+    visited = {root_pid}
+    queue = [root_pid]
+    while queue:
+        curr = queue.pop(0)
+        task_dir = proc_dir / str(curr) / "task"
+        if task_dir.is_dir():
+            try:
+                for tid_entry in task_dir.iterdir():
+                    ch_file = tid_entry / "children"
+                    if ch_file.is_file():
+                        for ch_str in ch_file.read_text(encoding="utf-8", errors="ignore").split():
+                            if ch_str.isdigit():
+                                ch_pid = int(ch_str)
+                                if ch_pid not in visited:
+                                    visited.add(ch_pid)
+                                    result.append(ch_pid)
+                                    queue.append(ch_pid)
+            except OSError:
+                pass
+        for child in sorted(parent_to_children.get(curr, ())):
+            if child not in visited:
+                visited.add(child)
+                result.append(child)
+                queue.append(child)
+    return result
+
+
 def sample_process_dirty_rate(
     pid: int,
     proc_root: str = "/proc",
@@ -166,25 +218,31 @@ def sample_process_dirty_rate(
     bandwidth_mbps: float = 1000.0,
     has_userfaultfd: bool = True,
     allow_clear_refs: bool = False,
+    include_children: bool = True,
 ) -> MemoryHeatProfile:
     """
-    Read `/proc/<pid>/pagemap` across writable VMAs to measure memory residency and soft-dirty bits.
+    Read `/proc/<pid>/pagemap` across writable VMAs (across the full process tree when
+    `include_children=True`) to measure memory residency and soft-dirty bits.
     When `allow_clear_refs=False` (default for non-destructive preflight), never writes to
     `/proc/<pid>/clear_refs`. Only resets soft-dirty bits when `allow_clear_refs=True` and `sample_ms > 0`.
     """
     proc_dir = Path(proc_root) / str(pid)
     maps_path = proc_dir / "maps"
-    pagemap_path = proc_dir / "pagemap"
 
     if not maps_path.exists():
         raise FileNotFoundError(f"Cannot read {maps_path}")
 
-    vmas = parse_writable_vmas_with_labels(
-        maps_path.read_text(encoding="utf-8", errors="ignore")
+    target_pids = (
+        _discover_tree_pids_for_pagemap(pid, proc_root)
+        if include_children
+        else [pid]
     )
+
     reset_ok = False
     if allow_clear_refs and sample_ms > 0:
-        reset_ok = reset_soft_dirty_bits(pid, proc_root=proc_root)
+        for t_pid in target_pids:
+            if reset_soft_dirty_bits(t_pid, proc_root=proc_root):
+                reset_ok = True
 
     t0 = time.monotonic()
     if sample_ms > 0 and reset_ok:
@@ -196,9 +254,17 @@ def sample_process_dirty_rate(
     hot_thrashing_pages = 0
     vma_profiles: List[VmaRegionProfile] = []
 
-    if pagemap_path.exists():
+    for t_pid in target_pids:
+        t_dir = Path(proc_root) / str(t_pid)
+        t_maps = t_dir / "maps"
+        t_pagemap = t_dir / "pagemap"
+        if not t_maps.exists() or not t_pagemap.exists():
+            continue
         try:
-            with pagemap_path.open("rb") as pm_file:
+            vmas = parse_writable_vmas_with_labels(
+                t_maps.read_text(encoding="utf-8", errors="ignore")
+            )
+            with t_pagemap.open("rb") as pm_file:
                 for start_addr, end_addr, label in vmas:
                     start_page = start_addr // PAGE_SIZE
                     num_pages = (end_addr - start_addr) // PAGE_SIZE
@@ -210,10 +276,11 @@ def sample_process_dirty_rate(
                     pres, dirty = count_pagemap_flags(raw)
                     total_present += pres
                     total_dirty += dirty
+                    vma_label = label if t_pid == pid else f"pid:{t_pid}:{label}"
                     vma_prof = VmaRegionProfile(
                         start_vaddr=start_addr,
                         end_vaddr=end_addr,
-                        label=label,
+                        label=vma_label,
                         present_pages=pres,
                         soft_dirty_pages=dirty,
                     )
