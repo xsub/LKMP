@@ -1,0 +1,90 @@
+name: Linux Kernel E2E
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  criu-netns-acceptance:
+    name: Real CRIU 4.x & 3-NetNS L2 Acceptance (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install CRIU 4.2+, iproute2, nftables & rsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 nftables rsync
+          if ! sudo apt-get install -y criu || ! sudo criu check; then
+            sudo bash scripts/install_criu_on_linux.sh
+          fi
+          criu --version
+          sudo criu check || true
+
+      - name: Run 12-scenario stateful REAL_CRIU acceptance suite
+        run: |
+          sudo ./bin/lkmp acceptance --backend REAL_CRIU
+          sudo ./bin/lkmp acceptance --backend REAL_CRIU --json > /tmp/lkmp-acceptance-telemetry.json
+
+      - name: Run real Linux CRIU 4.x E2E verification harness
+        run: sudo python3 scripts/linux_criu_e2e.py | tee /tmp/lkmp-criu-e2e.log
+
+      - name: Upload CRIU & NetNS E2E telemetry artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-criu-e2e-telemetry
+          path: |
+            /tmp/lkmp-acceptance-telemetry.json
+            /tmp/lkmp-criu-e2e.log
+
+  qemu-kvm-2pc-e2e:
+    name: Real QEMU 8.x KVM/QMP & Heterogeneous 2PC Gang E2E (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install QEMU 8.x, CRIU 4.2+, iproute2, nftables & rsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 nftables rsync qemu-system-x86
+          if ! sudo apt-get install -y criu || ! sudo criu check; then
+            sudo bash scripts/install_criu_on_linux.sh
+          fi
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          fi
+          qemu-system-x86_64 --version
+          criu --version
+
+      - name: Run real QEMU Live QMP, Multi-Hop & Heterogeneous [QEMU + CRIU] 2PC Gang E2E
+        run: sudo python3 scripts/linux_qemu_e2e.py | tee /tmp/lkmp-qemu-e2e-telemetry.log
+
+      - name: Upload QEMU & 2PC Gang E2E telemetry artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-qemu-2pc-e2e-telemetry
+          path: /tmp/lkmp-qemu-e2e-telemetry.log

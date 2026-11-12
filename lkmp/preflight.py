@@ -516,6 +516,24 @@ def inspect_process_tree(
                 is_deleted = pathname.endswith(" (deleted)")
                 clean_path = pathname[:-10] if is_deleted else pathname
 
+                if clean_path.startswith("anon_inode:"):
+                    if "io_uring" in clean_path and workload_kind not in ("qemu", "microvm"):
+                        findings.append(
+                            ResourceFinding(
+                                resource_type="anon_inode",
+                                identifier=f"mmap->{clean_path}",
+                                classification=ResourceClassification.BLOCKER,
+                                reason="Kernel io_uring rings cannot be safely checkpointed by CRIU",
+                            )
+                        )
+                    continue
+
+                if not clean_path.startswith("/"):
+                    continue
+
+                if clean_path.startswith("/memfd:") and workload_kind in ("qemu", "microvm"):
+                    continue
+
                 if clean_path.startswith("/dev/"):
                     _classify_device(clean_path, "mmap", findings, workload_kind=workload_kind)
                     continue
@@ -783,6 +801,9 @@ def _classify_fd_target(
 
     is_deleted = target.endswith(" (deleted)")
     clean_path = target[:-10] if is_deleted else target
+
+    if clean_path.startswith("/memfd:") and workload_kind in ("qemu", "microvm"):
+        return
 
     if clean_path.startswith("/dev/"):
         _classify_device(clean_path, "fd", findings, workload_kind=workload_kind)

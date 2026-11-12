@@ -31,6 +31,12 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/xsub/LKMP"
+Repository = "https://github.com/xsub/LKMP"
+Issues = "https://github.com/xsub/LKMP/issues"
+Actions = "https://github.com/xsub/LKMP/actions"
+
 [project.scripts]
 lkmp = "lkmp.cli:main"
 
@@ -46,3 +52,6 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.bandit]
+skips = ["B104", "B108"]

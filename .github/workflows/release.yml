@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Signed Artifacts & Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Lint, test & build Python distribution packages
+        run: |
+          python3 -m pip install --upgrade pip ruff build
+          ruff check lkmp/ tests/ scripts/
+          python3 -m unittest discover -s tests -p "test_*.py"
+          python3 -m build
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload release distribution artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: lkmp-dist
+          path: dist/*
+
+      - name: Create GitHub Release (on version tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "LKMP ${GITHUB_REF_NAME}" \
+            --generate-notes

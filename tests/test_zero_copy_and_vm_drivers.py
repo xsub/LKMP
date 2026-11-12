@@ -954,6 +954,59 @@ class TestParallel2PCGangAndDoctorCli(unittest.TestCase):
             finally:
                 srv.shutdown()
 
+    def test_kvm_anon_inode_maps_do_not_fail_preflight(self) -> None:
+        from lkmp.config import FilesystemMode, IpMobilityMode
+        from lkmp.models import HostCapabilities
+        from lkmp.preflight import evaluate_compatibility, inspect_process_tree
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp) / "proc"
+            pdir = _make_fake_proc(
+                proc_root,
+                8901,
+                comm="qemu-system-x86",
+                exe_target="/usr/bin/qemu-system-x86_64",
+                cmdline=[
+                    "qemu-system-x86_64",
+                    "-accel",
+                    "kvm",
+                    "-object",
+                    "memory-backend-memfd,id=m0,size=256M,share=on",
+                    "-qmp",
+                    "unix:/tmp/kvm8901.qmp,server=on,wait=off",
+                ],
+                fds={
+                    "3": "/dev/kvm",
+                    "4": "anon_inode:kvm-vm",
+                    "5": "anon_inode:kvm-vcpu:0",
+                    "6": "/memfd:m0 (deleted)",
+                },
+            )
+            (pdir / "maps").write_text(
+                "7f0000000000-7f0000003000 rw-s 00000000 00:0f 12345 anon_inode:kvm-vcpu:0\n"
+                "7f0010000000-7f0020000000 rw-s 00000000 00:01 12346 /memfd:m0 (deleted)\n",
+                encoding="utf-8",
+            )
+            snap = inspect_process_tree(8901, proc_root=str(proc_root))
+            self.assertEqual(snap.files, [])
+            caps = HostCapabilities(
+                arch="x86_64",
+                kernel_release="7.0.0",
+                cpu_vendor="GenuineIntel",
+                cpu_flags={"avx2"},
+                criu_available=True,
+                work_dir_free_bytes=10 * 1024**3,
+            )
+            cfg = MigrationConfig(
+                pid=8901,
+                source_addr="127.0.0.1:9700",
+                dest_addr="127.0.0.1:9701",
+                fs_mode=FilesystemMode.SHARED,
+                ip_mobility=IpMobilityMode.NONE,
+            )
+            report = evaluate_compatibility(cfg, caps, caps, snap, dest_files={})
+            self.assertTrue(report.compatible, msg=f"Unexpected blockers: {report.findings}")
+
 
 if __name__ == "__main__":
     unittest.main()

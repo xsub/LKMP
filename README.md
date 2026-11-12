@@ -1,314 +1,68 @@
-# LKMP (`lkmp`) — Real-Time Zero-Copy Linux Process, Container & VM Live Migration Orchestrator
+<div align="center">
 
-<p align="center">
-  <a href="https://github.com/xsub/LKMP/actions/workflows/ci.yml"><img src="https://github.com/xsub/LKMP/actions/workflows/ci.yml/badge.svg" alt="CI Status"></a>
-  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-2ea44f.svg" alt="License: Apache-2.0"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776ab.svg" alt="Python 3.10+"></a>
-  <a href="https://criu.org/"><img src="https://img.shields.io/badge/Engines-CRIU%204.x%20%7C%20QEMU%20QMP%20%7C%20Podman%20%7C%20Firecracker-008080.svg" alt="Engines"></a>
-  <img src="https://img.shields.io/badge/Platform-Linux%20(x86__64%20%7C%20ARM64)-f05032.svg" alt="Platform: Linux">
+<img src="docs/assets/product-banner.svg" alt="LKMP — Real-Time Zero-Copy Live Migration Orchestrator for Linux" width="100%">
+
+<br/>
+
+<!-- Row 1: Live GitHub Actions CI/CD & Security Workflow Badges -->
+<p>
+  <a href="https://github.com/xsub/LKMP/actions/workflows/ci.yml"><img src="https://github.com/xsub/LKMP/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI Matrix"></a>
+  <a href="https://github.com/xsub/LKMP/actions/workflows/linux-e2e.yml"><img src="https://github.com/xsub/LKMP/actions/workflows/linux-e2e.yml/badge.svg?branch=main" alt="Linux Kernel E2E"></a>
+  <a href="https://github.com/xsub/LKMP/actions/workflows/security.yml"><img src="https://github.com/xsub/LKMP/actions/workflows/security.yml/badge.svg?branch=main" alt="Security & Container"></a>
+  <a href="https://github.com/xsub/LKMP/actions/workflows/release.yml"><img src="https://github.com/xsub/LKMP/actions/workflows/release.yml/badge.svg" alt="Release Pipeline"></a>
 </p>
 
-**LKMP** (`lkmp`) is a mission-critical, low-latency, near-zero-copy live migration orchestrator for **Linux process trees** (**CRIU**), **QEMU/KVM & TCG virtual machines** (**QMP**), **OCI containers** (**Podman / crun / runc**), and **MicroVMs** (**Firecracker / Cloud-Hypervisor**). It moves running workloads—or heterogeneous coupled gangs such as `[QEMU VM + CRIU Process]`—from **Source Host A** to **Destination Host B** with millisecond-scale blackout windows (`~19 ms` measured end-to-end on QEMU 8.2.2), preserving virtual memory, CPU/vCPU registers, open file descriptors, and established TCP connections under a **Coordinated Two-Phase Cutover with Stopped-Readiness Barrier & WAL Roll-Forward** protocol.
-
-<p align="center">
-  <img src="docs/assets/hero-architecture.svg" alt="LKMP System Architecture" width="100%">
+<!-- Row 2: Product, Runtime, Quality & Security Badges -->
+<p>
+  <a href="https://github.com/xsub/LKMP/releases"><img src="https://img.shields.io/badge/version-v0.3.0-1f6feb?logo=semanticrelease&logoColor=white" alt="Version v0.3.0"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776ab?logo=python&logoColor=white" alt="Python 3.10 - 3.13"></a>
+  <img src="https://img.shields.io/badge/dependencies-0%20runtime%20(pure%20stdlib)-2ea043" alt="Zero Runtime Dependencies">
+  <img src="https://img.shields.io/badge/typing-PEP%20561%20strict-58a6ff" alt="PEP 561 Typed">
+  <a href="https://docs.astral.sh/ruff/"><img src="https://img.shields.io/badge/code%20style-ruff-261230?logo=ruff&logoColor=d7ff64" alt="Code Style: Ruff"></a>
+  <img src="https://img.shields.io/badge/security-mTLS%201.3%20%2B%20Merkle%20HMAC-8957e5" alt="Security: mTLS 1.3 + Merkle HMAC">
+  <img src="https://img.shields.io/badge/platform-Linux%20(x86__64%20%7C%20ARM64)-f05032?logo=linux&logoColor=white" alt="Platform: Linux">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-2ea44f" alt="License: Apache-2.0"></a>
 </p>
 
----
-
-## Architectural Pillars & Hardened SOTA Capabilities
-
-### 1. Coordinated Two-Phase Cutover with Stopped-Readiness Barrier & WAL Roll-Forward
-- **Strict Phase Isolation (`lkmp/orchestrator.py`, `lkmp/gang.py`)**:
-  - **Phase 1 (`execute_prepare_phase`)**: Executes preflight, incremental filesystem and memory pre-dumps, host freeze, final dump, transfer, pre-restore IP assignment, CRIU restore, and stopped readiness barrier (`verify_restored_stopped`, confirming both kernel `T`/`t` stopped state across every restored PID/thread via `/proc/<pid>/stat` and active `nftables` `input`/`output` `drop` rules via `nft list table`) up through `VERIFY` on Destination B. Throughout Phase 1, the source process tree on Host A remains frozen via `--leave-stopped` (`SIGSTOP` / `cgroup v2` freezer)—it is **never** terminated during Phase 1.
-  - **Phase 2 (`commit` / `rollback`)**: Only after Destination B (or *all* members of a gang migration) successfully passes health verification does the coordinator issue an irrevocable `commit()`: `commit_source` first confirms `TCP_REPAIR = 1` across the source process tree (`set_tree_tcp_repair` with kernel `getsockopt(SOL_TCP, TCP_REPAIR)` read-back verification) before sending `SIGKILL`, unfreezes any source `cgroup v2` workload envelope (`unfreeze_cgroup`), and cryptographically zero-wipes checkpoint images. `commit_source` persists `"committed": True` to `source_state.json` strictly **after** `SIGKILL` succeeds across the source process tree, and `_signal_process_tree` propagates any non-`ESRCH` `OSError` (such as `EPERM`).
-  - If any failure occurs in Phase 1 (restore failure, network timeout, failed `--health-cmd`, or image tamper), the coordinator executes a deterministic `rollback()`: `rollback_dest` confirms `TCP_REPAIR = 1` (`set_tree_tcp_repair` via `pidfd_open` + `pidfd_getfd` + `getsockopt` read-back), tears down any `lkmp<id>` tunnel device, and sends `SIGKILL` to any partial process on B without emitting spurious `FIN`/`RST` packets; if `TCP_REPAIR` confirmation fails (`TcpRepairError`), `rollback_dest` fails closed without sending `SIGKILL` so no unconfirmed `FIN`/`RST` can escape. Only when `rollback_dest` succeeds (`rolled_back_dest == True`) does `rollback_source` confirm `TCP_REPAIR = 0` on source sockets, tear down any `lkmp<id>` IPIP/IP6IP6 tunnel (`teardown_tunnel`), drop packet isolation rules, reclaim IP on A, and resume the original process tree on Host A in-place via `SIGCONT` with zero state loss. If Destination B cleanup or `TCP_REPAIR` confirmation fails, Source A remains frozen and network-fenced.
-  - **Per-Migration & Same-PID Concurrency Guards (`lkmp/agent.py`)**: `AgentService` enforces per-`migration_id` re-entrant locks and an active source-PID guard (`_active_source_pids`) that rejects concurrent attempts to freeze an already-frozen source PID under a second migration until commit or rollback releases it.
-- **Process-Tree-Wide Lifecycle & PID-Reuse Protection (`lkmp/preflight.py`, `lkmp/agent.py`)**:
-  - Process-tree-wide management recursively walks `/proc/<pid>/task/*/children` and `/proc/*/stat` parent-PID mappings via `discover_process_tree_pids` to ensure *all* child workers, threads, and grandchildren are frozen, resumed, or terminated together without orphaned processes.
-  - Before issuing any `SIGSTOP`, `SIGCONT`, or `SIGKILL`—and inside `verify_process`, `verify_restored_stopped`, and `claim_ip_and_resume`—`lkmp-agent` validates field 22 (`starttime`) from `/proc/<pid>/stat` (`read_proc_starttime`) against recorded `restore_state.json` and WAL `restored_starttime` metadata (`restore_state.json` is preserved across `wipe_images_on_commit` zero-wiping). If a process exited and the kernel recycled its PID to an unrelated program, LKMP refuses to treat the foreign PID as healthy or signal it.
-- **Application Consistency Levels & Freezer Polling (`lkmp/config.py`, `lkmp/envelope.py`)**:
-  - **Default Syscall-Boundary Crash Consistency**: The process tree is frozen via the `cgroup v2` freezer controller, actively polling `/sys/fs/cgroup/<workload>/cgroup.events` until `frozen 1` is observed before invoking CRIU dump.
-  - **Application-Quiesced Consistency (`--quiesce-cmd` / `--resume-cmd`)**: For database engines and stateful network services, `--quiesce-cmd` executes prior to packet locking and cgroup freezing to allow the application to drain in-flight requests, flush memory buffers, and run `fsync`. If the migration commits or rolls back, `--resume-cmd` is invoked to resume background application timers and processing loops.
-- **Write-Ahead Log (`.wal.jsonl`, `lkmp/journal.py`)**:
-  - Every state transition and decision (`PREPARING`, `PREPARED_STOPPED`, `COMMITTED`, `ABORTING`, `ROLLED_BACK`) is recorded to an append-only JSONL log with per-entry canonical SHA-256 checksums and mandatory `os.fsync` barriers on both the `.wal.jsonl` descriptor and its parent directory descriptor before remote RPC dispatch (propagating any `OSError` on file or directory `fsync` without advancing journal state). `open_migration_journal` and `MigrationJournal` operate strictly fail-closed: they never fall back to volatile `/tmp` directories on `OSError`/`PermissionError`, enforce persistent backing-storage verification (`require_persistent=True`) **by default across every `journal_dir`** (rejecting `tmpfs`/`ramfs`/`devtmpfs`/`rootfs`), synchronize `_seq` from existing disk entries (`sync_from_disk_if_exists`) so repeated recoveries strictly continue monotonic `seq` numbering (`last_seq + 1`), truncate only **unterminated** EOF write fragments (`not has_newline`) via `os.ftruncate` before appending, and raise `WalCorruptionError` on any corrupted `\n`-terminated record (refusing unsafe automatic rollback if a previously fsynced `COMMITTED` record suffered media corruption).
-  - If the migration controller crashes mid-flight, the state is deterministically recovered via:
-    ```bash
-    lkmp recover --journal /var/lib/lkmp/journals/<id>.wal.jsonl --source 10.0.1.10:9700 --dest 10.0.1.11:9700
-    ```
-    If the journal belongs to a 2PC gang (`gang_id`), `<gang_id>.gang.wal.jsonl` persists authoritative `member_ids` and `member_configs`; `recover_from_journal` and `lkmp recover --gang-journal` verify full gang membership and the presence of every expected `<member_id>.wal.jsonl` before acting, and consult `<gang_id>.gang.wal.jsonl` **first** so a crash between gang `COMMITTED` and member `COMMITTED` never triggers a conflicting member rollback. Before executing `commit_source` (`SIGKILL` on Source A), recovery verifies Destination B holds a live restored PID matching its recorded `starttime`.
-
-### 2. Supervised CRIU Daemons & Complete Memory Page Movement
-- **Non-Blocking RPC Orchestration & Cross-Restart Orphan Hygiene (`lkmp/criu_driver.py`, `lkmp/agent.py`)**:
-  - `criu page-server` natively supports `--daemon --pidfile <path>`, detaching immediately so agent JSON-RPC handlers return without blocking worker threads or timing out RPC connections.
-  - Because upstream CRIU does not support `--daemon` on `lazy-pages` or `dump --lazy-pages`, `lkmp-agent` supervises them as background processes via `subprocess.Popen` (`run_background_daemon`, closing parent log file descriptors immediately after spawn), tracking their PIDs in `.pid` files. Across `lkmp-agent` restarts, `stop_daemon` inspects `/proc/<pid>/cmdline` and `/proc/<pid>/comm` (`_is_verified_criu_pid`) to safely reap orphaned CRIU `page-server`/`lazy-pages` daemons while refusing to signal recycled non-CRIU PIDs.
-- **Explicit Memory Transfer Semantics by Strategy**:
-  - **`COLD`**: Memory pages (`pages-*.img`) are transferred alongside checkpoint metadata via `rsync` (`sync_checkpoint_images(..., include_pages=True)`).
-  - **`PRE_COPY`**: Memory pages (`pages-*.img`) are streamed directly over the network via `criu page-server --daemon`. After streaming completes, Destination B measures actual received byte counts (`finalize_page_server_round`), computes the Merkle root of received page files, and binds `dest_pages_merkle_root` into `manifest.sig.json` for end-to-end attestation.
-  - **`LAZY` / `HYBRID`**: Destination B launches supervised `criu lazy-pages` prior to invoking `criu restore --lazy-pages`. Concurrently, Source A executes supervised `criu dump --lazy-pages`, establishing a demand-paging daemon pair backed by kernel `userfaultfd`.
-
-### 3. Pre-Restore IP Assignment & Per-Migration `nftables` Isolation
-- **Pre-Restore Socket Binding (`lkmp/network.py`)**:
-  - Destination B assigns the workload IP (`ip addr replace <ip>/32 dev <iface>`) **before** invoking `criu restore --tcp-established`. This guarantees that kernel `TCP_REPAIR` socket `bind()` operations succeed immediately during descriptor reconstitution without `EADDRNOTAVAIL` errors.
-- **Isolated & Atomic Per-Migration Fencing**:
-  - During the freeze window, Source A is fenced using an isolated, per-migration table: `lkmp_lock_<migration_id>_<ip>`, committing table creation, flush, `input`/`output` filter chains, and `ip daddr`/`ip saddr` `drop` rules in a **single atomic `nft` batch transaction**. Repeated `lock_network` invocations atomically replace the ruleset inside one kernel `nf_tables` transaction with zero packet-leak window between `flush table` and `drop` rule installation—and if a re-lock batch fails while an active `drop` lock is already protecting the workload (`verify_network_locked`), the existing lock is preserved rather than deleted.
-- **Dual-Stack IPv4/IPv6 Packet Locking, IPIP / IP6IP6 Tunnel Forwarding & Custom BGP Templates (`--ip-mobility tunnel|garp|arp|bgp|cloud`)**:
-  - Full dual-stack endpoint parsing (`parse_host_port` / `format_rsync_remote` across `10.0.0.2:9700`, `[::1]:9700`, and `[2001:db8::2]:9700`), IPv6 `AgentServer` / `AgentClient` sockets (`AF_INET6`), and bracketed `rsync` remotes (`[2001:db8::2]:/path/`).
-  - Tunnel mode (`tunnel` / `ebpf`) establishes an on-demand `ipip` (IPv4) or `ip6ip6` (IPv6) tunnel device (`lkmp<id>`) on Source A forwarding in-flight packets to Destination B until network fabric convergence completes, idempotently replacing stale devices on retry and tearing down tunnels cleanly on rollback.
-  - Announces the relocated IP via Gratuitous ARP (`garp` / `arp`), BGP `/32` or `/128` host routes (`bgp`, supporting custom FRR/BIRD/GoBGP templates via `--bgp-daemon-cmd`), or cloud VPC API webhooks (`cloud`).
-
-### 4. Fail-Closed Mutual TLS (mTLS), Turnkey PKI (`lkmp tls-init`), Bounded RPC & Checkpoint Attestation
-- **Mandatory Mutual TLS with Client Verification (`CERT_REQUIRED`, `lkmp/agent.py`, `lkmp/pki.py`)**:
-  - `TlsConfig(enabled=True)` operates strictly fail-closed: `AgentServer` sets `ssl.CERT_REQUIRED` against the trusted CA bundle, requiring mutual authentication on every TCP JSON-RPC connection, while `AgentClient` caches verified `SSLContext` instances (keyed by certificate mtime) and retries transient read-only RPC resets safely.
-  - `lkmp tls-init` (`generate_mtls_pki`) generates a Root CA (`ca.crt`, `ca.key`) and SAN-signed node certificates (`node.crt`, `node.key` with `0600` key permissions and `serverAuth, clientAuth` EKU) compatible with both `lkmp-agent` and `criu page-server --tls`. `deploy/Dockerfile.node` + `deploy/entrypoint.sh` auto-bootstrap shared cluster mTLS certificates out of the box on port `9700` (with `/metrics` & `/healthz` on port `9701`).
-  - `_RpcRequestHandler` enforces bounded `16 MiB` JSON-RPC frame reads (`MAX_RPC_MESSAGE_BYTES`) and per-socket timeouts (`120s`) to prevent memory-exhaustion or hung-socket DoS.
-- **Strict Path-Traversal Sanitization (`lkmp/journal.py`, `lkmp/agent.py`)**:
-  - All RPC identifiers (`migration_id`, `round_name`, `workload_id`) are validated against strict alphanumeric regex patterns (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`) and verified with `Path.is_relative_to(work_dir)` to guarantee no path traversal (`../`) escapes the scratch workspace. Secure directory wiping (`secure_wipe_directory`) enforces parent boundary checks before overwriting files.
-- **Cryptographic Merkle Attestation (`lkmp/attestation.py`)**:
-  - Checkpoint integrity is validated before restore (`verify_attestation=True`). Source metadata `.img` files and Destination B's received memory pages (`dest_pages_merkle_root`) are signed with HMAC-SHA256 using operator-supplied or ephemeral per-migration keys (no static cluster secrets). Even a 1-bit corruption in `core-*.img` or `pages-*.img` aborts the restore and triggers rollback.
-
-### 5. 4-State Portability Assessment & Non-Destructive Preflight (`lkmp portability`, `lkmp preflight`)
-- **4-State Per-Domain Portability Report (`BLOCKED` / `PREPARE` / `UNKNOWN` / `VERIFIED`)**:
-  - `lkmp portability` evaluates the **entire process tree** (walking `/proc/<pid>/task/*/children` and `/proc/*/stat` `ppid` for all child PIDs, not just the root PID) across five independent domains:
-    1. **`memory_and_cpu`**: CPU ISA superset verification (`avx2`, `avx512f`, `xsave`, `sve`), active `TracerPid` across any child PID, and active vs. passive dirty-rate sampling (`--active-sample-ms`).
-    2. **`files`**: ELF `.note.gnu.build-id` verification, deleted-open file descriptors, destination scratch-disk capacity verification (`work_dir_free_bytes < rss_bytes` `BLOCKER` for `COLD`/`PRE_COPY`), and writable mount synchronization (`PREPARE` until frozen volume snapshot / rsync is configured).
-    3. **`network`**: Explicit socket FD inspection across all child processes (`PREPARE` requiring `--tcp-established` + pre-restore IP assignment + `nftables` lock).
-    4. **`devices`**: `/dev/nvidia*`, `/dev/dri/renderD*`, `/dev/kfd` (`PREPARE` with `--enable-gpu`, `BLOCKED` without), and arbitrary host char/block devices (`BLOCKED`).
-    5. **`external_resources`**: Cross-tree pipe topology analysis (pipes whose read+write ends are both held within the inspected process tree are classified `OK`; pipes with external endpoints are `PREPARE`), `anon_inode` inspection (`io_uring` -> `BLOCKED`, `eventpoll`/`timerfd`/`signalfd`/`eventfd` -> `OK`, unrecognized `anon_inode` -> `UNKNOWN`), and kernel feature checks (`criu check --extra` and `criu check --feature`).
-  - Rather than outputting a misleading percentage score, LKMP reports `UNKNOWN` whenever static read-only inspection cannot prove safety, and reaches `VERIFIED` only when isolated `--check-only` and `--trial-restore` validation succeed.
-- **Podman-Style Consistent Frozen Data Snapshot & Same-Host CoW Fast Path (`lkmp/fs_sync.py`, `lkmp/agent.py`, `lkmp/orchestrator.py`)**:
-  - During `freeze_and_final_dump`, LKMP enforces strict Podman-style ordering: `quiesce_cmd` -> `nftables` packet lock -> `cgroup.freeze = 1` (polling `cgroup.events` until `frozen 1`) -> `criu dump --leave-stopped` -> `snapshot_writable_paths_while_frozen` (`--volume-snapshot-cmd` or CoW snapshot into `vol_snap` while the process tree is still frozen). Both `snapshot_writable_paths_while_frozen` and `final_delta_sync` operate strictly fail-closed (`FileNotFoundError`), refusing to fall back to live mutable paths when any configured `writable_path` or its `vol_snap` entry is missing, guaranteeing memory pages and transferred on-disk files correspond to the exact same point in time.
-  - When Source A and Destination B genuinely share an underlying host/filesystem (`is_same_host_or_shared_storage`), proven via a per-migration cryptographic probe file (`.lkmp_storage_probe.json` written by Destination B during `prepare_migration` and verified on Source A's local VFS—never inferred from equal IP or loopback addresses alone), the production migration pipeline (`execute_prepare_phase` -> `transfer_final_state` -> `sync_checkpoint_images`) automatically invokes Copy-on-Write reflinks (`cow_clone_directory` via `cp --reflink=auto` / `cp -c`) instead of `rsync`.
-
-### 6. Adaptive Strategy Auto-Pilot & Knee-of-Curve Convergence
-- **Process-Tree VMA Locality Profiler (`--strategy auto`, `lkmp/pagemap.py`)**:
-  - Scans `/proc/<pid>/pagemap` soft-dirty bits (bit 55) across writable VMAs (`[heap]`, `[stack]`, `mmap`) of the **entire multi-process tree** (root PID + all child/grandchild workers via `_discover_tree_pids_for_pagemap`) to measure aggregate dirty rates, classifies pages into `COLD`, `WARM`, and `HOT_THRASHING`, calculates Shannon byte entropy (`0` to `8` bits/byte) for compression estimation, and selects `cold`, `pre-copy`, or `hybrid`.
-- **Asymptotic Convergence Predictor (`lkmp/convergence.py`)**:
-  - Models page decay trajectory `D(t) = D_inf + A * r^t` across pre-dump rounds and tracks `observed_bandwidth_mbps`, stopping pre-copy at the mathematical knee-of-curve (`D_inf`) before thrashing pages waste link bandwidth.
-
-### 7. Mission-Critical Low-Latency & Near-Zero-Copy Hot Path (`v0.3.0`)
-- **Sub-Millisecond Raw `AF_PACKET` Gratuitous ARP (`lkmp/network.py`)**:
-  - Replaces synchronous `arping -U -c 3` (`2,000 ms` sleep stall inside the freeze blackout window) with direct 42-byte RFC 5227 Ethernet II broadcast frames (`build_gratuitous_arp_frame` + `send_gratuitous_arp_raw` over `socket(AF_PACKET, SOCK_RAW)`), cutting L2 switchover notification to `< 0.5 ms` with automatic CLI fallback when unprivileged.
-- **Persistent Keep-Alive mTLS RPC & Zero-Fork In-Band Metadata Transfer (`lkmp/agent.py`, `lkmp/orchestrator.py`)**:
-  - `AgentClient` and `_RpcRequestHandler` pool persistent keep-alive mTLS connections with `TCP_NODELAY` across all 10 migration phases (`connections_opened == 1`), eliminating repeated TCP + X.509 handshake RTTs during cutover.
-  - Pre-spawns `start_page_server(round="final")` **before** `freeze_start` so daemon startup never touches the blackout window, and streams signed checkpoint metadata (`<= 8 MiB` `core-*.img` + `manifest.sig.json`) directly in-band over the warm mTLS socket (`export_inband_metadata` -> `upload_checkpoint_files`), eliminating cold `rsync` + `ssh` process forks during freeze.
-- **`tmpfs` Zero-Disk Staging, Kernel `FICLONE` Reflinks & `copy_file_range` (`lkmp/realtime.py`, `lkmp/fs_sync.py`, `lkmp/attestation.py`)**:
-  - `--prefer-tmpfs` / `--tmpfs-staging` stages checkpoints in RAM-backed `/dev/shm/lkmp-migrations` so `.img` writes never block on NVMe/SSD writeback, paired with CRIU `--auto-dedup` (`--auto-dedup`) to punch holes in superseded pre-dump images.
-  - `native_reflink_or_copy_file` invokes `fcntl.ioctl(dst_fd, FICLONE, src_fd)` (`0x40049409`) directly in-kernel for zero-copy CoW extent sharing on XFS/Btrfs/OCFS2, falling back to `os.copy_file_range` in-kernel splice with zero userspace buffer copies, while SHA-256 attestation uses C/OpenSSL GIL-releasing `hashlib.file_digest`.
-- **Deterministic Real-Time OS Tuning & Parallel `O(1)` 2PC Gang Barriers (`lkmp/realtime.py`, `lkmp/gang.py`)**:
-  - `lkmp agent --rt-priority 50 --mlockall --cpu-affinity 0,1` applies `SCHED_FIFO`, `mlockall(MCL_CURRENT | MCL_FUTURE)`, and housekeeping CPU pinning so workload load spikes cannot preempt the migration agent during cutover, and inspects `/proc/<pid>/timens_offsets` (`read_timens_offsets`) for monotonic/boottime continuity.
-  - `GangMigrationCoordinator` executes preflight, Phase 1 prepare, `commit_source`, and `complete_switchover_and_verify` barriers concurrently across `ThreadPoolExecutor` workers (`O(1)` wall-clock cutover independent of gang size `N`) backed by a thread-safe `RLock`-guarded `MigrationJournal`.
-
-### 8. Pluggable Hypervisor, MicroVM & OCI Container Workload Drivers + `lkmp doctor` (`lkmp/drivers/*`)
-- **Automatic Process-Tree Fingerprinter & Porting Advisor (`lkmp doctor --pid <pid>`, `lkmp/drivers/detector.py`)**:
-  - Inspects `/proc/<pid>/{exe,cmdline,fd,cgroup,mountinfo,net/unix}` to automatically classify any target PID into `POSIX_TREE` (`CriuDriver`), `QEMU_VM` (`QemuQmpDriver`, KVM or TCG), `MICROVM` (`MicroVmDriver`, Firecracker or Cloud-Hypervisor), or `OCI_CONTAINER` (`OciContainerDriver`, Podman / Docker / containerd), flagging blockers (`VFIO` without migratable vGPU, missing `-qmp`, open `io_uring`) and recommending zero-copy flags (`memory-backend-memfd,share=on`).
-- **`QemuQmpDriver` — Zero-Copy Live Hypervisor 2PC Driver (`lkmp/drivers/qemu_qmp.py`)**:
-  - Migrates live `qemu-system-*` VMs via QMP (never dumping `/dev/kvm` via CRIU): launches standby QEMU on Destination B with `-S -incoming defer` + `late-block-activate=true`, streams dirty guest RAM via `multifd` + `zero-copy-send=true` (`MSG_ZEROCOPY` on `memory-backend-memfd,share=on`), halts at `pause-before-switchover` (`pre-switchover` -> `< 2 ms` `vmstate` flush), verifies Destination B reached `status="paused"` while Source A remains alive in `postmigrate`, and either commits (`cont` on B + `quit` on A) or rolls back (`quit` on B + `cont` on A) atomically—even in **heterogeneous 2PC gangs alongside CRIU processes** and across **multi-hop (`A -> B -> A`) migrations**!
-  - Turnkey zero-copy VM launch profile: `lkmp run --profile qemu --id vm-01 --memory-mb 2048 --vcpus 4 --disk /mnt/shared/vm.qcow2`.
-- **`OciContainerDriver` & `MicroVmDriver` (`lkmp/drivers/oci_runtime.py`, `lkmp/drivers/microvm.py`)**:
-  - `OciContainerDriver` fences container restart policies (`--restart=no`, restored on rollback) prior to checkpointing to prevent daemon/`conmon` split-brain, shares immutable OCI image `lowerdir` layers on Destination B, and integrates `--pre-checkpoint` + paused `--import` restore into LKMP's 2PC barrier.
-  - `MicroVmDriver` orchestrates Firecracker HTTP-over-UNIX `Paused` + `Full`/`Diff` memory snapshots (`PUT /snapshot/load` with `resume_vm: false` for 2PC verification before `Resumed` on commit) and Cloud-Hypervisor `/api/v1/vm.*`.
-
----
-
-## Live Migration Pipeline & Rollback Safety Net
-
-<p align="center">
-  <img src="docs/assets/migration-phases.svg" alt="LKMP Migration Pipeline and Rollback" width="100%">
+<p>
+  <a href="#-60-second-quickstart"><b>Quickstart</b></a> •
+  <a href="#-why-lkmp"><b>Why LKMP?</b></a> •
+  <a href="#-supported-workloads--auto-routed-drivers"><b>Workloads</b></a> •
+  <a href="#-verified-performance--benchmarks"><b>Benchmarks</b></a> •
+  <a href="#-architecture--two-phase-cutover-pipeline"><b>Architecture</b></a> •
+  <a href="#-python-sdk"><b>Python SDK</b></a> •
+  <a href="#-production-runbook"><b>Runbook</b></a> •
+  <a href="#-cli-reference"><b>CLI Reference</b></a> •
+  <a href="#-verification--ci-matrix"><b>Verification</b></a>
 </p>
 
-### End-to-End Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant CLI as 💻 lkmp Controller
-    participant A as 🟢 Source Host A (lkmp-agent)
-    participant B as 🔵 Dest Host B (lkmp-agent)
-    participant NET as 🌐 Network Fabric (GARP/BGP)
-
-    rect rgb(18, 45, 31)
-    Note over CLI,B: PHASE 1–3: READ-ONLY PREFLIGHT & ITERATIVE PRE-COPY (App Running on A — 0 ms Downtime)
-    CLI->>A: get_capabilities() & inspect_process(pid) (Non-destructive pagemap read)
-    CLI->>B: get_capabilities() & stat_files(paths)
-    Note over CLI: Verify CPU ISA, ELF build-ids & CRIU availability on A & B
-    CLI->>A: pre_sync_fs() (Initial rsync baseline pass)
-    loop Iterative Pre-Copy (Round 1..N until converged)
-        CLI->>B: start_page_server(round=N) -> criu page-server --daemon --pidfile
-        CLI->>A: run_pre_dump(round=N) -> criu pre-dump --track-mem --page-server
-        A-->>B: Stream dirty RAM pages over mTLS (:27000)
-        CLI->>B: finalize_page_server_round(round=N) -> Measure received bytes & page Merkle root
-    end
-    end
-
-    rect rgb(60, 42, 15)
-    Note over CLI,NET: PHASE 4–7: FREEZE, METADATA TRANSFER & RESTORE (Downtime Window Begins)
-    CLI->>B: start_page_server(round=final) -> criu page-server --daemon --pidfile
-    CLI->>A: freeze_and_final_dump()
-    Note over A: nftables lock (lkmp_lock_<id>_<ip>) + cgroup freeze + criu dump --leave-stopped
-    A-->>B: Stream final dirty pages to page-server
-    CLI->>B: finalize_page_server_round(round=final) -> Compute dest_pages_merkle_root
-    CLI->>A: transfer_final_state(dest_pages_merkle_root)
-    Note over A: Attest manifest.sig.json (metadata + dest pages root) + rsync metadata .img
-    CLI->>A: release_ip(workload_ip) (Setup IPIP hairpin tunnel dev lkmp<id>)
-    CLI->>B: restore_process()
-    Note over B: 1. Verify HMAC & Merkle attestation<br/>2. nftables lock on B (lkmp_lock_<id>_<ip>)<br/>3. ip addr replace <ip>/32 (BEFORE criu restore so TCP_REPAIR succeeds)<br/>4. criu restore --tcp-established --leave-stopped
-    CLI->>B: verify_restored_stopped(restored_pid)
-    Note over B: Confirm /proc/<pid>/stat 'T'/'t' across tree + active nft list table drop rules
-    CLI->>B: claim_ip_and_resume(restored_pid)
-    B->>NET: Broadcast Gratuitous ARP / BGP /32 route + SIGCONT to restored process
-    end
-
-    rect rgb(18, 38, 60)
-    Note over CLI,B: PHASE 8: TWO-PHASE COMMIT BOUNDARY (Source A Remains Frozen & Alive!)
-    CLI->>B: verify_process(restored_pid, --health-cmd)
-    end
-
-    alt Phase 2a: Verification Succeeds (Irrevocable Commit)
-        rect rgb(18, 38, 60)
-        Note over CLI: Phase 8 Verified -> WAL: Log COMMITTED
-        CLI->>A: commit_source() (SIGKILL frozen source process + zero-wipe .img)
-        CLI->>B: cleanup_dest() (Zero-wipe checkpoint .img)
-        end
-    else Phase 2b: Verification or Restore Fails (Deterministic Rollback)
-        rect rgb(65, 22, 26)
-        Note over CLI: Failure Detected -> WAL: Log ABORTING
-        CLI->>B: rollback_dest() (SIGKILL partial restored process + remove IP)
-        CLI->>A: rollback_source() (Drop nftables lock + re-claim IP + SIGCONT source process)
-        Note over A: Source process resumes on Host A with ZERO data loss!
-        Note over CLI: WAL: Log ROLLED_BACK
-        end
-    end
-```
-
-### State Machine Diagram
-
-```mermaid
-flowchart LR
-    classDef init fill:#21262d,stroke:#8b949e,color:#e6edf3,stroke-width:1.5px
-    classDef online fill:#122d1f,stroke:#3fb950,color:#e6edf3,stroke-width:2px
-    classDef freeze fill:#3b260c,stroke:#d29922,color:#e6edf3,stroke-width:2px
-    classDef commit fill:#12263c,stroke:#58a6ff,color:#e6edf3,stroke-width:2px
-    classDef fail fill:#42161b,stroke:#f85149,color:#ff7b72,stroke-width:2px
-
-    INIT(["INIT"]):::init --> PREFLIGHT["1. PREFLIGHT<br/>Read-only ISA & CRIU Check"]:::online
-    PREFLIGHT -->|"Compatible"| PREPARE["2. PREPARE<br/>FS Sync & Agent Session"]:::online
-    PREFLIGHT -.->|"Blocker Found"| ABORTED(["ABORTED"]):::fail
-
-    PREPARE --> PRE_COPY["3. PRE_COPY (1..N)<br/>criu page-server --daemon"]:::online
-    PRE_COPY -->|"Dirty set shrinking"| PRE_COPY
-    PRE_COPY -->|"Converged / Cap"| FREEZE["4. FREEZE<br/>nftables lock + cgroup"]:::freeze
-
-    FREEZE --> FINAL_DUMP["5. FINAL_DUMP<br/>criu dump --leave-stopped"]:::freeze
-    FINAL_DUMP --> TRANSFER["6. TRANSFER<br/>Attestation & Metadata"]:::freeze
-    TRANSFER --> RESTORE["7. RESTORE<br/>Pre-assign IP + criu restore"]:::freeze
-    RESTORE --> SWITCHOVER["8. SWITCHOVER<br/>Announce IP + SIGCONT on B"]:::freeze
-
-    SWITCHOVER --> VERIFY{"9. VERIFY<br/>Health Check on B<br/>(Source A Frozen)"}:::commit
-    VERIFY -->|"Healthy (Commit Phase)"| COMMIT(["10. COMMIT<br/>SIGKILL A & Zero-Wipe"]):::commit
-
-    RESTORE -.->|"Restore Error"| ROLLBACK(["ROLLBACK<br/>Kill B & Resume A (SIGCONT)"]):::fail
-    SWITCHOVER -.->|"Network Error"| ROLLBACK
-    VERIFY -.->|"Health Check Failed"| ROLLBACK
-```
+</div>
 
 ---
 
-## Migration Strategies & Memory Movement Mechanics
+## Overview
 
-| Strategy (`--strategy`) | Memory Transfer Mechanism | Downtime Profile | Best For |
-| :--- | :--- | :--- | :--- |
-| **`auto`** *(recommended)* | Profiles pagemap write rates; dynamically selects `cold`, `pre-copy`, or `hybrid` | Workload-optimal | Production workloads with variable or unknown memory dynamics |
-| **`cold`** | `pages-*.img` copied via `rsync` (`include_pages=True`) alongside metadata | Proportional to RSS / network bandwidth | Small memory footprints (`<= 8 MiB`), batch jobs, non-critical workers |
-| **`pre-copy`** | `pages-*.img` streamed via `criu page-server --daemon`; byte volume verified on B | Sub-second (`final_dirty / bw + restore`) | General stateful microservices, databases, caching layers |
-| **`lazy`** | On-demand page fetching via supervised `criu lazy-pages` on B + supervised `criu dump --lazy-pages` on A | Near-instant switchover | Very large memory footprints where pre-copy cannot converge |
-| **`hybrid`** | Iterative `pre-dump` passes, cutover, followed by `userfaultfd` demand paging for hot pages | Minimal freeze downtime | Write-intensive workloads (`>= 70%` link bandwidth saturation) |
+**LKMP (`lkmp`)** is a mission-critical, near-zero-copy live migration orchestrator and zero-dependency Python SDK for **Linux process trees** (`CRIU 4.x`), **QEMU/KVM & TCG virtual machines** (`QMP`), **OCI containers** (`Podman / crun / runc`), and **MicroVMs** (`Firecracker / Cloud-Hypervisor`).
 
-### Page Transfer & Attestation Binding
-1. **Cold Transfers**: Checkpoint metadata and memory images are synchronized consistently using `rsync -a --numeric-ids --compress`.
-2. **Pre-Copy Transfers**: The destination agent spawns `criu page-server --daemon --pidfile <path> --images-dir <dir> --port 27000 --tls`. Source A streams dirty pages directly to the daemon socket. Upon completion of each round, `finalize_page_server_round` measures the received image sizes directly on Destination B and calculates a cryptographic Merkle root across all `pages-*.img` files (`dest_pages_merkle_root`). This destination digest is signed by Source A into `manifest.sig.json`, eliminating man-in-the-middle or truncated stream vulnerabilities.
-3. **Lazy / Hybrid Transfers**: Destination B launches supervised `criu lazy-pages` before invoking `criu restore --lazy-pages`. Concurrently, Source A executes supervised `criu dump --lazy-pages` in the background, allowing `userfaultfd` page-fault requests across the network to be served without blocking RPC handlers.
+Unlike ad-hoc checkpoint scripts or single-engine hypervisor tools, LKMP wraps every migration—and even **heterogeneous coupled gangs** such as `[QEMU VM + CRIU Stateful Service]`—in a **Coordinated Two-Phase Cutover (2PC) Protocol** backed by an `fsync`-durable **Write-Ahead Log (`.wal.jsonl`)**, **persistent mTLS 1.3 RPC**, **Merkle + HMAC-SHA256 checkpoint attestation**, and **atomic zero-data-loss rollback**.
 
-### Pre-Copy Convergence Rules
-Pre-copy iterative rounds stop and transition to `FREEZE` when **any** of the following criteria is satisfied:
-- **Target Downtime Met**: Remaining dirty page transfer time fits within `--target-downtime-ms` (`dirty_bytes <= effective_bw * target_downtime`).
-- **Knee-of-Curve Floor (`D_inf`)**: The asymptotic dirty-page decay model detects that the dirty working set has reached a non-converging plateau (`dirty_bytes <= 1.20 * D_inf`).
-- **Diminishing Returns**: Dirty memory volume decreases by less than `10%` (`--min-shrink-ratio 0.10`) compared to the prior round.
-- **Iteration Cap**: Pre-copy round count reaches `--max-iter` (default `8`).
+> [!IMPORTANT]
+> **Core Safety Guarantee — Zero Split-Brain by Construction:** Source workloads are **never** terminated during Phase 1. Source Host A stays alive and frozen (`--leave-stopped` / QMP `postmigrate`) while Destination Host B is restored in a kernel-stopped, `nftables`-fenced barrier. Only after health checks and attestation pass does the coordinator `fsync` `COMMITTED` to the WAL; on any error, Destination B is cleanly reaped under `TCP_REPAIR` and Source A resumes in-place via `SIGCONT` with zero state loss.
 
 ---
 
-## Coordinated Gang Migration & Durable Crash Recovery
+## ⚡ 60-Second Quickstart
 
-### Coordinated Two-Phase Gang Migration with Stopped-Readiness Barrier
-Coupled microservices or MPI ranks cannot be migrated independently without risking distributed state desynchronization. LKMP provides `GangMigrationCoordinator` (`lkmp/gang.py`) to execute coordinated multi-process gang migrations with strict readiness barriers:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant GANG as 🎛️ GangMigrationCoordinator
-    participant M1 as 🔹 Member 1 (Srv A1 -> B1)
-    participant M2 as 🔹 Member 2 (Srv A2 -> B2)
-
-    Note over GANG,M2: Global Preflight Barrier
-    GANG->>M1: run_preflight()
-    GANG->>M2: run_preflight()
-    Note over GANG: All members must report compatible=True
-
-    Note over GANG,M2: Phase 1: Stopped-Readiness Barrier (Source Processes Kept Frozen via --leave-stopped)
-    GANG->>M1: execute_prepare_phase(keep_stopped=True) -> VERIFY (A1 frozen, B1 stopped)
-    GANG->>M2: execute_prepare_phase(keep_stopped=True) -> VERIFY (A2 frozen, B2 stopped)
-
-    alt All Members Pass Stopped Verification
-        Note over GANG,M2: Phase 2a: Global Irrevocable Commit Barrier (fsync COMMITTED to GangJournal)
-        GANG->>M1: commit_source() (SIGKILL A1)
-        GANG->>M2: commit_source() (SIGKILL A2)
-        GANG->>M1: complete_switchover_and_verify() (Resume B1)
-        GANG->>M2: complete_switchover_and_verify() (Resume B2)
-    else Any Member Fails in Phase 1
-        Note over GANG,M2: Phase 2b: Coordinated Rollback Barrier (fsync ABORTING to GangJournal)
-        GANG->>M1: rollback() (SIGKILL partial B1, SIGCONT A1)
-        GANG->>M2: rollback() (SIGKILL partial B2, SIGCONT A2)
-        Note over GANG: All original processes resume on Source A with ZERO split-brain!
-    end
-```
-
-#### Gang Migration Invariants
-1. **Stopped-Readiness Barrier**: During Phase 1 (`execute_prepare_phase(keep_stopped_on_prepare=True)`), every member process restored on Destination B remains stopped (`--leave-stopped`) and network-fenced, with `verify_restored_stopped` explicitly confirming kernel stopped state (`T`/`t`) across all restored PIDs/threads and active `nftables` `input`/`output` `drop` rules (`nft list table`) before Phase 1 completes. Meanwhile, all corresponding source processes on Host A remain alive and frozen. No source process is terminated during Phase 1.
-2. **Safe Coordinated Rollback**: If any member fails during Phase 1 (restore failure, network timeout, failed `--health-cmd`, or image tamper), the coordinator fsyncs `ABORTING` to `GangJournal` and rolls back all prepared members. It records `ROLLED_BACK` and reports `atomic_rollback_triggered=True` **strictly if and only if** every member confirms `rolled_back=True` (otherwise preserving `ABORTING` and keeping any unconfirmed member fenced).
-3. **Irrevocable Commit Order & Gang-Authoritative WAL Roll-Forward**: Only when all members successfully verify in stopped state does the coordinator fsync `COMMITTED` to `GangJournal`. `<gang_id>.gang.wal.jsonl` persists authoritative `member_ids` and `member_configs` (refusing partial recovery if any member WAL is missing), and `MigrationOrchestrator.recover_from_journal` always consults `<gang_id>.gang.wal.jsonl` first so a crash before per-member `COMMITTED` propagation still rolls forward deterministically. Before killing any Source A process (`commit_source`), roll-forward recovery verifies Destination B holds a live restored PID matching its recorded `starttime`.
-
-### Durable Crash Recovery with Write-Ahead Log (WAL)
-Every phase transition is persisted to an append-only `.wal.jsonl` log using `os.fsync`:
-```text
-{"seq": 1, "migration_id": "mig-9a2c", "state": "PREFLIGHT", "commit_decision": "PREPARING"}
-{"seq": 2, "migration_id": "mig-9a2c", "state": "PREPARE", "commit_decision": "PREPARING"}
-...
-{"seq": 8, "migration_id": "mig-9a2c", "state": "VERIFY", "commit_decision": "PREPARING", "restored_pid": 8484}
-{"seq": 9, "migration_id": "mig-9a2c", "state": "COMMIT", "commit_decision": "COMMITTED", "restored_pid": 8484}
-```
-
-If the controller host crashes or loses power, the operator simply re-executes recovery:
-```bash
-lkmp recover \
-  --journal /var/lib/lkmp/journals/mig-9a2c.wal.jsonl \
-  --source 10.0.1.10:9700 \
-  --dest 10.0.1.11:9700
-```
-- If `COMMITTED` was logged, recovery executes `commit()` to finalize cleanup on Source A.
-- If the log ended prior to `COMMITTED` (e.g., during `RESTORE` or `VERIFY`), recovery deterministically issues `rollback()` to restore the original workload on Source A.
-
----
-
-## Try It in 5 Seconds (`lkmp demo`)
-
-LKMP provides a built-in multi-node cluster simulator running over loopback TCP JSON-RPC sockets so you can validate pre-copy convergence, fault injection, and rollback mechanics without multi-host physical infrastructure:
+Try LKMP immediately on **Linux or macOS** with zero root privileges using the built-in multi-node loopback TCP RPC simulator, or install it as a CLI + Python SDK:
 
 ```bash
 git clone https://github.com/xsub/LKMP.git
 cd LKMP
 
-# 1. Run live pre-copy migration demo with Prometheus telemetry
+# Optional: install `lkmp` into a virtualenv (0 third-party dependencies)
+python3 -m pip install -e .
+
+# 1. Run an interactive live pre-copy migration with Prometheus OpenMetrics output
 ./bin/lkmp demo --strategy auto --rss-mb 256 --dirty-mbps 40 --prometheus
 ```
 
@@ -330,17 +84,14 @@ Iterative Pre-Copy Convergence (Online Phase — 0 ms Downtime):
   Round 2: [█████░░░░░░░░░░░░░░░░░░░]   24.0 MiB in    0.1 ms  (STREAMED)
   Round 3: [██░░░░░░░░░░░░░░░░░░░░░░]   10.0 MiB in    0.1 ms  (CONVERGED)
            └─ Dirty set (10485760 B) is within target downtime budget (25000000 B)
-
-FSM Trajectory:
-  INIT -> PREFLIGHT -> PREPARE -> PRE_COPY -> PRE_COPY -> PRE_COPY -> FREEZE -> FINAL_DUMP -> TRANSFER -> RESTORE -> SWITCHOVER -> VERIFY -> COMMIT
 ```
 
 ```bash
-# 2. Test transactional rollback via health check fault or image tamper injection
+# 2. Prove deterministic 2PC rollback under health-check failure or 1-bit checkpoint tampering
 ./bin/lkmp demo --strategy pre-copy --inject-fault verify
 ./bin/lkmp demo --strategy cold --inject-fault corrupt-image
 
-# 3. Execute comparative SOTA benchmark across workload profiles
+# 3. Run the comparative SOTA workload benchmark matrix
 ./bin/lkmp benchmark
 ```
 
@@ -357,20 +108,245 @@ FSM Trajectory:
 
 ---
 
-## Production Deployment & Operational Runbook
+## 🎯 Why LKMP?
+
+| Capability | Pod / Service Drain & Restart | DIY `criu dump` Scripts | Hypervisor-Only (`virsh`) | **LKMP (`v0.3.0`)** |
+| :--- | :---: | :---: | :---: | :---: |
+| **In-RAM State & CPU Registers Preserved** | ❌ Lost | ✅ Processes only | ✅ VMs only | ✅ **Processes, Containers, VMs & MicroVMs** |
+| **Established TCP Sockets Survive (`TCP_REPAIR`)** | ❌ Dropped | ⚠️ Fragile (`RST` leaks) | ✅ Inside guest NIC | ✅ **Atomic `nftables` Lock + `TCP_REPAIR` Read-Back** |
+| **Zero-Loss Rollback if Target Fails Health Check** | ❌ Re-deploy delay | ❌ Source killed on dump | ⚠️ Partial | ✅ **2PC Stopped Barrier (`--leave-stopped` / `-S defer`)** |
+| **Heterogeneous Coupled Gang 2PC (`[VM + Process]`)** | ❌ | ❌ | ❌ | ✅ **Parallel `O(1)` 2PC Gang Coordinator** |
+| **Controller Crash Recovery (Power Loss Mid-Cutover)** | ❌ | ❌ Orphaned state | ❌ | ✅ **`fsync` SHA-256 JSONL WAL (`lkmp recover`)** |
+| **Near-Zero-Copy Data Plane** | N/A | ❌ Disk + SSH forks | ✅ `multifd` | ✅ **`MSG_ZEROCOPY`, `FICLONE`, `/dev/shm`, Raw GARP** |
+| **Cryptographic Tamper Protection** | N/A | ❌ Plaintext `.img` | ⚠️ Optional TLS | ✅ **Fail-Closed mTLS 1.3 + Merkle HMAC-SHA256** |
+| **Pre-Migration Blocker & ISA Diagnostics** | N/A | ❌ Trial-and-error | ⚠️ Basic | ✅ **4-State `lkmp portability` + `lkmp doctor`** |
+
+---
+
+## 🧩 Supported Workloads & Auto-Routed Drivers
+
+`lkmp doctor --pid <pid>` inspects `/proc/<pid>/{exe,cmdline,fd,cgroup,mountinfo}` and `/proc/net/unix` to automatically classify any target PID and route `lkmp migrate` to the native 2PC driver—never naively attempting `criu dump` on `/dev/kvm` descriptors:
+
+| Workload Family | Driver | Pre-Copy / Streaming Engine | 2PC Stopped Barrier | Porting Highlights |
+| :--- | :--- | :--- | :--- | :--- |
+| **Linux Process Trees** | `CriuDriver` | `criu pre-dump` + `page-server --daemon` / `lazy-pages` (`userfaultfd`) | `criu restore --leave-stopped` + `nftables` `drop` | Full process-tree discovery, `TCP_REPAIR` verification, GPU plugin hooks (`cuda-checkpoint` / `amdgpu`) |
+| **QEMU / KVM & TCG VMs** | `QemuQmpDriver` | QMP `multifd` + `zero-copy-send` (`MSG_ZEROCOPY` on `memfd,share=on`) | `-S -incoming defer` + `late-block-activate` + `pause-before-switchover` | `~18.6 ms` measured cutover, multi-hop (`A -> B -> A`) ready, `lkmp run --profile qemu` turnkey launcher |
+| **OCI Containers** | `OciContainerDriver` | `podman` / `docker` `--pre-checkpoint` + `--leave-running --export` | Paused `--import` restore + `--restart=no` split-brain fencing | Fences daemon auto-restart before cutover (restored on rollback); reuses immutable `lowerdir` image layers |
+| **MicroVMs** | `MicroVmDriver` | Firecracker `Full`/`Diff` snapshots & Cloud-Hypervisor `/api/v1/vm.snapshot` | `PUT /snapshot/load` (`resume_vm: false`) / paused restore | Direct HTTP-over-UNIX control socket orchestration with sub-second snapshot cutover |
+
+---
+
+## 📊 Verified Performance & Benchmarks
+
+Measured on real Linux `7.0` (`x86_64`) with **`CRIU 4.2.1`** and **`QEMU 8.2.2`** across isolated host namespaces and 3-NetNS L2 Ethernet bridges:
+
+| Benchmark / Hot-Path Metric | Legacy Baseline (`v0.2`) | **LKMP `v0.3.0` (Measured)** | Underlying Optimization |
+| :--- | :---: | :---: | :--- |
+| **Live QEMU 8.2.2 VM 2PC Cutover (`Host A -> B`)** | N/A (Blocked on `/dev/kvm`) | **`18.57 ms`** | QMP `multifd` + `pause-before-switchover` + `-incoming defer` |
+| **Multi-Hop Reverse QEMU Cutover (`Host B -> A`)** | N/A | **`18.89 ms`** | Preserved post-commit QMP control socket + per-ID migration tracking |
+| **Real `CRIU 4.2.1` `PRE_COPY` NetNS L2 Blackout** | `~2,250 ms` | **`182.40 ms`** (`>12x` faster) | Pre-spawned final `page-server` + raw `AF_PACKET` GARP + `/dev/shm` |
+| **L2 Gratuitous ARP Switchover Broadcast** | `~2,005 ms` (`arping -c 3`) | **`< 0.50 ms`** | Direct 42-byte RFC 5227 Ethernet II frame via `AF_PACKET` `SOCK_RAW` |
+| **mTLS 1.3 Handshakes per 10-State Migration** | `12 – 18` per host | **`1` per host** | Persistent keep-alive JSON-RPC connection pool with `TCP_NODELAY` |
+| **Metadata Transfer Fork Overhead (`<= 8 MiB`)** | Cold `rsync` + `ssh` fork | **`0` process forks** | In-band base64 streaming over warm keep-alive mTLS socket |
+| **Same-Host / Shared-FS Checkpoint Clone** | User-space `cp` / `rsync` | **Zero-Copy Extent Share** | Kernel `ioctl(FICLONE)` (`0x40049409`) + `os.copy_file_range` fallback |
+| **N-Member Coupled 2PC Gang Barrier Scaling** | `O(N)` serial | **`O(1)` parallel** | Concurrent `ThreadPoolExecutor` barriers + `RLock` fsynced WAL |
+
+---
+
+## 🏗️ Architecture & Two-Phase Cutover Pipeline
+
+<p align="center">
+  <img src="docs/assets/hero-architecture.svg" alt="LKMP Unified System Architecture" width="100%">
+</p>
+
+### 10-State Pipeline & Deterministic Rollback Safety Net
+
+<p align="center">
+  <img src="docs/assets/migration-phases.svg" alt="LKMP 10-State Migration Pipeline and Rollback" width="100%">
+</p>
+
+### End-to-End Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI as 💻 lkmp Controller
+    participant A as 🟢 Source Host A (lkmp-agent)
+    participant B as 🔵 Dest Host B (lkmp-agent)
+    participant NET as 🌐 Network Fabric (Raw GARP / BGP)
+
+    rect rgb(18, 45, 31)
+    Note over CLI,B: PHASE 1–3: READ-ONLY PREFLIGHT & ITERATIVE PRE-COPY (App Running on A — 0 ms Downtime)
+    CLI->>A: get_capabilities() & inspect_process(pid) (Auto-detect POSIX / QEMU / OCI / MicroVM)
+    CLI->>B: get_capabilities() & stat_files(paths)
+    CLI->>A: pre_sync_fs() (Baseline rsync or shared storage probe)
+    loop Iterative Pre-Copy (Round 1..N until knee-of-curve D_inf or budget met)
+        CLI->>B: start_page_server(round=N)
+        CLI->>A: run_pre_dump(round=N) -> CRIU pre-dump / QMP multifd pre-copy
+        A-->>B: Stream dirty RAM pages over mTLS / zero-copy socket
+        CLI->>B: finalize_page_server_round(round=N) -> Measure bytes & page Merkle root
+    end
+    end
+
+    rect rgb(60, 42, 15)
+    Note over CLI,NET: PHASE 4–7: PRE-SPAWN, FREEZE, IN-BAND METADATA & STOPPED RESTORE
+    CLI->>B: start_page_server(round=final) (Pre-spawned BEFORE freeze_start!)
+    CLI->>A: freeze_and_final_dump()
+    Note over A: Atomic nftables drop + cgroup.freeze + dump --leave-stopped (or QMP pre-switchover)
+    A-->>B: Stream final dirty delta + in-band signed manifest.sig.json
+    CLI->>A: release_ip(workload_ip) (Optional IPIP/IP6IP6 hairpin tunnel lkmp<id>)
+    CLI->>B: restore_process() -> Pre-assign IP + stopped restore (--leave-stopped / -S defer)
+    CLI->>B: verify_restored_stopped(restored_pid) -> Confirm kernel 'T'/'t' + active nft drop
+    CLI->>B: claim_ip_and_resume(restored_pid)
+    B->>NET: Raw AF_PACKET GARP (<0.5 ms) / BGP /32 + SIGCONT / QMP cont
+    end
+
+    rect rgb(18, 38, 60)
+    Note over CLI,B: PHASE 8: TWO-PHASE COMMIT BOUNDARY (Source A Remains Frozen & Alive!)
+    CLI->>B: verify_process(restored_pid, --health-cmd, starttime check)
+    end
+
+    alt Phase 2a: Verification Succeeds (Irrevocable Commit)
+        rect rgb(18, 38, 60)
+        Note over CLI: fsync COMMITTED to .wal.jsonl
+        CLI->>A: commit_source() (Confirm TCP_REPAIR=1 -> SIGKILL A -> zero-wipe .img)
+        CLI->>B: cleanup_dest() (Zero-wipe scratch .img, preserve restore_state.json)
+        end
+    else Phase 2b: Any Error or Tamper Detected (Zero-Loss Rollback)
+        rect rgb(65, 22, 26)
+        Note over CLI: fsync ABORTING to .wal.jsonl
+        CLI->>B: rollback_dest() (Confirm TCP_REPAIR=1 -> SIGKILL partial B -> release IP)
+        CLI->>A: rollback_source() (Confirm TCP_REPAIR=0 -> unlock nftables -> SIGCONT A)
+        Note over A: Original workload resumes in-place on Host A with ZERO state loss!
+        end
+    end
+```
+
+### Strategy Auto-Pilot (`--strategy auto`)
+
+| Strategy | Memory Transfer Engine | Downtime Profile | Ideal Workload Profile |
+| :--- | :--- | :--- | :--- |
+| **`auto`** *(default)* | Samples `/proc/<pid>/pagemap` soft-dirty bits & Shannon entropy across the entire process tree; selects `cold`, `pre-copy`, or `hybrid` | Workload-optimal | Production fleets with mixed or dynamic memory write rates |
+| **`cold`** | Copies `pages-*.img` alongside metadata (`FICLONE` CoW on shared FS or `rsync`) | Proportional to RSS | Small services (`<= 8 MiB`), batch workers, Firecracker snapshots |
+| **`pre-copy`** | Iterative `criu page-server --daemon` or QMP `multifd` rounds until asymptotic `D_inf` floor | Millisecond-scale | Stateful databases, caches, QEMU VMs, latency-sensitive APIs |
+| **`lazy`** | Supervised `criu lazy-pages` (`userfaultfd`) on B + `criu dump --lazy-pages` on A | Near-instant cutover | Multi-GiB memory footprints where pre-copy cannot converge |
+| **`hybrid`** | Iterative `pre-dump` passes followed by post-copy `userfaultfd` demand paging | Minimal freeze window | Write-heavy analytics / AI inference (`>= 70%` link saturation) |
+
+### Architectural Deep Dives
+
+<details>
+<summary><b>1. Hardened Two-Phase Cutover, <code>TCP_REPAIR</code> Verification & PID-Reuse Defense</b></summary>
+
+<br/>
+
+- **Stopped-Readiness Barrier (`verify_restored_stopped`)**: Confirms across *every* restored PID and thread that field 3 of `/proc/<pid>/stat` is kernel-stopped (`T`/`t`) and verifies via `nft list table` that per-migration `input`/`output` `drop` chains are active before Phase 1 completes.
+- **Kernel `TCP_REPAIR` Read-Back Confirmation**: Before `commit_source` or `rollback_dest` sends `SIGKILL`, `set_tree_tcp_repair` uses `pidfd_open` + `pidfd_getfd` + `getsockopt(SOL_TCP, TCP_REPAIR)` to confirm `TCP_REPAIR == 1` on every established TCP socket so the kernel never emits spurious `FIN`/`RST` packets to peers. On `TcpRepairError`, `rollback_dest` fails closed without killing B so Source A remains safely fenced.
+- **Process-Tree Discovery & `starttime` Guard**: Walks `/proc/<pid>/task/*/children` and `/proc/*/stat` `ppid` recursively across all descendants, validating field 22 (`starttime`) of `/proc/<pid>/stat` before any `SIGSTOP`, `SIGCONT`, `SIGKILL`, or health check to prevent signaling recycled PIDs.
+- **Application Quiesce Hooks**: Supports `--quiesce-cmd` and `--resume-cmd` around cgroup v2 freeze (`cgroup.events -> frozen 1`) plus Podman-style frozen volume snapshots (`snapshot_writable_paths_while_frozen`) so memory pages and disk state match the exact same point in time.
+
+</details>
+
+<details>
+<summary><b>2. Crash-Safe Fsynced Write-Ahead Log (<code>.wal.jsonl</code>) & Authoritative Gang Recovery</b></summary>
+
+<br/>
+
+- **Fail-Closed Durable WAL**: Every state transition (`PREPARING`, `PREPARED_STOPPED`, `COMMITTED`, `ABORTING`, `ROLLED_BACK`) appends a canonical SHA-256-checksummed JSONL record with mandatory `os.fsync` barriers on both the file descriptor and parent directory descriptor.
+- **Persistent Backing-Storage Check**: Rejects volatile `tmpfs`/`ramfs`/`devtmpfs` journal directories (`require_persistent=True` by default), synchronizes monotonic `seq` numbers across repeated recoveries (`last_seq + 1`), truncates only unterminated EOF partial writes, and raises `WalCorruptionError` on corrupted `\n`-terminated records rather than risking unsafe rollback after a committed cutover.
+- **Gang-Authoritative Roll-Forward (`<gang_id>.gang.wal.jsonl`)**: Persists complete `member_ids` and `member_configs` in the gang journal. Recovery verifies all member WALs are present and consults the gang decision *first* so a crash between gang `COMMITTED` and member `COMMITTED` always rolls forward deterministically.
+
+</details>
+
+<details>
+<summary><b>3. Zero-Copy Hot Path, Real-Time OS Tuning & Cryptographic Attestation</b></summary>
+
+<br/>
+
+- **Zero-Disk `/dev/shm` Staging & `FICLONE` Reflinks**: `--prefer-tmpfs` stages checkpoints in RAM-backed `/dev/shm/lkmp-migrations` paired with CRIU `--auto-dedup`. When Source A and Destination B share storage (proven via a cryptographic `.lkmp_storage_probe.json` VFS token—never inferred from IP addresses alone), `native_reflink_or_copy_file` uses kernel `ioctl(FICLONE)` with `os.copy_file_range` fallback.
+- **Deterministic Real-Time Agent Scheduling**: `--rt-priority`, `--mlockall`, and `--cpu-affinity` pin `lkmp-agent` under `SCHED_FIFO` with locked memory pages so host CPU/memory pressure cannot stall the cutover path; `read_timens_offsets` inspects `/proc/<pid>/timens_offsets` for monotonic/boottime namespace continuity.
+- **Fail-Closed mTLS 1.3 & Merkle + HMAC-SHA256 Attestation**: `AgentServer` enforces `ssl.CERT_REQUIRED` mutual TLS with `16 MiB` bounded RPC frames. Checkpoint metadata `.img` digests and Destination B's received `dest_pages_merkle_root` (computed via GIL-releasing `hashlib.file_digest`) are bound into `manifest.sig.json` and verified prior to restore.
+
+</details>
+
+<details>
+<summary><b>4. 4-State Process-Tree Portability Assessment (<code>lkmp portability</code>)</b></summary>
+
+<br/>
+
+Evaluates every process and child worker across five independent domains—reporting **`BLOCKED`**, **`PREPARE`**, **`UNKNOWN`**, or **`VERIFIED`** (never a misleading percentage score):
+1. **`memory_and_cpu`**: CPU ISA superset (`avx2`, `avx512f`, `xsave`, `sve`), `TracerPid`, active soft-dirty rate (`--active-sample-ms`).
+2. **`files`**: ELF `.note.gnu.build-id` verification, deleted ghost files, destination scratch capacity, writable mount sync.
+3. **`network`**: Active socket FDs across child tasks (`--tcp-established`, pre-restore IP binding, `nftables` fencing).
+4. **`devices`**: `/dev/nvidia*` & `/dev/dri/*` (`--enable-gpu`), hypervisor `/dev/kvm` & `anon_inode:kvm-*` (routed to `QemuQmpDriver`/`MicroVmDriver`), and non-migratable host char/block devices.
+5. **`external_resources`**: Intra-tree vs. external pipe topology, `io_uring` detection, and controlled `--check-only` / 2PC `--trial-restore` verification.
+
+</details>
+
+---
+
+## 🐍 Python SDK
+
+LKMP ships with a strictly typed (`py.typed` PEP 561), zero-dependency Python API for embedding live migration, workload diagnostics, and 2PC gang coordination directly into cluster schedulers and control planes:
+
+```python
+from lkmp import (
+    AgentClient,
+    FilesystemMode,
+    GangMigrationCoordinator,
+    IpMobilityMode,
+    MigrationConfig,
+    MigrationOrchestrator,
+    MigrationStrategy,
+    TlsConfig,
+)
+
+tls = TlsConfig(
+    enabled=True,
+    ca_cert="/etc/lkmp/tls/ca.crt",
+    cert_file="/etc/lkmp/tls/node-a.crt",
+    key_file="/etc/lkmp/tls/node-a.key",
+)
+
+with AgentClient("10.0.0.1:9700", tls=tls) as src, AgentClient("10.0.0.2:9700", tls=tls) as dst:
+    # 1. Diagnose any PID (POSIX tree, QEMU VM, Podman container, Firecracker MicroVM)
+    diagnosis = src.call("diagnose_workload", pid=4242)
+    print(f"Detected {diagnosis['kind']} -> ready={diagnosis['ready']}")
+
+    # 2. Execute single-workload 2PC live migration with durable WAL
+    cfg = MigrationConfig(
+        pid=4242,
+        source_addr="10.0.0.1:9700",
+        dest_addr="10.0.0.2:9700",
+        strategy=MigrationStrategy.AUTO,
+        fs_mode=FilesystemMode.SHARED,
+        ip_mobility=IpMobilityMode.TUNNEL,
+        workload_ip="10.0.0.99/24",
+        tls=tls,
+    )
+    result = MigrationOrchestrator(cfg, src, dst).execute()
+    assert result.success, result.error_message
+
+    # 3. Or migrate a coupled heterogeneous gang [QEMU VM + CRIU Service] atomically in parallel
+    gang = GangMigrationCoordinator("prod-tier-01", [(vm_cfg, src, dst), (svc_cfg, src, dst)], parallel=True)
+    gang_result = gang.execute()
+    assert gang_result.all_committed
+```
+
+---
+
+## 🛠️ Production Runbook
 
 ### 1. Bootstrap Cluster mTLS PKI & Launch `lkmp-agent`
 
-Generate a shared Root CA and SAN-signed per-node certificates with `lkmp tls-init`, then start `lkmp-agent` on both physical Linux hosts (requires `root` or `CAP_CHECKPOINT_RESTORE` + `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`):
-
 ```bash
-# Generate Root CA + node-a / node-b mTLS certificates (0600 private keys)
+# Generate Root CA + SAN-signed node certificates (0600 private key permissions)
 ./bin/lkmp tls-init \
   --out-dir /etc/lkmp/tls \
   --host 10.0.0.1 --host 10.0.0.2 \
   --node node-a --node node-b
 
-# On Source Host A (10.0.0.1) — RPC on :9700, Prometheus /metrics & /healthz on :9701, tmpfs + RT tuning
+# Start lkmp-agent on Source Host A (10.0.0.1) & Destination Host B (10.0.0.2)
+# RPC on :9700, Prometheus /metrics & /healthz on :9701, /dev/shm staging + SCHED_FIFO RT tuning
 sudo ./bin/lkmp agent \
   --host 0.0.0.0 \
   --port 9700 \
@@ -381,227 +357,60 @@ sudo ./bin/lkmp agent \
   --tls-ca /etc/lkmp/tls/ca.crt \
   --tls-cert /etc/lkmp/tls/node-a.crt \
   --tls-key /etc/lkmp/tls/node-a.key
-
-# On Destination Host B (10.0.0.2)
-sudo ./bin/lkmp agent \
-  --host 0.0.0.0 \
-  --port 9700 \
-  --metrics-port 9701 \
-  --tls-ca /etc/lkmp/tls/ca.crt \
-  --tls-cert /etc/lkmp/tls/node-b.crt \
-  --tls-key /etc/lkmp/tls/node-b.key
-
-# Check live node health & Prometheus telemetry
-./bin/lkmp status --agent 10.0.0.1:9700 --prometheus \
-  --tls-ca /etc/lkmp/tls/ca.crt --tls-cert /etc/lkmp/tls/node.crt --tls-key /etc/lkmp/tls/node.key
 ```
 
-### 2. Launch Workload inside a Migration Envelope or Zero-Copy QEMU Profile (`lkmp run` & `lkmp doctor`)
+### 2. Launch Migratable Workloads & Diagnose Porting Readiness (`lkmp run` & `lkmp doctor`)
 
 ```bash
 # Option A: Launch a POSIX process tree inside isolated PID/net/mnt/ipc/uts/time namespaces + cgroup v2
-sudo ./bin/lkmp run \
-  --id srv-1 \
-  --ip 10.0.0.99/24 \
-  --iface eth0 \
-  -- /usr/local/bin/my-stateful-server
+sudo ./bin/lkmp run --id srv-1 --ip 10.0.0.99/24 --iface eth0 -- /usr/local/bin/my-stateful-server
 
-# Option B: Launch a zero-copy-migratable QEMU VM (shared memory-backend-memfd + QMP control socket)
-sudo ./bin/lkmp run \
-  --id vm-prod-01 \
-  --profile qemu \
-  --memory-mb 2048 \
-  --vcpus 4 \
-  --disk /mnt/shared/vm-prod-01.qcow2
+# Option B: Launch a zero-copy-migratable QEMU VM (memory-backend-memfd,share=on + QMP control socket)
+sudo ./bin/lkmp run --id vm-prod-01 --profile qemu --memory-mb 2048 --vcpus 4 --disk /mnt/shared/vm.qcow2
 
-# Inspect any running PID (POSIX, QEMU VM, Podman/OCI container, Firecracker MicroVM) for porting readiness
+# Inspect any running PID for driver auto-detection, zero-copy capability, and porting blockers
 ./bin/lkmp doctor --pid 4242 --agent 10.0.0.1:9700 \
-  --tls-ca /etc/lkmp/tls/ca.crt --tls-cert /etc/lkmp/tls/node.crt --tls-key /etc/lkmp/tls/node.key
+  --tls-ca /etc/lkmp/tls/ca.crt --tls-cert /etc/lkmp/tls/node-a.crt --tls-key /etc/lkmp/tls/node-a.key
 ```
 
-### 3. Run Non-Destructive Preflight Check
+### 3. Preflight, Portability Assessment & Live Cutover
 
 ```bash
-./bin/lkmp preflight \
-  --pid 4242 \
-  --source 10.0.0.1:9700 \
-  --dest 10.0.0.2:9700 \
-  --strategy auto \
-  --tls-ca /etc/lkmp/ca.pem \
-  --tls-cert /etc/lkmp/client.pem \
-  --tls-key /etc/lkmp/client.key
-```
+# Non-destructive 4-state portability assessment (with optional --check-only & 2PC --trial-restore)
+./bin/lkmp portability \
+  --pid 4242 --source 10.0.0.1:9700 --dest 10.0.0.2:9700 \
+  --active-sample-ms 150 --check-only --trial-restore \
+  --tls-ca /etc/lkmp/tls/ca.crt --tls-cert /etc/lkmp/tls/node-a.crt --tls-key /etc/lkmp/tls/node-a.key
 
-### 4. Execute Live Migration
-
-```bash
+# Execute live 2PC migration with IPIP tunnel mobility and post-restore health verification
 ./bin/lkmp migrate \
-  --pid 4242 \
-  --workload-id srv-1 \
-  --source 10.0.0.1:9700 \
-  --dest 10.0.0.2:9700 \
-  --strategy auto \
-  --fs-mode rsync \
-  --writable-path /var/lib/my-stateful-server \
-  --ip-mobility tunnel \
-  --workload-ip 10.0.0.99/24 \
+  --pid 4242 --workload-id srv-1 \
+  --source 10.0.0.1:9700 --dest 10.0.0.2:9700 \
+  --strategy auto --fs-mode rsync --writable-path /var/lib/my-stateful-server \
+  --ip-mobility tunnel --workload-ip 10.0.0.99/24 \
   --health-cmd "curl -sf http://10.0.0.99:8080/healthz" \
-  --tls-ca /etc/lkmp/ca.pem \
-  --tls-cert /etc/lkmp/client.pem \
-  --tls-key /etc/lkmp/client.key
+  --tls-ca /etc/lkmp/tls/ca.crt --tls-cert /etc/lkmp/tls/node-a.crt --tls-key /etc/lkmp/tls/node-a.key
 ```
 
-### 5. Coordinated 2PC Gang Migration, WAL Inspection & Crash Recovery
+### 4. Coordinated 2PC Gang Migration, WAL Audit & Crash Recovery
 
 ```bash
-# Execute atomic 2PC gang migration across coupled workloads
+# Migrate coupled workloads atomically under a parallel 2PC stopped-readiness barrier
 ./bin/lkmp gang-migrate \
-  --gang-id redis-pair-01 \
+  --gang-id tier-pair-01 \
   --member pid=4242,source=10.0.0.1:9700,dest=10.0.0.2:9700,strategy=pre-copy,workload_ip=10.0.0.91/24 \
   --member pid=4243,source=10.0.0.1:9700,dest=10.0.0.2:9700,strategy=pre-copy,workload_ip=10.0.0.92/24 \
-  --tls-ca /etc/lkmp/tls/ca.crt \
-  --tls-cert /etc/lkmp/tls/node.crt \
-  --tls-key /etc/lkmp/tls/node.key
+  --tls-ca /etc/lkmp/tls/ca.crt --tls-cert /etc/lkmp/tls/node-a.crt --tls-key /etc/lkmp/tls/node-a.key
 
-# Non-destructively audit WAL checksums, sequence numbers, and gang membership
-./bin/lkmp wal-inspect /var/lib/lkmp/journals/redis-pair-01.gang.wal.jsonl
-
-# Recover an interrupted single-process or gang migration (WAL replay)
-./bin/lkmp recover \
-  --gang-journal /var/lib/lkmp/journals/redis-pair-01.gang.wal.jsonl \
-  --tls-ca /etc/lkmp/tls/ca.crt \
-  --tls-cert /etc/lkmp/tls/node.crt \
-  --tls-key /etc/lkmp/tls/node.key
+# Audit WAL SHA-256 checksums and replay recovery if the controller crashed mid-flight
+./bin/lkmp wal-inspect /var/lib/lkmp/journals/tier-pair-01.gang.wal.jsonl
+./bin/lkmp recover --gang-journal /var/lib/lkmp/journals/tier-pair-01.gang.wal.jsonl \
+  --tls-ca /etc/lkmp/tls/ca.crt --tls-cert /etc/lkmp/tls/node-a.crt --tls-key /etc/lkmp/tls/node-a.key
 ```
 
-### 6. Run 4-State Portability Assessment (`lkmp portability`)
+### 5. Local Two-Node Privileged Cluster (Docker Compose)
 
-```bash
-# 1. Read-only 4-state per-domain portability inspection across the entire process tree
-./bin/lkmp portability \
-  --pid 4242 \
-  --source 10.0.0.1:9700 \
-  --dest 10.0.0.2:9700 \
-  --tls-ca /etc/lkmp/ca.pem \
-  --tls-cert /etc/lkmp/client.pem \
-  --tls-key /etc/lkmp/client.key
-
-# 2. Controlled CRIU --check-only & isolated trial-restore verification (to reach VERIFIED)
-./bin/lkmp portability \
-  --pid 4242 \
-  --source 10.0.0.1:9700 \
-  --dest 10.0.0.2:9700 \
-  --active-sample-ms 150 \
-  --check-only \
-  --trial-restore \
-  --tls-ca /etc/lkmp/ca.pem \
-  --tls-cert /etc/lkmp/client.pem \
-  --tls-key /etc/lkmp/client.key
-```
-
-### 7. Run 12-Scenario Stateful Multi-Process Acceptance Suite & Real Linux CRIU E2E
-
-LKMP includes a comprehensive 12-scenario acceptance suite proving live migration invariants across `COLD`, `PRE_COPY`, and `LAZY` strategies, 2PC fault injection boundaries, Milestone Scenario 11 (active TCP + file writes surviving a forced controller restart via WAL recovery), and Scenario 12 (Same-Host Two-VM CoW reflink fast path):
-
-```bash
-# 1. Run complete 12-scenario acceptance matrix (auto-detects REAL_CRIU on Linux root, or force --backend REAL_CRIU)
-sudo ./bin/lkmp acceptance --backend REAL_CRIU
-
-# 2. Output machine-readable JSON telemetry for automated CI gating
-sudo ./bin/lkmp acceptance --backend REAL_CRIU --json
-
-# 3. Execute real Linux host CRIU 4.2.1 E2E verification test harness on host (exits non-zero on any failure)
-sudo python3 scripts/linux_criu_e2e.py
-
-# 4. Execute real Linux QEMU 8.2.2 Live QMP + Heterogeneous [QEMU VM + CRIU Process] 2PC Gang E2E
-sudo python3 scripts/linux_qemu_e2e.py
-```
-
----
-
-## Testing & Verification Scope
-
-To maintain rigorous transparency, the verification scope is divided into automated test assertions and real Linux CRIU + QEMU kernel testbed runs:
-
-### Proven in CI & Verified on Linux 7.0 + CRIU 4.2.1 + QEMU 8.2.2 (`132 unittest` Cases + `ruff` Zero-Error Gate + `12/12 REAL_CRIU lkmp acceptance` + `4/4 REAL_CRIU E2E` + `3/3 REAL_QEMU & Heterogeneous 2PC Gang E2E`)
-- **Real Linux QEMU 8.2.2 & Heterogeneous `[QEMU VM + CRIU Process]` 2PC E2E (`scripts/linux_qemu_e2e.py`, Verified `3/3 PASS` on Linux `7.0.0-42-generic` x86_64 with QEMU `8.2.2` + CRIU `4.2.1`)**:
-  1. **Scenario 1 — Real QEMU Live QMP 2PC Migration (`Host A -> Host B`, `PASS`)**: Boots a real `256 MiB` `memory-backend-memfd,share=on` QEMU VM inside an isolated host namespace, validates `lkmp doctor` (`kind="qemu"`, `ready=True`, `zero_copy_capable=True`), executes full `PRE_COPY` + `multifd=2` + `pause-before-switchover` + `-S -incoming defer` + `late-block-activate` cutover over persistent mTLS (`connections_opened == 1`), achieving **`~19 ms` end-to-end orchestrator blackout downtime** and confirming `query-status -> {"running": true, "status": "running"}` on Destination B. *(Note: On bare-metal/nested hosts exposing `/dev/kvm`, QEMU runs hardware KVM virtualization; on hosts without `/dev/kvm`, `-accel kvm -accel tcg` transparently exercises the identical QMP `memfd` + `pause-before-switchover` 2PC state machine under TCG.)*
-  2. **Scenario 2 — Multi-Hop Reverse Live QEMU Migration (`Host B -> Host A`, `PASS`)**: Immediately live-migrates the already-migrated QEMU VM back from Host B to Host A (`~19 ms` blackout), proving post-commit QMP socket preservation and multi-hop state hygiene.
-  3. **Scenario 3 — Heterogeneous 2PC Gang `[Real QEMU 8.2.2 VM + Real CRIU 4.2.1 Process]` (`PASS`)**: Proves **Part A (Atomic 2PC Rollback)** when a fault is injected on the CRIU member (resuming both the `-S`-paused QEMU VM via QMP `cont` and the `--leave-stopped` CRIU process via `SIGCONT` on Host A with zero state loss) followed by **Part B (Parallel 2PC Commit)** migrating both workloads atomically onto Host B with unbroken `xorshift64*` PRNG sequence continuity (`43` consecutive verified records).
-- **Real Linux CRIU 4.2.1 E2E (`scripts/linux_criu_e2e.py`, Verified `4/4 PASS` on Linux `7.0.0-42-generic` x86_64 with CRIU `4.2.1 GitID: f192861`, strict non-zero exit gate)**:
-  1. **CRIU CLI Flag Verification (`PASS`)**: Verifies `criu page-server --daemon --pidfile` immediate detachment, passive `/proc/net/tcp` port listening detection, and `--lazy-pages` flag compatibility.
-  2. **Scenario A — `REAL_CRIU COLD` Dump & Detached Restore (`PASS`)**: Checkpoints a live multi-process workload (`pstree.img`, `3 core-*.img`, `3 pages-*.img`), terminates the source tree, restores via `criu restore --restore-detached --shell-job`, and verifies continuous `state.log` record advancement (`5 -> 13` records).
-  3. **Scenario B — `REAL_CRIU PRE_COPY` Page-Server Streaming (`PASS`)**: Streams iterative `criu pre-dump --track-mem --page-server` and final `criu dump --prev-images-dir` rounds to background `criu page-server --daemon` instances, verifying `6 pages-*.img` files (`35,405,824` bytes).
-  4. **Scenario C — `REAL_CRIU LAZY` Supervised `Popen` & Demand-Paging Restore (`PASS`)**: Supervises background `criu dump --lazy-pages` and `criu lazy-pages --page-server`, restores the workload inside an isolated destination PID/mount namespace via `criu restore --lazy-pages --restore-detached`, and verifies active post-restore execution (`12` `state.log` records).
-- **12-Scenario Stateful Acceptance Matrix (`lkmp acceptance --backend REAL_CRIU`, `12/12 PASS` on Linux 7.0 + CRIU 4.2.1)**:
-  - Under `--backend REAL_CRIU`, `AcceptanceClusterHarness` provisions an isolated 3-NetNS L2 virtual Ethernet bridge fabric (`RealNetnsL2Fabric`: `ns_fab` client + `br0`, `ns_a` Source Host A, and `ns_b` Destination Host B) per scenario. Source A is dumped in `ns_a` via `criu dump --leave-stopped --shell-job --tcp-established` (asserting `tcp-stream-*.img` creation and asserting Source A remains alive and stopped), and Destination B restores concurrently in `ns_b` via `unshare --pid --mount --fork ... criu restore --restore-detached --leave-stopped --shell-job --tcp-established` **without** terminating Source A prior to restore. On rollback, Destination B confirms `TCP_REPAIR = 1` and terminates the restored tree, while Source A confirms `TCP_REPAIR = 0` and resumes the **exact original kernel task** in-place via `SIGCONT` (verified via unchanged `/proc/<pid>/stat` `starttime`, never restored from a backup copy). (On non-Linux/unprivileged machines, `POSIX_PROCESS_CLONE` runs the same `AF_INET` TCP workload over user-space `dup()` simulation without invoking kernel `TCP_REPAIR`.)
-  - Scenarios 1–10: `COLD`, `PRE_COPY`, and `LAZY` cutovers plus fault injection at `FINAL_DUMP`, `TRANSFER` (1-bit `core-*.img` tamper), `RESTORE`, `VERIFY`, controller crash after restore (`CRASH_AFTER_RESTORE`), and 2-member Gang stopped-readiness barrier abort (`GANG_MEMBER_2_FAIL`) & mid-commit roll-forward recovery (`GANG_MID_COMMIT_FAULT`).
-  - **Scenario 11 (Milestone)**: Active `AF_INET` TCP request-response loop + `state.log` file writer surviving a **forced controller restart** mid-cutover via `recover_from_journal()`, measuring both `client_observed_blackout_ms` and `criu_restore_duration_ms` with zero lost/duplicated records and zero dual execution.
-  - **Scenario 12**: Same-Host Two-VM CoW Snapshot Fast Path (`SAME_HOST_COW`) executing through `MigrationOrchestrator.execute()` and verifying production `transfer_final_state` invokes CoW reflink cloning (`cp --reflink=auto` / `cp -c`) without `rsync`.
-- **4-State Portability Assessment (`lkmp portability`)**: Evaluates `BLOCKED` / `PREPARE` / `UNKNOWN` / `VERIFIED` across `memory_and_cpu`, `files`, `network`, `devices`, and `external_resources` for all child PIDs in the process tree.
-- **Crash Recovery WAL (`<id>.wal.jsonl` & `<gang_id>.gang.wal.jsonl`)**: Enabled by default in `MigrationOrchestrator` and `lkmp migrate`, enforcing persistent backing-storage checks (`require_persistent=True`) across *all* `journal_dir` paths (rejecting `tmpfs`/`ramfs`), fail-closed file and parent-directory `os.fsync` barriers, and orphaned `restore_state.json` / `restored.pid` discovery so controller crashes between `restore_process` and WAL recording still deterministically terminate any target process on rollback.
-- **2PC Stopped-Readiness & Network Lock Barrier (`verify_restored_stopped`)**: Confirms across every PID and thread in the restored process tree that the kernel state in `/proc/<pid>/stat` is stopped (`T`/`t`) and confirms via `nft list table inet <table>` that both `input` (`daddr <ip> drop`) and `output` (`saddr <ip> drop`) filter chains are active on Destination B before Phase 1 completes.
-- **Fail-Closed mTLS & Path Traversal Defenses**: Mandatory `ca_cert` + `cert_file` + `key_file` with `ssl.CERT_REQUIRED` when `tls.enabled=True`, and strict `is_relative_to(work_dir)` path validation.
-
-### Requires Dual-Host Physical Network Fabric (`CAP_SYS_ADMIN` + `CAP_NET_ADMIN` + CRIU >= 3.19)
-- **Cross-Host Active TCP Connection Continuity**: Real-world validation of kernel `TCP_REPAIR` socket restoration across separate physical L2/L3 network interfaces with BGP/GARP/IPIP convergence.
-- **Multi-Host 10G/40G `userfaultfd` Page Servicing**: Latency and throughput tail-latency benchmarks under heavy write loads over physical NICs.
-
----
-
-## Project Structure
-
-```text
-.
-├── .github/workflows/ci.yml      # GitHub Actions CI matrix (Ruff + Python 3.10-3.13 + Linux CRIU & QEMU E2E)
-├── bin/lkmp                      # Executable CLI entrypoint
-├── docs/assets/                  # High-resolution architecture & pipeline SVG diagrams
-├── scripts/
-│   ├── install_criu_on_linux.sh  # Automated CRIU 4.2.1 source builder & verifier for Linux 6.x/7.x
-│   ├── linux_criu_e2e.py         # Real Linux CRIU E2E verification and CLI flag compatibility suite
-│   └── linux_qemu_e2e.py         # Real Linux QEMU 8.x QMP 2PC, multi-hop & heterogeneous [QEMU+CRIU] gang E2E
-├── lkmp/
-│   ├── __init__.py               # Public Python SDK exports & package version (0.3.0)
-│   ├── py.typed                  # PEP 561 static typing marker
-│   ├── logging_utils.py          # ContextVar-correlated structured JSON & human log formatters
-│   ├── realtime.py               # SCHED_FIFO, mlockall, CPU affinity, tmpfs staging & timens_offsets
-│   ├── config.py                 # MigrationConfig, EnvelopeConfig, strategy/mobility/driver enums
-│   ├── models.py                 # 10-state FSM states, 4-state PortabilityReport & telemetry models
-│   ├── drivers/
-│   │   ├── base.py               # Pluggable WorkloadMigrationDriver 2PC protocol
-│   │   ├── detector.py           # /proc fingerprinter & lkmp doctor advisor (POSIX / QEMU / MicroVM / OCI)
-│   │   ├── qemu_qmp.py           # QEMU/KVM & TCG QMP 2PC driver (multifd + zero-copy-send + -S defer)
-│   │   ├── oci_runtime.py        # Podman / crun / runc 2PC driver with --restart=no split-brain fencing
-│   │   └── microvm.py            # Firecracker & Cloud-Hypervisor UNIX HTTP API 2PC snapshot driver
-│   ├── pki.py                    # Turnkey Root CA & SAN-signed mTLS X.509 generator (lkmp tls-init)
-│   ├── journal.py                # Thread-safe append-only fsynced JSONL WAL, recovery & wal-inspect
-│   ├── envelope.py               # Namespace unshare (pid, net, mnt, ipc, uts, time), QEMU profile & cgroup v2
-│   ├── pagemap.py                # Multi-process tree /proc/<pid>/pagemap soft-dirty profiler & entropy
-│   ├── preflight.py              # Process-tree /proc inspector, 4-state portability & disk/ISA checker
-│   ├── convergence.py            # Pre-copy convergence math, observed bandwidth & D_inf predictor
-│   ├── attestation.py            # GIL-free SHA-256 Merkle tree & HMAC checkpoint attestation
-│   ├── gang.py                   # Parallel O(1) 2PC gang coordinator & GangJournal recovery
-│   ├── criu_driver.py            # Daemonized CRIU builder (--auto-dedup), orphan reaper & GPU hooks
-│   ├── network.py                # Raw AF_PACKET GARP, atomic nftables lock & IPv4/IPv6 IP mobility
-│   ├── fs_sync.py                # Kernel FICLONE reflink, copy_file_range, frozen snapshot & rsync
-│   ├── telemetry.py              # Thread-safe Prometheus OpenMetrics exporter & TUI/doctor renderers
-│   ├── demo.py                   # Two-node loopback TCP simulation harness & benchmark runner
-│   ├── acceptance.py             # 12-scenario multi-process stateful live migration acceptance matrix
-│   ├── agent.py                  # Persistent keep-alive mTLS JSON-RPC daemon, in-band transfer & /metrics
-│   ├── orchestrator.py           # 10-state 2PC migration controller, runtime auto-routing & WAL recovery
-│   └── cli.py                    # Unified CLI parser and 14 subcommand dispatchers
-├── deploy/
-│   ├── Dockerfile.node           # Hardened Ubuntu 24.04 node image (:9700 mTLS RPC, :9701 /metrics & /healthz)
-│   ├── entrypoint.sh             # Lock-serialized shared mTLS PKI bootstrap for multi-node containers
-│   └── docker-compose.test.yml   # Multi-node privileged test cluster with shared CA & L2 bridge
-└── tests/                        # 132 unit, zero-copy hot path, VM/OCI/MicroVM driver, WAL & acceptance tests
-```
-
----
-
-## Two-Node Test Cluster (Docker Compose)
-
-You can launch a local two-node cluster (`node-a` at `172.28.0.10:9700` and `node-b` at `172.28.0.11:9700`, with shared auto-bootstrapped mTLS PKI and `/healthz` + `/metrics` on `:9701`) configured with CRIU, `nftables`, and `iproute2`:
+Spin up a ready-to-use two-node Ubuntu 24.04 cluster (`node-a` at `172.28.0.10:9700` and `node-b` at `172.28.0.11:9700`) with auto-bootstrapped mTLS PKI, CRIU, `nftables`, `iproute2`, and Prometheus `:9701/metrics`:
 
 ```bash
 docker compose -f deploy/docker-compose.test.yml up -d --build
@@ -609,24 +418,82 @@ docker compose -f deploy/docker-compose.test.yml up -d --build
 
 ---
 
-## CLI Reference
+## ⌨️ CLI Reference
 
-| Command | Description |
+| Subcommand | Purpose |
 | :--- | :--- |
-| `lkmp tls-init` | Generate a Root CA (`ca.crt`) and SAN-signed mTLS leaf certificates (`node.crt`, `node.key`) |
-| `lkmp agent` | Start the dual-stack `lkmp-agent` JSON-RPC daemon (`--port 9700`, optional `--metrics-port 9701`) |
-| `lkmp status` | Query live node health, capabilities, active migrations, and Prometheus telemetry from `lkmp-agent` |
-| `lkmp doctor` | Fingerprint any PID (`POSIX`, `QEMU`, `Podman/OCI`, `Firecracker`) and diagnose zero-copy porting readiness |
-| `lkmp run` | Launch a POSIX namespace envelope or zero-copy QEMU VM (`--profile qemu`) with `cgroup v2` isolation |
-| `lkmp preflight` | Execute non-destructive, strictly read-only compatibility and ISA superset checks |
-| `lkmp portability` | Run 4-state (`BLOCKED` / `PREPARE` / `UNKNOWN` / `VERIFIED`) per-domain portability assessment across the full process tree |
-| `lkmp migrate` | Run live migration under Coordinated Two-Phase Cutover with mandatory durable WAL (`.wal.jsonl`) |
-| `lkmp gang-migrate` | Execute atomic 2-Phase Commit (2PC) gang migration across multiple coupled process trees |
-| `lkmp wal-inspect` | Non-destructively verify SHA-256 checksums, monotonic sequences, and 2PC decisions in a WAL journal |
-| `lkmp recover` | Recover an interrupted single-process (`.wal.jsonl`) or gang (`.gang.wal.jsonl`) migration |
-| `lkmp acceptance` | Run the 12-scenario stateful multi-process live migration acceptance verification suite |
-| `lkmp demo` | Run loopback TCP RPC live migration simulation with fault injection and Prometheus metrics |
-| `lkmp benchmark` | Execute comparative SOTA benchmark suite across memory dirtying profiles |
+| `lkmp tls-init` | Generate a Root CA (`ca.crt`) and SAN-signed mTLS node certificates (`0600` keys) |
+| `lkmp agent` | Run the dual-stack `lkmp-agent` mTLS JSON-RPC daemon (`:9700`) & OpenMetrics server (`:9701`) |
+| `lkmp status` | Query live agent health, host ISA/CRIU capabilities, active migrations, and Prometheus metrics |
+| `lkmp doctor` | Fingerprint any PID (`POSIX`, `QEMU`, `Podman/OCI`, `Firecracker`) and diagnose zero-copy readiness |
+| `lkmp run` | Launch a POSIX namespace envelope or zero-copy QEMU VM (`--profile qemu`) under `cgroup v2` |
+| `lkmp preflight` | Execute non-destructive, read-only compatibility, ELF build-id, and CPU ISA superset checks |
+| `lkmp portability` | Run 4-state (`BLOCKED` / `PREPARE` / `UNKNOWN` / `VERIFIED`) process-tree portability analysis |
+| `lkmp migrate` | Execute live migration under Two-Phase Cutover with mandatory fsynced WAL (`.wal.jsonl`) |
+| `lkmp gang-migrate` | Execute parallel `O(1)` 2PC gang migration across coupled workloads (homogeneous or heterogeneous) |
+| `lkmp wal-inspect` | Non-destructively verify SHA-256 checksums, sequence monotonicity, and 2PC state in a WAL file |
+| `lkmp recover` | Deterministically roll forward or roll back an interrupted single or gang migration from WAL |
+| `lkmp acceptance` | Run the 12-scenario stateful multi-process live migration & fault-injection acceptance suite |
+| `lkmp demo` | Run zero-root loopback TCP RPC live migration simulation with fault & tamper injection |
+| `lkmp benchmark` | Run comparative SOTA convergence & blackout benchmarks across workload memory profiles |
+
+---
+
+## ✅ Verification & CI Matrix
+
+Every push and pull request on `main` is gated across four automated GitHub Actions workflows:
+
+| Workflow | Runner / Environment | Automated Verification Gate |
+| :--- | :--- | :--- |
+| **[`ci.yml`](.github/workflows/ci.yml)** | Ubuntu & macOS · Python `3.10–3.13` | Zero-warning `ruff` lint, bytecode & wheel build smoke test, `133` unit + two-agent mTLS RPC tests, CLI fault-injection & benchmark suite |
+| **[`linux-e2e.yml`](.github/workflows/linux-e2e.yml)** | Ubuntu `24.04` Kernel · Root + `/dev/kvm` | **`12/12` `REAL_CRIU` 3-NetNS L2 acceptance matrix**, **`4/4` `linux_criu_e2e.py`** (`COLD` / `PRE_COPY` / `LAZY`), and **`3/3` `linux_qemu_e2e.py`** (Live QEMU 8.x QMP, `A -> B -> A` multi-hop, and heterogeneous `[QEMU VM + CRIU Process]` 2PC rollback & commit) |
+| **[`security.yml`](.github/workflows/security.yml)** | Ubuntu `24.04` · Bandit + Docker | Zero-runtime-dependency supply-chain check, `bandit` Medium/High SAST scan, mTLS/Merkle/WAL security invariants, and `deploy/Dockerfile.node` build & smoke test |
+| **[`release.yml`](.github/workflows/release.yml)** | Ubuntu · Tag `v*.*.*` / Manual | Full lint + test gate, wheel & sdist build, `SHA256SUMS.txt` generation, and automated GitHub Release publishing |
+
+```bash
+# Run the complete verification stack locally on a Linux host with CRIU 4.x & QEMU 8.x:
+ruff check lkmp/ tests/ scripts/
+python3 -m unittest discover -s tests -p "test_*.py" -v
+sudo ./bin/lkmp acceptance --backend REAL_CRIU
+sudo python3 scripts/linux_criu_e2e.py
+sudo python3 scripts/linux_qemu_e2e.py
+```
+
+> [!NOTE]
+> **Scope Boundary:** Automated CI proves real single-host multi-NetNS L2 CRIU `TCP_REPAIR` and QEMU KVM/TCG QMP migrations. Validating multi-host 10G/40G `userfaultfd` tail latency and physical ToR switch BGP/GARP convergence requires dual bare-metal Linux hosts (`CAP_SYS_ADMIN` + `CAP_NET_ADMIN`).
+
+---
+
+## 📁 Project Structure
+
+```text
+.
+├── .github/workflows/            # CI Matrix, Real Linux CRIU/QEMU E2E, Security/Docker & Release pipelines
+├── bin/lkmp                      # Zero-install CLI entrypoint
+├── docs/assets/                  # Custom SVG product banner, system architecture & 10-state pipeline diagrams
+├── deploy/                       # Hardened Ubuntu 24.04 node Dockerfile, PKI entrypoint & 2-node Compose cluster
+├── scripts/
+│   ├── install_criu_on_linux.sh  # Automated CRIU 4.2.1 builder & kernel capability verifier
+│   ├── linux_criu_e2e.py         # Real Linux CRIU 4.x COLD / PRE_COPY / LAZY E2E verification harness
+│   └── linux_qemu_e2e.py         # Real Linux QEMU 8.x QMP 2PC, multi-hop & heterogeneous [QEMU+CRIU] gang E2E
+├── lkmp/
+│   ├── drivers/                  # Pluggable 2PC drivers: CriuDriver, QemuQmpDriver, OciContainerDriver, MicroVmDriver
+│   ├── orchestrator.py           # 10-state 2PC controller, auto-driver router, knee-of-curve & WAL recovery
+│   ├── gang.py                   # Parallel O(1) 2PC gang coordinator & authoritative GangJournal
+│   ├── agent.py                  # Persistent keep-alive mTLS 1.3 JSON-RPC daemon, in-band transfer & /metrics
+│   ├── journal.py                # Thread-safe fsynced SHA-256 JSONL Write-Ahead Log & wal-inspect
+│   ├── network.py                # Sub-ms raw AF_PACKET GARP, atomic nftables drop & IPv4/IPv6 tunnel/BGP mobility
+│   ├── fs_sync.py                # Kernel FICLONE CoW reflink, copy_file_range, frozen snapshot & rsync
+│   ├── realtime.py               # SCHED_FIFO, mlockall, CPU affinity, /dev/shm staging & timens_offsets
+│   ├── attestation.py            # GIL-free hashlib.file_digest Merkle tree & HMAC-SHA256 attestation
+│   ├── preflight.py              # Process-tree /proc inspector, ELF build-id & 4-state portability engine
+│   ├── pagemap.py                # Multi-process /proc/<pid>/pagemap soft-dirty profiler & Shannon entropy
+│   ├── envelope.py               # Namespace unshare (pid/net/mnt/ipc/uts/time), QEMU profile & cgroup v2
+│   ├── pki.py                    # Turnkey Root CA & SAN-signed X.509 mTLS generator (lkmp tls-init)
+│   ├── telemetry.py              # Thread-safe Prometheus OpenMetrics exporter & TUI/doctor renderers
+│   └── cli.py                    # Unified 14-subcommand CLI parser & dispatcher
+└── tests/                        # 133 unit, hot-path, VM/OCI/MicroVM driver, security, WAL & acceptance tests
+```
 
 ---
 

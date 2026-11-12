@@ -1,0 +1,68 @@
+name: Security & Container
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  security-audit:
+    name: Bandit SAST, Zero-Dep Supply Chain & mTLS/WAL Security Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Enforce zero runtime third-party dependency surface
+        run: |
+          python3 - <<'PY'
+          import tomllib, pathlib
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          deps = data["project"].get("dependencies", [])
+          assert deps == [], f"Expected zero runtime dependencies, found: {deps}"
+          print("Verified: 0 third-party runtime dependencies in pyproject.toml")
+          PY
+
+      - name: Run Bandit SAST security scan across lkmp/
+        run: |
+          python3 -m pip install "bandit[toml]"
+          bandit -c pyproject.toml -r lkmp/ -ll -ii
+
+      - name: Verify fail-closed mTLS, Merkle tamper & WAL security invariants
+        run: python3 -m unittest tests.test_audit_fixes tests.test_comprehensive_enhancements -v
+
+  docker-node-image:
+    name: Ubuntu 24.04 Agent Node Container Build & Smoke Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Build deploy/Dockerfile.node container image
+        run: docker build -f deploy/Dockerfile.node -t lkmp-node:ci .
+
+      - name: Smoke-test containerized lkmp CLI, PKI & CRIU toolchain
+        run: |
+          docker run --rm --entrypoint /bin/bash lkmp-node:ci -c "
+            set -euo pipefail
+            criu --version
+            nft --version
+            lkmp tls-init --out-dir /tmp/pki --host 127.0.0.1 --node node-a --json >/dev/null
+            lkmp demo --strategy auto --rss-mb 64 --dirty-mbps 10 >/dev/null
+          "
