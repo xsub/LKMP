@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
-from lkmp.agent import AgentClient, config_to_dict
+from lkmp.agent import AgentClient, config_from_dict, config_to_dict
 from lkmp.config import MigrationConfig
 from lkmp.journal import (
     DEFAULT_JOURNAL_DIR,
@@ -278,10 +278,16 @@ class GangMigrationCoordinator:
                 )
 
             # 4. Phase 2b (Global Commit): All members prepared and verified stopped on B
-            # Step 1: Write and fsync COMMITTED to GangJournal and each member's WAL
-            self.journal.append(state=MigrationState.COMMIT, commit_decision="COMMITTED")
+            # Step 1: Write and fsync COMMIT_DECIDED to GangJournal and each member's WAL before cutover
+            member_configs = [config_to_dict(o.config) for o in prepared_orchestrators]
+            self.journal.append(
+                state=MigrationState.COMMIT,
+                commit_decision="COMMIT_DECIDED",
+                member_ids=self.member_ids,
+                member_configs=member_configs,
+            )
             for orch in prepared_orchestrators:
-                orch._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
+                orch._transition(MigrationState.COMMIT, commit_decision="COMMIT_DECIDED")
 
             try:
                 # Step 2: Fence/Kill Source A concurrently across all members first
@@ -300,6 +306,12 @@ class GangMigrationCoordinator:
                     return o.commit()
 
                 committed_results = self._map_members(prepared_orchestrators, _switchover_and_commit)
+                self.journal.append(
+                    state=MigrationState.COMMIT,
+                    commit_decision="COMMITTED",
+                    member_ids=self.member_ids,
+                    member_configs=member_configs,
+                )
 
                 return GangMigrationResult(
                     gang_id=self.gang_id,
@@ -322,6 +334,8 @@ class GangMigrationCoordinator:
         cls,
         gang_journal_path: str | Path,
         members: List[Tuple[MigrationConfig, AgentClient, AgentClient]],
+        *,
+        require_persistent_journal: bool = True,
     ) -> GangMigrationResult:
         """
         Recover an interrupted gang migration from its fsynced GangJournal.
@@ -329,7 +343,7 @@ class GangMigrationCoordinator:
         If not committed, roll back all members to Source A.
         """
         path = Path(gang_journal_path)
-        journal = MigrationJournal.load(path)
+        journal = MigrationJournal.load(path, require_persistent=require_persistent_journal)
         gang_id = journal.migration_id
         if gang_id.endswith(".gang"):
             gang_id = gang_id[:-5]
@@ -369,11 +383,18 @@ class GangMigrationCoordinator:
                     f"Cannot recover gang {gang_id!r}: non-contiguous member WAL missing before "
                     f"{mem_wal_path} (expected full gang {expected_member_ids})"
                 )
-            loaded_member_journals[mid] = MigrationJournal.load(mem_wal_path)
+            loaded_member_journals[mid] = MigrationJournal.load(
+                mem_wal_path, require_persistent=require_persistent_journal
+            )
 
         committed_decision = journal.has_committed_decision
         results: List[MigrationResult] = []
-        coordinator = cls(gang_id=gang_id, members=members, journal_dir=path.parent)
+        coordinator = cls(
+            gang_id=gang_id,
+            members=members,
+            journal_dir=path.parent,
+            require_persistent_journal=require_persistent_journal,
+        )
         if [o.migration_id for o in coordinator.orchestrators] != expected_member_ids:
             raise ValueError(
                 f"Gang recovery member identifier mismatch for {gang_id!r}: "
@@ -384,6 +405,13 @@ class GangMigrationCoordinator:
             for orch in coordinator.orchestrators:
                 mem_journal = loaded_member_journals[orch.migration_id]
                 assert mem_journal is not None
+                if mem_journal.effective_config_dict is not None:
+                    orig_src, orig_dst = orch.config.source_addr, orch.config.dest_addr
+                    orch.config = config_from_dict(mem_journal.effective_config_dict)
+                    if orig_src:
+                        orch.config.source_addr = orig_src
+                    if orig_dst:
+                        orch.config.dest_addr = orig_dst
                 for entry in reversed(mem_journal.entries):
                     if entry.restored_pid is not None:
                         orch._restored_pid = entry.restored_pid
@@ -405,20 +433,32 @@ class GangMigrationCoordinator:
                         pre_verify = orch.dest.call("verify_process", **verify_kwargs)
 
                     if not pre_verify.get("healthy"):
+                        if pre_verify.get("still_stopped") is True:
+                            orch.source.call(
+                                "commit_source",
+                                migration_id=orch.migration_id,
+                                config_dict=config_to_dict(orch.config),
+                            )
+                            orch.complete_switchover_and_verify()
+                            res = orch.commit()
+                            results.append(res)
+                            continue
                         raise RuntimeError(
                             "Refusing roll-forward commit_source: "
                             f"{pre_verify.get('reason')}"
                         )
+
                     orch.source.call(
                         "commit_source",
                         migration_id=orch.migration_id,
                         config_dict=config_to_dict(orch.config),
                     )
-                    already_switched_over = any(
-                        e.state == MigrationState.SWITCHOVER.value and e.commit_decision == "COMMITTED"
+                    already_resumed = any(
+                        e.state == MigrationState.VERIFY.value
+                        and e.commit_decision in ("COMMIT_DECIDED", "COMMITTED")
                         for e in mem_journal.entries
                     )
-                    if not already_switched_over:
+                    if not already_resumed:
                         orch.complete_switchover_and_verify()
                     res = orch.commit()
                     results.append(res)
@@ -432,6 +472,13 @@ class GangMigrationCoordinator:
                         )
                     )
             all_ok = bool(results) and all(r.success for r in results)
+            if all_ok:
+                coordinator.journal.append(
+                    state=MigrationState.COMMIT,
+                    commit_decision="COMMITTED",
+                    member_ids=expected_member_ids,
+                    member_configs=[config_to_dict(o.config) for o in coordinator.orchestrators],
+                )
             err_summary = (
                 "; ".join(r.error_message for r in results if not r.success and r.error_message)
                 if not all_ok
@@ -448,12 +495,20 @@ class GangMigrationCoordinator:
         else:
             for orch in coordinator.orchestrators:
                 mem_journal = loaded_member_journals[orch.migration_id]
-                if mem_journal is not None and not mem_journal.has_rolled_back_decision:
-                    for entry in reversed(mem_journal.entries):
-                        if entry.restored_pid is not None:
-                            orch._restored_pid = entry.restored_pid
-                            orch._restored_starttime = entry.restored_starttime
-                            break
+                if mem_journal is not None:
+                    if mem_journal.effective_config_dict is not None:
+                        orig_src, orig_dst = orch.config.source_addr, orch.config.dest_addr
+                        orch.config = config_from_dict(mem_journal.effective_config_dict)
+                        if orig_src:
+                            orch.config.source_addr = orig_src
+                        if orig_dst:
+                            orch.config.dest_addr = orig_dst
+                    if not mem_journal.has_rolled_back_decision:
+                        for entry in reversed(mem_journal.entries):
+                            if entry.restored_pid is not None:
+                                orch._restored_pid = entry.restored_pid
+                                orch._restored_starttime = entry.restored_starttime
+                                break
                 res = orch.rollback("Gang recovery: aborting uncommitted gang migration")
                 results.append(res)
             all_rolled_back = bool(results) and all(r.rolled_back for r in results)

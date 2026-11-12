@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -11,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from lkmp.config import MigrationConfig, MigrationStrategy
+from lkmp.config import MigrationConfig, MigrationStrategy, TlsConfig
 from lkmp.drivers.detector import WorkloadKind, detect_workload_profile, read_proc_starttime
 from lkmp.logging_utils import get_logger
 from lkmp.network import parse_host_port
@@ -390,6 +391,89 @@ class QemuQmpDriver:
                 logger.debug("migrate-set-parameters partial support on %s: %s", qmp_ep, exc)
         return enabled_names
 
+    @staticmethod
+    def _write_restricted_file(src: Path, dst: Path) -> None:
+        raw = src.read_bytes()
+        fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            offset = 0
+            while offset < len(raw):
+                written = os.write(fd, raw[offset:])
+                if written <= 0:
+                    raise OSError("Short write staging QEMU TLS credential")
+                offset += written
+        finally:
+            os.close(fd)
+
+    def _configure_tls_creds(
+        self,
+        qmp_ep: str,
+        mig_dir: Path,
+        tls: TlsConfig,
+        *,
+        is_source: bool,
+    ) -> Optional[Path]:
+        """
+        Configure QEMU native `tls-creds-x509` over QMP when `tls.enabled=True`.
+        Fails closed (raises `QmpError`) if certificate files are missing or if QEMU
+        rejects `tls-creds-x509`, preventing silent fallback to plaintext RAM streaming.
+        """
+        if not tls.enabled:
+            try:
+                self._qmp_call(qmp_ep, "migrate-set-parameters", {"tls-creds": ""})
+            except Exception:
+                pass
+            return None
+
+        if not tls.ca_cert or not tls.cert_file or not tls.key_file:
+            raise QmpError(
+                "TLS is enabled for QEMU migration, but ca_cert, cert_file, or key_file is missing. "
+                "Refusing plaintext QEMU RAM stream; supply X.509 credentials or explicitly disable TLS."
+            )
+        ca_p = Path(tls.ca_cert)
+        cert_p = Path(tls.cert_file)
+        key_p = Path(tls.key_file)
+        for p in (ca_p, cert_p, key_p):
+            if not p.is_file():
+                raise QmpError(f"QEMU TLS credential file does not exist: {p}")
+
+        role = "client" if is_source else "server"
+        tls_dir = mig_dir / f"qemu_tls_{role}"
+        tls_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(tls_dir, 0o700)
+        except OSError:
+            pass
+
+        self._write_restricted_file(ca_p, tls_dir / "ca-cert.pem")
+        self._write_restricted_file(cert_p, tls_dir / f"{role}-cert.pem")
+        self._write_restricted_file(key_p, tls_dir / f"{role}-key.pem")
+
+        try:
+            self._qmp_call(qmp_ep, "object-del", {"id": "lkmp_tls0"})
+        except Exception:
+            pass
+
+        self._qmp_call(
+            qmp_ep,
+            "object-add",
+            {
+                "qom-type": "tls-creds-x509",
+                "id": "lkmp_tls0",
+                "dir": str(tls_dir),
+                "endpoint": role,
+                "verify-peer": not bool(tls.no_verify),
+            },
+        )
+        self._qmp_call(qmp_ep, "migrate-set-parameters", {"tls-creds": "lkmp_tls0"})
+        return tls_dir
+
+    def _cleanup_tls_dirs(self, mig_dir: Path) -> None:
+        for role in ("client", "server"):
+            tdir = mig_dir / f"qemu_tls_{role}"
+            if tdir.exists():
+                shutil.rmtree(tdir, ignore_errors=True)
+
     def _ensure_standby_started(
         self,
         migration_id: str,
@@ -436,17 +520,30 @@ class QemuQmpDriver:
             raise QmpError(f"Standby QEMU did not write pidfile {dest_pidfile}")
         standby_pid = int(dest_pidfile.read_text(encoding="utf-8").strip())
 
-        multifd = int(meta.get("qemu_multifd_channels", config.qemu_multifd_channels))
-        enable_postcopy = config.strategy in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID)
-        self._configure_caps(
-            str(dest_sock),
-            is_source=False,
-            multifd_channels=multifd,
-            enable_zero_copy=False,
-            enable_postcopy=enable_postcopy,
-        )
-        uri = f"tcp:0.0.0.0:{config.page_server_port}"
-        self._qmp_call(str(dest_sock), "migrate-incoming", {"uri": uri})
+        try:
+            multifd = int(meta.get("qemu_multifd_channels", config.qemu_multifd_channels))
+            enable_postcopy = config.strategy in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID)
+            self._configure_caps(
+                str(dest_sock),
+                is_source=False,
+                multifd_channels=multifd,
+                enable_zero_copy=False,
+                enable_postcopy=enable_postcopy,
+            )
+            self._configure_tls_creds(str(dest_sock), mig_dir, config.tls, is_source=False)
+            uri = f"tcp:0.0.0.0:{config.page_server_port}"
+            self._qmp_call(str(dest_sock), "migrate-incoming", {"uri": uri})
+        except Exception:
+            try:
+                self._qmp_call(str(dest_sock), "quit", None)
+            except Exception:
+                pass
+            try:
+                os.kill(standby_pid, signal.SIGKILL)
+            except OSError:
+                pass
+            self._cleanup_tls_dirs(mig_dir)
+            raise
 
         starttime = read_proc_starttime(standby_pid, self.proc_root)
         restore_state = {
@@ -457,6 +554,7 @@ class QemuQmpDriver:
             "dest_qmp_socket": str(dest_sock),
             "workload_ip": config.workload_ip,
             "tcp_established": config.tcp_established,
+            "resumed": False,
         }
         state_file.write_text(json.dumps(restore_state, indent=2), encoding="utf-8")
         return standby_pid, dest_sock
@@ -488,6 +586,7 @@ class QemuQmpDriver:
     def _ensure_source_migration_started(
         self,
         migration_id: str,
+        mig_dir: Path,
         qmp_ep: str,
         dest_host: str,
         config: MigrationConfig,
@@ -505,18 +604,21 @@ class QemuQmpDriver:
         uri = f"tcp:{uri_host}:{config.page_server_port}"
         multifd = int(config.qemu_multifd_channels)
         enable_postcopy = config.strategy in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID)
+        # QEMU kernel MSG_ZEROCOPY (`zero-copy-send`) is mutually exclusive with userspace GnuTLS (`tls-creds`)
+        enable_zero_copy = bool(config.qemu_zero_copy_send) and not bool(config.tls.enabled)
 
         caps = self._configure_caps(
             qmp_ep,
             is_source=True,
             multifd_channels=multifd,
-            enable_zero_copy=bool(config.qemu_zero_copy_send),
+            enable_zero_copy=enable_zero_copy,
             enable_postcopy=enable_postcopy,
         )
+        self._configure_tls_creds(qmp_ep, mig_dir, config.tls, is_source=True)
         try:
             self._qmp_call(qmp_ep, "migrate", {"uri": uri})
         except QmpError as exc:
-            if "zero-copy" in str(exc).lower() or "memlock" in str(exc).lower():
+            if not config.tls.enabled and ("zero-copy" in str(exc).lower() or "memlock" in str(exc).lower()):
                 logger.warning("QMP zero-copy-send unavailable (%s); retrying standard multifd stream", exc)
                 self._qmp_call(
                     qmp_ep,
@@ -538,10 +640,10 @@ class QemuQmpDriver:
         dest_host: str,
         config: MigrationConfig,
     ) -> Dict[str, Any]:
-        _ = (mig_dir, prev_round_name)
+        _ = prev_round_name
         t0 = time.monotonic()
         qmp_ep, _cmdline = self._resolve_source_qmp_and_cmdline(config)
-        self._ensure_source_migration_started(migration_id, qmp_ep, dest_host, config)
+        self._ensure_source_migration_started(migration_id, mig_dir, qmp_ep, dest_host, config)
 
         # Sample QEMU background RAM streaming progress up to 150ms or until `pre-switchover`
         deadline = time.monotonic() + 0.15
@@ -593,7 +695,7 @@ class QemuQmpDriver:
         if config.strategy == MigrationStrategy.COLD:
             self._qmp_call(qmp_ep, "stop", None)
 
-        self._ensure_source_migration_started(migration_id, qmp_ep, dest_host, config)
+        self._ensure_source_migration_started(migration_id, mig_dir, qmp_ep, dest_host, config)
 
         # Phase A: Wait until QEMU reaches `pre-switchover` (or `completed` if pause-before-switchover unsupported)
         deadline = time.monotonic() + 30.0
@@ -690,6 +792,47 @@ class QemuQmpDriver:
             "qemu_status": st.get("status"),
         }
 
+    def verify_running_dest(
+        self,
+        migration_id: str,
+        mig_dir: Path,
+        restored_pid: int,
+        config: MigrationConfig,
+    ) -> Dict[str, Any]:
+        _ = (migration_id, config)
+        dest_sock, _pidfile, state_file = self._dest_paths(mig_dir)
+        if state_file.exists():
+            try:
+                data = json.loads(state_file.read_text(encoding="utf-8"))
+                if data.get("dest_qmp_socket"):
+                    dest_sock = Path(data["dest_qmp_socket"])
+            except Exception:
+                pass
+        try:
+            st = self._qmp_call(str(dest_sock), "query-status", None) or {}
+        except Exception as exc:
+            return {
+                "healthy": False,
+                "reason": f"Unable to query QMP status on destination QEMU PID {restored_pid}: {exc}",
+            }
+        if st.get("running") is True:
+            return {
+                "healthy": True,
+                "checked_pids": [restored_pid],
+                "qemu_status": st.get("status", "running"),
+            }
+        status_name = str(st.get("status") or "")
+        if st.get("running") is False and status_name in ("paused", "inmigrate", "prelaunch", "restore-vm"):
+            return {
+                "healthy": False,
+                "still_stopped": True,
+                "reason": f"Destination QEMU PID {restored_pid} is still paused ({st})",
+            }
+        return {
+            "healthy": False,
+            "reason": f"Destination QEMU PID {restored_pid} is not running: {st}",
+        }
+
     def resume_dest(
         self,
         migration_id: str,
@@ -700,18 +843,28 @@ class QemuQmpDriver:
     ) -> Dict[str, Any]:
         _ = (migration_id, target_host, config)
         dest_sock, _pidfile, state_file = self._dest_paths(mig_dir)
+        state_data: Dict[str, Any] = {}
         if state_file.exists():
             try:
-                data = json.loads(state_file.read_text(encoding="utf-8"))
-                if data.get("dest_qmp_socket"):
-                    dest_sock = Path(data["dest_qmp_socket"])
+                state_data = json.loads(state_file.read_text(encoding="utf-8"))
+                if state_data.get("dest_qmp_socket"):
+                    dest_sock = Path(state_data["dest_qmp_socket"])
+            except Exception:
+                state_data = {}
+        cur_st = self._qmp_call(str(dest_sock), "query-status", None) or {}
+        if not cur_st.get("running", False):
+            self._qmp_call(str(dest_sock), "cont", None)
+            cur_st = self._qmp_call(str(dest_sock), "query-status", None) or {}
+        if not cur_st.get("running", False):
+            raise QmpError(f"Destination QEMU PID {restored_pid} failed to resume after QMP `cont`: {cur_st}")
+        if state_file.exists():
+            try:
+                state_data["resumed"] = True
+                state_file.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
             except Exception:
                 pass
-        self._qmp_call(str(dest_sock), "cont", None)
-        st = self._qmp_call(str(dest_sock), "query-status", None) or {}
-        if not st.get("running", False):
-            raise QmpError(f"Destination QEMU PID {restored_pid} failed to resume after QMP `cont`: {st}")
-        return {"resumed_pid": restored_pid, "qemu_status": st.get("status")}
+        self._cleanup_tls_dirs(mig_dir)
+        return {"resumed_pid": restored_pid, "qemu_status": cur_st.get("status")}
 
     def commit_source(
         self,
@@ -722,21 +875,56 @@ class QemuQmpDriver:
         self._started_migrations.discard(migration_id)
         src_state_file = mig_dir / "source_state.json"
         qmp_ep: Optional[str] = None
+        exp_st: Optional[int] = None
         if src_state_file.exists():
             try:
                 data = json.loads(src_state_file.read_text(encoding="utf-8"))
                 qmp_ep = data.get("qmp_socket")
+                raw_st = data.get("starttimes") or {}
+                exp_st = raw_st.get(str(config.pid))
             except Exception:
                 pass
-        if qmp_ep:
+        if exp_st is None and (config.runtime_metadata or {}).get("source_starttime") is not None:
+            exp_st = int(config.runtime_metadata["source_starttime"])
+
+        pid_reused = False
+        if exp_st is not None:
+            curr_st = read_proc_starttime(config.pid, self.proc_root)
+            if curr_st is not None and curr_st != exp_st:
+                pid_reused = True
+
+        if qmp_ep and not pid_reused:
             try:
                 self._qmp_call(qmp_ep, "quit", None)
             except Exception:
                 pass
-        try:
-            os.kill(config.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        if not pid_reused:
+            try:
+                os.kill(config.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            if self.proc_root == "/proc" and getattr(os.kill, "__module__", "") == "posix":
+                stat_path = Path(f"/proc/{config.pid}/stat")
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    try:
+                        raw_stat = stat_path.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        break
+                    rparen = raw_stat.rfind(")")
+                    if rparen == -1:
+                        break
+                    fields = raw_stat[rparen + 1 :].strip().split()
+                    if not fields or fields[0] in ("Z", "X", "x"):
+                        break
+                    if exp_st is not None and len(fields) >= 20:
+                        try:
+                            if int(fields[19]) != exp_st:
+                                break
+                        except ValueError:
+                            pass
+                    time.sleep(0.005)
+        self._cleanup_tls_dirs(mig_dir)
         return {"committed": True, "driver": WorkloadKind.QEMU_VM.value}
 
     def rollback_dest(
@@ -747,7 +935,15 @@ class QemuQmpDriver:
         config: MigrationConfig,
     ) -> Dict[str, Any]:
         _ = (migration_id, config)
-        dest_sock, dest_pidfile, _state_file = self._dest_paths(mig_dir)
+        dest_sock, dest_pidfile, state_file = self._dest_paths(mig_dir)
+        exp_st: Optional[int] = None
+        if state_file.exists():
+            try:
+                st_data = json.loads(state_file.read_text(encoding="utf-8"))
+                if restored_pid is not None:
+                    exp_st = (st_data.get("starttimes") or {}).get(str(restored_pid))
+            except Exception:
+                pass
         if dest_sock.exists():
             try:
                 self._qmp_call(str(dest_sock), "quit", None)
@@ -760,15 +956,18 @@ class QemuQmpDriver:
             except Exception:
                 target_pid = None
         if target_pid is not None:
-            try:
-                os.kill(int(target_pid), signal.SIGKILL)
-            except OSError:
-                pass
+            curr_st = read_proc_starttime(int(target_pid), self.proc_root)
+            if exp_st is None or curr_st is None or curr_st == exp_st:
+                try:
+                    os.kill(int(target_pid), signal.SIGKILL)
+                except OSError:
+                    pass
         if dest_sock.exists():
             try:
                 dest_sock.unlink()
             except OSError:
                 pass
+        self._cleanup_tls_dirs(mig_dir)
         return {"rolled_back_dest": True, "errors": []}
 
     def rollback_source(

@@ -33,7 +33,7 @@ from lkmp.config import (
     TlsConfig,
 )
 from lkmp.convergence import measure_predump_dirty_bytes
-from lkmp.criu_driver import CriuDriver
+from lkmp.criu_driver import CriuDriver, _default_runner as _criu_default_runner
 from lkmp.drivers import (
     MicroVmDriver,
     OciContainerDriver,
@@ -48,7 +48,7 @@ from lkmp.fs_sync import (
     FilesystemSyncManager,
     _default_runner as _fs_default_runner,
 )
-from lkmp.journal import validate_safe_identifier
+from lkmp.journal import _fsync_directory, _mkdir_durable, validate_safe_identifier
 from lkmp.logging_utils import get_logger
 from lkmp.models import FileArtifact, HostCapabilities
 from lkmp.network import (
@@ -66,6 +66,7 @@ from lkmp.preflight import (
     is_pid_stopped,
     parse_elf_build_id,
     read_proc_starttime,
+    read_proc_state,
 )
 from lkmp.realtime import resolve_tmpfs_work_dir
 from lkmp.telemetry import PrometheusMetricsCollector
@@ -82,6 +83,7 @@ IDEMPOTENT_READ_METHODS = frozenset(
         "stat_files",
         "verify_process",
         "verify_restored_stopped",
+        "wait_lazy_transfer",
         "health_check",
         "get_metrics",
     }
@@ -349,6 +351,67 @@ class AgentService:
         if not rnd_dir.is_relative_to(mig_dir) or rnd_dir == mig_dir:
             raise ValueError(f"Invalid round directory path for {round_name!r}")
         return rnd_dir
+
+    def _read_boot_id(self) -> Optional[str]:
+        boot_id_path = Path(self.proc_root) / "sys" / "kernel" / "random" / "boot_id"
+        if boot_id_path.exists():
+            try:
+                val = boot_id_path.read_text(encoding="utf-8").strip()
+                if val:
+                    return val
+            except OSError:
+                pass
+        return None
+
+    def _source_tombstone_path(self, migration_id: str) -> Path:
+        validate_safe_identifier(migration_id, "migration_id")
+        tomb_dir = (self.work_dir / ".tombstones").resolve()
+        if not tomb_dir.is_relative_to(self.work_dir):
+            raise ValueError("Invalid tombstone directory")
+        tomb_path = (tomb_dir / f"{migration_id}.source.json").resolve()
+        if tomb_path.parent != tomb_dir:
+            raise ValueError(f"Invalid tombstone path for {migration_id!r}")
+        return tomb_path
+
+    def _write_source_tombstone(self, migration_id: str, payload: Dict[str, Any]) -> None:
+        tomb_path = self._source_tombstone_path(migration_id)
+        tomb_dir = tomb_path.parent
+        _mkdir_durable(tomb_dir, mode=0o700)
+        tmp_path = tomb_dir / f".{tomb_path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            offset = 0
+            while offset < len(raw):
+                written = os.write(fd, raw[offset:])
+                if written <= 0:
+                    raise OSError(errno.EIO, "Short write to durable source tombstone")
+                offset += written
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp_path), str(tomb_path))
+        _fsync_directory(tomb_dir)
+
+    def _read_source_tombstone(self, migration_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            tomb_path = self._source_tombstone_path(migration_id)
+        except ValueError:
+            return None
+        if not tomb_path.exists():
+            return None
+        try:
+            return json.loads(tomb_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _remove_source_tombstone(self, migration_id: str) -> None:
+        try:
+            tomb_path = self._source_tombstone_path(migration_id)
+            if tomb_path.exists():
+                tomb_path.unlink()
+        except Exception:
+            pass
 
     def get_capabilities(self) -> Dict[str, Any]:
         if self._capabilities_override is not None:
@@ -711,8 +774,43 @@ class AgentService:
                 drv_res = drv.freeze_and_dump_source(
                     migration_id, mig_dir, prev_round_name, dest_host, config
                 )
+                drv_starttimes: Dict[str, Optional[int]] = {
+                    str(config.pid): read_proc_starttime(config.pid, self.proc_root)
+                }
+                src_state = mig_dir / "source_state.json"
+                if src_state.exists():
+                    try:
+                        parsed_src = json.loads(src_state.read_text(encoding="utf-8"))
+                        if isinstance(parsed_src.get("starttimes"), dict):
+                            drv_starttimes.update({str(k): v for k, v in parsed_src["starttimes"].items()})
+                    except Exception:
+                        pass
+                self._write_source_tombstone(
+                    migration_id,
+                    {
+                        "migration_id": migration_id,
+                        "pid": config.pid,
+                        "tree_pids": [config.pid],
+                        "starttimes": drv_starttimes,
+                        "boot_id": self._read_boot_id(),
+                        "committed": False,
+                    },
+                )
                 if config.volume_snapshot_cmd or config.writable_paths:
                     self.fs.snapshot_writable_paths_while_frozen(config, img_dir / "vol_snap")
+                wk = (config.workload_kind or "auto").lower()
+                if config.verify_attestation and wk != WorkloadKind.QEMU_VM.value:
+                    try:
+                        self.attestor.generate_manifest(
+                            images_dir=img_dir,
+                            migration_id=migration_id,
+                            pid=config.pid,
+                            dest_pages_merkle_root=None,
+                            key_hex=config.attestation_key_hex,
+                            expected_pages_bytes=None,
+                        )
+                    except Exception:
+                        pass
                 return drv_res
             except Exception:
                 src_state = mig_dir / "source_state.json"
@@ -738,16 +836,28 @@ class AgentService:
                 )
                 quiesced = True
 
-            # Record source_state.json in mig_dir
+            # Record source_state.json in mig_dir AND durable tombstone outside mig_dir
             source_state_file = mig_dir / "source_state.json"
             state_data = {
                 "pid": config.pid,
                 "tree_pids": tree_pids,
                 "starttimes": starttimes,
+                "boot_id": self._read_boot_id(),
                 "committed": False,
                 "quiesced": quiesced,
             }
             source_state_file.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+            self._write_source_tombstone(
+                migration_id,
+                {
+                    "migration_id": migration_id,
+                    "pid": config.pid,
+                    "tree_pids": tree_pids,
+                    "starttimes": starttimes,
+                    "boot_id": state_data["boot_id"],
+                    "committed": False,
+                },
+            )
             source_state_written = True
         except Exception:
             if not source_state_written:
@@ -774,7 +884,17 @@ class AgentService:
         )
         if config.strategy in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID):
             lazy_dump_pidfile = img_dir / "lazy-dump.pid"
-            self.criu.run_background_daemon(cmd, pidfile=lazy_dump_pidfile)
+            self.criu.run_background_daemon(
+                cmd,
+                pidfile=lazy_dump_pidfile,
+                log_file=img_dir / "lazy-dump.log",
+            )
+            self.criu.wait_lazy_dump_ready(
+                lazy_dump_pidfile,
+                img_dir,
+                config.lazy_pages_port,
+                proc_root=self.proc_root,
+            )
         else:
             self.criu.runner(cmd)
 
@@ -917,10 +1037,7 @@ class AgentService:
             return {"eligible": False, "reason": "same_host_cow_faster"}
 
         img_dir = self._round_dir(migration_id, "final")
-        if config.verify_attestation and wk not in (
-            WorkloadKind.OCI_CONTAINER.value,
-            WorkloadKind.MICROVM.value,
-        ):
+        if config.verify_attestation and wk != WorkloadKind.QEMU_VM.value:
             pages_size = sum(
                 p.stat().st_size
                 for p in img_dir.iterdir()
@@ -941,7 +1058,11 @@ class AgentService:
         for item in sorted(img_dir.iterdir()):
             if not item.is_file():
                 continue
-            if item.name.startswith("pages-") and item.name.endswith(".img"):
+            if (
+                config.strategy == MigrationStrategy.PRE_COPY
+                and item.name.startswith("pages-")
+                and item.name.endswith(".img")
+            ):
                 continue
             if (
                 item.name == "manifest.sig.json"
@@ -1013,10 +1134,7 @@ class AgentService:
         )
         expected_pages_bytes = pages_size if pages_size > 0 else None
 
-        if not skip_images_sync and config.verify_attestation and wk not in (
-            WorkloadKind.OCI_CONTAINER.value,
-            WorkloadKind.MICROVM.value,
-        ):
+        if not skip_images_sync and config.verify_attestation and wk != WorkloadKind.QEMU_VM.value:
             self.attestor.generate_manifest(
                 images_dir=img_dir,
                 migration_id=migration_id,
@@ -1026,8 +1144,15 @@ class AgentService:
                 expected_pages_bytes=expected_pages_bytes,
             )
 
-        # For COLD migration, pages-*.img were NOT sent via page-server, so transfer MUST include them!
-        include_pages = config.strategy == MigrationStrategy.COLD
+        # For COLD, all pages-*.img are on disk on Source A.
+        # For LAZY / HYBRID (`criu dump --lazy-pages`), CRIU places lazy-eligible pages in its page-pipe
+        # AND writes any non-lazy VMA pages (`!vma_entry_can_be_lazy()`) to local `pages-*.img` on Source A,
+        # which Destination B MUST receive for both `criu restore --lazy-pages` and Merkle attestation.
+        include_pages = config.strategy in (
+            MigrationStrategy.COLD,
+            MigrationStrategy.LAZY,
+            MigrationStrategy.HYBRID,
+        )
         used_cow = False
         if not skip_images_sync:
             resolved_dest_img_dir = self._resolve_same_host_dest_images_dir(
@@ -1074,6 +1199,13 @@ class AgentService:
 
         drv = self._select_driver(config)
         if drv is not None:
+            wk = (config.workload_kind or "auto").lower()
+            if config.verify_attestation and wk != WorkloadKind.QEMU_VM.value:
+                self.attestor.verify_directory(
+                    img_dir,
+                    expected_migration_id=migration_id,
+                    key_hex=config.attestation_key_hex,
+                )
             self.net.lock_network(config.workload_ip, migration_id=migration_id)
             self.net.assign_ip_for_restore(config)
             if config.volume_restore_cmd:
@@ -1092,13 +1224,14 @@ class AgentService:
                     existing_state = {}
             restore_state = {
                 **existing_state,
-                "driver": (config.workload_kind or "auto").lower(),
+                "driver": wk,
                 "config_dict": config_dict,
                 "restored_pid": restored_pid,
                 "tree_pids": [restored_pid],
                 "starttimes": {str(restored_pid): restored_st},
                 "workload_ip": config.workload_ip,
                 "tcp_established": bool(config.workload_ip),
+                "resumed": False,
             }
             if drv_res.get("dest_qmp_socket"):
                 restore_state["dest_qmp_socket"] = drv_res.get("dest_qmp_socket")
@@ -1132,7 +1265,12 @@ class AgentService:
                 images_dir=str(img_dir),
                 source_host=source_host,
             )
-            self.criu.run_background_daemon(lazy_cmd, pidfile=lazy_pidfile)
+            self.criu.run_background_daemon(
+                lazy_cmd,
+                pidfile=lazy_pidfile,
+                log_file=img_dir / "lazy-pages.log",
+            )
+            self.criu.wait_lazy_pages_socket_ready(lazy_pidfile, img_dir)
 
         # If volume_restore_cmd is set, execute via self.fs.runner before criu restore
         if config.volume_restore_cmd:
@@ -1163,6 +1301,7 @@ class AgentService:
             "starttimes": starttimes,
             "workload_ip": config.workload_ip,
             "tcp_established": config.tcp_established,
+            "resumed": False,
         }
         (img_dir / "restore_state.json").write_text(json.dumps(restore_state, indent=2), encoding="utf-8")
 
@@ -1188,15 +1327,19 @@ class AgentService:
         target_host: str,
         config_dict: Dict[str, Any],
         migration_id: Optional[str] = None,
+        fenced_canary: bool = False,
     ) -> Dict[str, Any]:
         config = config_from_dict(config_dict)
         tree_pids: Optional[List[int]] = None
         starttimes: Optional[Dict[str, int]] = None
+        state_file: Optional[Path] = None
+        state_payload: Optional[Dict[str, Any]] = None
         if migration_id:
             state_file = self._round_dir(migration_id, "final") / "restore_state.json"
             if state_file.exists():
                 try:
                     data = json.loads(state_file.read_text(encoding="utf-8"))
+                    state_payload = data
                     if restored_pid is None:
                         restored_pid = data.get("restored_pid")
                     tree_pids = data.get("tree_pids")
@@ -1227,8 +1370,16 @@ class AgentService:
                         f"(expected {exp_root_st}, got {curr_root_st}); refusing to claim IP or resume"
                     )
 
-        cmds = self.net.announce_ip_on_host(config, target_host=target_host, ensure_assigned=True)
-        self.net.unlock_network(config.workload_ip, migration_id=migration_id)
+        if fenced_canary:
+            cmds = self.net.lock_network(
+                config.workload_ip,
+                migration_id=migration_id,
+                allow_loopback=True,
+            )
+        else:
+            cmds = self.net.announce_ip_on_host(config, target_host=target_host, ensure_assigned=True)
+            self.net.unlock_network(config.workload_ip, migration_id=migration_id)
+
         if config.workload_id:
             validate_safe_identifier(config.workload_id, "workload_id")
             self.envelope.unfreeze_cgroup(config.workload_id)
@@ -1245,6 +1396,19 @@ class AgentService:
                 expected_starttimes=starttimes,
             )
 
+        if state_file is not None and state_file.exists():
+            try:
+                latest_state = (
+                    json.loads(state_file.read_text(encoding="utf-8"))
+                    if state_payload is None
+                    else json.loads(state_file.read_text(encoding="utf-8"))
+                )
+                latest_state["resumed"] = True
+                latest_state["fenced_canary"] = bool(fenced_canary)
+                state_file.write_text(json.dumps(latest_state, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
         if config.resume_cmd:
             subprocess.run(
                 shlex.split(config.resume_cmd),
@@ -1254,7 +1418,47 @@ class AgentService:
                 text=True,
             )
 
-        return {"resumed_pid": restored_pid, "ip_commands": cmds}
+        return {
+            "resumed_pid": restored_pid,
+            "ip_commands": cmds,
+            "fenced_canary": bool(fenced_canary),
+        }
+
+    def finalize_canary_network(
+        self,
+        target_host: str,
+        config_dict: Dict[str, Any],
+        migration_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Lift fenced canary network lock and announce workload IP via GARP/BGP after durable COMMIT."""
+        config = config_from_dict(config_dict)
+        cmds = self.net.announce_ip_on_host(config, target_host=target_host, ensure_assigned=True)
+        self.net.unlock_network(config.workload_ip, migration_id=migration_id)
+        if migration_id:
+            state_file = self._round_dir(migration_id, "final") / "restore_state.json"
+            if state_file.exists():
+                try:
+                    data = json.loads(state_file.read_text(encoding="utf-8"))
+                    data["fenced_canary"] = False
+                    data["resumed"] = True
+                    state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+        return {"ip_commands": cmds, "network_unlocked": True}
+
+    def wait_lazy_transfer(
+        self,
+        migration_id: str,
+        timeout_sec: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Wait for Destination B's `criu lazy-pages` daemon to finish transferring all memory pages."""
+        final_dir = self._round_dir(migration_id, "final")
+        lazy_pidfile = final_dir / "lazy-pages.pid"
+        return self.criu.wait_daemon_exit(
+            lazy_pidfile,
+            timeout_sec=timeout_sec,
+            proc_root=self.proc_root,
+        )
 
     def verify_process(
         self,
@@ -1263,14 +1467,23 @@ class AgentService:
         timeout_sec: float = 5.0,
         migration_id: Optional[str] = None,
         expected_restored_starttime: Optional[int] = None,
+        allow_stopped: bool = False,
     ) -> Dict[str, Any]:
         expected_starttimes: Dict[str, Optional[int]] = {}
+        driver_name: Optional[str] = None
+        saved_cfg_dict: Optional[Dict[str, Any]] = None
+        state_resumed: Optional[bool] = None
 
         if migration_id:
             state_file = self._round_dir(migration_id, "final") / "restore_state.json"
             if state_file.exists():
                 try:
                     data = json.loads(state_file.read_text(encoding="utf-8"))
+                    driver_name = data.get("driver")
+                    if isinstance(data.get("config_dict"), dict):
+                        saved_cfg_dict = data["config_dict"]
+                    if "resumed" in data:
+                        state_resumed = bool(data.get("resumed"))
                     st_pid = data.get("restored_pid")
                     if restored_pid is None:
                         restored_pid = st_pid
@@ -1311,29 +1524,91 @@ class AgentService:
         ):
             expected_starttimes[str(pid_int)] = int(expected_restored_starttime)
 
-        tree_pids: List[int] = [pid_int]
-        for p in discover_process_tree_pids(pid_int, self.proc_root):
-            if int(p) not in tree_pids:
-                tree_pids.append(int(p))
-
-        for p in tree_pids:
-            if not self._check_pid_alive(p):
+        drv = self._select_driver_by_name(driver_name)
+        if drv is not None and migration_id:
+            if not self._check_pid_alive(pid_int):
                 return {
                     "healthy": False,
-                    "reason": f"Restored process {p} is not alive on destination",
+                    "reason": f"Restored runtime process {pid_int} is not alive on destination",
                 }
-            exp_st = expected_starttimes.get(str(p))
+            exp_st = expected_starttimes.get(str(pid_int))
             if exp_st is not None:
-                curr_st = read_proc_starttime(p, self.proc_root)
+                curr_st = read_proc_starttime(pid_int, self.proc_root)
                 if curr_st is None or curr_st != exp_st:
                     return {
                         "healthy": False,
                         "reason": (
-                            f"Restored process {p} starttime mismatch on destination "
-                            f"(expected {exp_st}, got {curr_st}); PID was reused or vanished"
+                            f"Restored runtime process {pid_int} starttime mismatch on destination "
+                            f"(expected {exp_st}, got {curr_st})"
                         ),
                     }
-        if health_check_cmd:
+            cfg = (
+                config_from_dict(saved_cfg_dict)
+                if saved_cfg_dict is not None
+                else MigrationConfig(pid=pid_int, source_addr="", dest_addr="")
+            )
+            drv_chk = (
+                drv.verify_stopped_dest(migration_id, self._migration_dir(migration_id), pid_int, cfg)
+                if allow_stopped
+                else drv.verify_running_dest(migration_id, self._migration_dir(migration_id), pid_int, cfg)
+            )
+            if not drv_chk.get("healthy"):
+                return drv_chk
+        else:
+            tree_pids: List[int] = [pid_int]
+            for p in discover_process_tree_pids(pid_int, self.proc_root):
+                if int(p) not in tree_pids:
+                    tree_pids.append(int(p))
+
+            real_linux_proc = self._uses_real_linux_proc()
+            for p in tree_pids:
+                if not self._check_pid_alive(p):
+                    return {
+                        "healthy": False,
+                        "reason": f"Restored process {p} is not alive on destination",
+                    }
+                exp_st = expected_starttimes.get(str(p))
+                if exp_st is not None:
+                    curr_st = read_proc_starttime(p, self.proc_root)
+                    if curr_st is None or curr_st != exp_st:
+                        return {
+                            "healthy": False,
+                            "reason": (
+                                f"Restored process {p} starttime mismatch on destination "
+                                f"(expected {exp_st}, got {curr_st}); PID was reused or vanished"
+                            ),
+                        }
+                proc_state = read_proc_state(p, self.proc_root)
+                if (real_linux_proc or state_resumed is True) and not allow_stopped and proc_state in ("T", "t"):
+                    for _ in range(5):
+                        time.sleep(0.01)
+                        proc_state = read_proc_state(p, self.proc_root)
+                        if proc_state not in ("T", "t"):
+                            break
+                if real_linux_proc and proc_state is None:
+                    return {
+                        "healthy": False,
+                        "reason": f"Unable to inspect /proc/{p}/stat state on destination",
+                    }
+                if proc_state in ("Z", "X", "x"):
+                    return {
+                        "healthy": False,
+                        "reason": f"Restored process {p} is zombie/dead (state={proc_state!r}) on destination",
+                    }
+                if not allow_stopped and proc_state in ("T", "t"):
+                    mock_noop_resumed = (
+                        not real_linux_proc
+                        and state_resumed is True
+                        and self._send_signal is not os.kill
+                    )
+                    if not mock_noop_resumed:
+                        return {
+                            "healthy": False,
+                            "still_stopped": True,
+                            "reason": f"Restored process {p} is still stopped (state={proc_state!r}) on destination",
+                        }
+
+        if health_check_cmd and not allow_stopped:
             try:
                 res = subprocess.run(
                     shlex.split(health_check_cmd),
@@ -1498,7 +1773,12 @@ class AgentService:
             "network_lock_confirmed": network_lock_required,
         }
 
-    def commit_source(self, migration_id: str, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def commit_source(
+        self,
+        migration_id: str,
+        config_dict: Dict[str, Any],
+        lazy_transfer_confirmed_by_dest: bool = False,
+    ) -> Dict[str, Any]:
         mig_dir = self._migration_dir(migration_id)
         base_root = self._migration_base_root(migration_id)
         config = config_from_dict(config_dict)
@@ -1506,24 +1786,86 @@ class AgentService:
         tree_pids: Optional[List[int]] = None
         starttimes: Optional[Dict[str, int]] = None
         state_data: Optional[Dict[str, Any]] = None
+        tombstone = self._read_source_tombstone(migration_id)
 
         if source_state_file.exists():
             try:
                 state_data = json.loads(source_state_file.read_text(encoding="utf-8"))
                 if state_data.get("committed"):
+                    self._write_source_tombstone(
+                        migration_id,
+                        {
+                            **(tombstone or {}),
+                            "migration_id": migration_id,
+                            "pid": config.pid,
+                            "committed": True,
+                        },
+                    )
                     self._release_source_pid(config.pid, migration_id)
                     return {"committed": True, "idempotent_noop": True}
                 tree_pids = state_data.get("tree_pids")
                 starttimes = state_data.get("starttimes")
+                if starttimes is None and tombstone is not None:
+                    starttimes = tombstone.get("starttimes")
             except Exception:
                 state_data = None
+        elif tombstone is not None:
+            if tombstone.get("committed"):
+                self._release_source_pid(config.pid, migration_id)
+                return {"committed": True, "idempotent_noop": True}
+            tomb_boot = tombstone.get("boot_id")
+            curr_boot = self._read_boot_id()
+            if tomb_boot and curr_boot and tomb_boot != curr_boot:
+                self._write_source_tombstone(
+                    migration_id,
+                    {**tombstone, "committed": True, "reconciled_boot_id": curr_boot},
+                )
+                if config.wipe_images_on_commit and mig_dir.exists():
+                    self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
+                self._release_source_pid(config.pid, migration_id)
+                return {"committed": True, "idempotent_noop": True, "host_rebooted": True}
+            tree_pids = tombstone.get("tree_pids")
+            starttimes = tombstone.get("starttimes")
         elif not self._check_pid_alive(config.pid) and not mig_dir.exists():
+            self._write_source_tombstone(
+                migration_id,
+                {
+                    "migration_id": migration_id,
+                    "pid": config.pid,
+                    "tree_pids": [config.pid],
+                    "starttimes": {},
+                    "boot_id": self._read_boot_id(),
+                    "committed": True,
+                },
+            )
             self._release_source_pid(config.pid, migration_id)
             return {"committed": True, "idempotent_noop": True}
+        else:
+            meta_st = (config.runtime_metadata or {}).get("source_starttime")
+            if meta_st is not None:
+                starttimes = {str(config.pid): int(meta_st)}
+            elif read_proc_starttime(config.pid, self.proc_root) is not None:
+                raise RuntimeError(
+                    f"Refusing to terminate source PID {config.pid} for migration {migration_id!r}: "
+                    f"missing source_state.json, durable tombstone, and recorded starttime while "
+                    f"live /proc/{config.pid}/stat exists"
+                )
 
         drv = self._select_driver(config)
         if drv is not None:
             drv_res = drv.commit_source(migration_id, mig_dir, config)
+            self._write_source_tombstone(
+                migration_id,
+                {
+                    **(tombstone or {}),
+                    "migration_id": migration_id,
+                    "pid": config.pid,
+                    "tree_pids": tree_pids or [config.pid],
+                    "starttimes": starttimes or {},
+                    "boot_id": self._read_boot_id(),
+                    "committed": True,
+                },
+            )
             if state_data is not None and source_state_file.exists():
                 try:
                     state_data["committed"] = True
@@ -1539,8 +1881,19 @@ class AgentService:
             self._release_source_pid(config.pid, migration_id)
             return drv_res
 
-        # Stop lazy-dump daemon if running
         lazy_dump_pidfile = self._round_dir(migration_id, "final") / "lazy-dump.pid"
+        if config.strategy in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID) and not lazy_transfer_confirmed_by_dest:
+            lazy_dump_active = self.criu.is_daemon_running(
+                lazy_dump_pidfile, proc_root=self.proc_root
+            ) or (self.criu.runner is not _criu_default_runner and lazy_dump_pidfile.exists())
+            if lazy_dump_active:
+                return {
+                    "committed": False,
+                    "execution_committed": True,
+                    "lazy_transfer_pending": True,
+                }
+
+        # Stop lazy-dump daemon if running
         if lazy_dump_pidfile.exists():
             self.criu.stop_daemon(lazy_dump_pidfile, proc_root=self.proc_root)
 
@@ -1557,12 +1910,25 @@ class AgentService:
             else 0
         )
 
-        # Terminate source process tree BEFORE marking source_state.json as committed
+        # Terminate source process tree BEFORE marking source_state.json or durable tombstone as committed
         self._signal_process_tree(
             config.pid,
             signal.SIGKILL,
             recorded_pids=tree_pids,
             expected_starttimes=starttimes,
+        )
+
+        self._write_source_tombstone(
+            migration_id,
+            {
+                **(tombstone or {}),
+                "migration_id": migration_id,
+                "pid": config.pid,
+                "tree_pids": tree_pids or [config.pid],
+                "starttimes": starttimes or {},
+                "boot_id": self._read_boot_id(),
+                "committed": True,
+            },
         )
 
         if config.workload_id:
@@ -1797,6 +2163,7 @@ class AgentService:
                     errors.append(f"resume_cmd failed: {r_exc}")
             if not errors:
                 self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
+                self._remove_source_tombstone(migration_id)
                 self._release_source_pid(config.pid, migration_id)
             if errors:
                 raise RuntimeError("; ".join(errors))
@@ -1890,6 +2257,7 @@ class AgentService:
 
         if not errors:
             self.fs.secure_wipe_directory(mig_dir, allowed_parent=base_root)
+            self._remove_source_tombstone(migration_id)
             self._release_source_pid(config.pid, migration_id)
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -1923,6 +2291,8 @@ class AgentService:
             "restore_process",
             "release_ip",
             "claim_ip_and_resume",
+            "finalize_canary_network",
+            "wait_lazy_transfer",
             "verify_process",
             "verify_restored_stopped",
             "commit_source",
@@ -1993,7 +2363,16 @@ class _RpcRequestHandler(socketserver.StreamRequestHandler):
                     result = service.dispatch_rpc(method, params)
                     resp = {"ok": True, "result": result}
                 except Exception as exc:
-                    resp = {"ok": False, "error": str(exc)}
+                    err_str = str(exc)
+                    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                        stderr_tail = (
+                            exc.stderr.decode("utf-8", errors="replace")
+                            if isinstance(exc.stderr, bytes)
+                            else str(exc.stderr)
+                        ).strip()[-600:]
+                        if stderr_tail:
+                            err_str = f"{err_str} | stderr: {stderr_tail}"
+                    resp = {"ok": False, "error": err_str}
             payload = (json.dumps(resp) + "\n").encode("utf-8")
             try:
                 self.wfile.write(payload)

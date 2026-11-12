@@ -160,11 +160,12 @@ class CriuDriver:
             cmd.append("--track-mem")
 
         if config.strategy in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID):
+            # Omit `--address 0.0.0.0`: CRIU's lazy-pages server binds wildcard (`AI_PASSIVE`)
+            # by default when `--address` is omitted, whereas passing `--address 0.0.0.0` causes
+            # `criu/tls.c` to expect literal `0.0.0.0` in the connecting peer's X.509 SAN/CN.
             cmd.extend(
                 [
                     "--lazy-pages",
-                    "--address",
-                    "0.0.0.0",
                     "--port",
                     str(config.lazy_pages_port),
                 ]
@@ -274,6 +275,77 @@ class CriuDriver:
         self._daemons[str(pidfile_path)] = proc
         return proc.pid
 
+    @staticmethod
+    def _is_tcp_port_listening(port: int, proc_root: str = "/proc") -> bool:
+        """Passively inspect /proc/net/tcp{,6} for TCP_LISTEN (0A) without connecting to single-accept sockets."""
+        hex_port = f":{int(port):04X}"
+        for table in ("net/tcp", "net/tcp6"):
+            tbl_path = Path(proc_root) / table
+            if not tbl_path.exists():
+                continue
+            try:
+                for line in tbl_path.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[1].upper().endswith(hex_port) and parts[3] == "0A":
+                        return True
+            except OSError:
+                continue
+        return False
+
+    def wait_lazy_dump_ready(
+        self,
+        pidfile: str | Path,
+        images_dir: str | Path,
+        port: int,
+        proc_root: str = "/proc",
+        timeout_sec: float = 10.0,
+    ) -> None:
+        """Wait until `criu dump --lazy-pages` has flushed checkpoint metadata and opened its TCP listener."""
+        if self.runner is not _default_runner:
+            return
+        img_path = Path(images_dir)
+        proc = self._daemons.get(str(pidfile))
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        while time.monotonic() < deadline:
+            if proc is not None and proc.poll() is not None:
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"CRIU lazy-dump daemon exited prematurely with returncode {proc.returncode}"
+                    )
+                return
+            if (img_path / "inventory.img").exists() and self._is_tcp_port_listening(port, proc_root=proc_root):
+                return
+            time.sleep(0.01)
+        raise TimeoutError(
+            f"Timed out after {timeout_sec}s waiting for CRIU lazy-dump metadata and port {port} readiness"
+        )
+
+    def wait_lazy_pages_socket_ready(
+        self,
+        pidfile: str | Path,
+        images_dir: str | Path,
+        timeout_sec: float = 10.0,
+    ) -> None:
+        """Wait until `criu lazy-pages` has connected to lazy-dump and created `lazy-pages.socket`."""
+        if self.runner is not _default_runner:
+            return
+        sock_path = Path(images_dir) / "lazy-pages.socket"
+        proc = self._daemons.get(str(pidfile))
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        while time.monotonic() < deadline:
+            if proc is not None and proc.poll() is not None:
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"CRIU lazy-pages daemon exited prematurely with returncode {proc.returncode}"
+                    )
+                return
+            if sock_path.exists():
+                return
+            time.sleep(0.01)
+        raise TimeoutError(
+            f"Timed out after {timeout_sec}s waiting for CRIU lazy-pages.socket in {images_dir}"
+        )
+
     def _is_verified_criu_pid(self, pid: int, proc_root: str = "/proc") -> bool:
         """Verify that `pid` belongs to a CRIU daemon before signaling an untracked pidfile PID."""
         proc_dir = Path(proc_root) / str(pid)
@@ -293,6 +365,67 @@ class CriuDriver:
         except OSError:
             return False
         return False
+
+    def is_daemon_running(self, pidfile: str | Path, proc_root: str = "/proc") -> bool:
+        """Return True if a supervised CRIU daemon (`lazy-pages` / `lazy-dump` / `page-server`) is still active."""
+        p_str = str(pidfile)
+        p_path = Path(pidfile)
+        proc = self._daemons.get(p_str)
+        if proc is not None:
+            if proc.poll() is None:
+                return True
+            self._daemons.pop(p_str, None)
+            if p_path.exists():
+                try:
+                    p_path.unlink()
+                except OSError:
+                    pass
+            return False
+        if p_path.exists():
+            try:
+                recorded_pid = int(p_path.read_text(encoding="utf-8").strip())
+                if recorded_pid > 0 and self._is_verified_criu_pid(recorded_pid, proc_root=proc_root):
+                    return True
+            except (ValueError, OSError):
+                return False
+        return False
+
+    def wait_daemon_exit(
+        self,
+        pidfile: str | Path,
+        timeout_sec: float = 30.0,
+        proc_root: str = "/proc",
+    ) -> Dict[str, Any]:
+        """Wait up to `timeout_sec` for a background CRIU daemon (e.g., `lazy-pages`) to complete."""
+        p_str = str(pidfile)
+        p_path = Path(pidfile)
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        proc = self._daemons.get(p_str)
+        if proc is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                rc = proc.wait(timeout=remaining)
+                self._daemons.pop(p_str, None)
+                if p_path.exists():
+                    try:
+                        p_path.unlink()
+                    except OSError:
+                        pass
+                return {"exited": True, "returncode": rc}
+            except subprocess.TimeoutExpired:
+                return {"exited": False, "returncode": None}
+
+        while True:
+            if not self.is_daemon_running(p_path, proc_root=proc_root):
+                if p_path.exists():
+                    try:
+                        p_path.unlink()
+                    except OSError:
+                        pass
+                return {"exited": True, "returncode": 0}
+            if time.monotonic() >= deadline:
+                return {"exited": False, "returncode": None}
+            time.sleep(0.02)
 
     def stop_daemon(self, pidfile: str | Path, proc_root: str = "/proc") -> None:
         """Terminate and clean up a supervised or detached CRIU background daemon."""

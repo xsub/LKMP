@@ -168,8 +168,12 @@ class OciContainerDriver:
             cmd = [engine, "checkpoint", "--leave-stopped", "--image-path", str(final_dir), cid]
             self.runner(cmd)
 
+        src_st = read_proc_starttime(config.pid, self.proc_root)
         state = {
             "driver": WorkloadKind.OCI_CONTAINER.value,
+            "pid": config.pid,
+            "tree_pids": [config.pid],
+            "starttimes": {str(config.pid): src_st},
             "engine": engine,
             "container_id": cid,
             "orig_restart_policy": orig_restart,
@@ -215,6 +219,7 @@ class OciContainerDriver:
             "starttimes": {str(restored_pid): starttime},
             "workload_ip": config.workload_ip,
             "tcp_established": config.tcp_established,
+            "resumed": False,
         }
         (final_dir / "restore_state.json").write_text(json.dumps(restore_state, indent=2), encoding="utf-8")
         return {"restored_pid": restored_pid, "restored_starttime": starttime, "command": cmd}
@@ -238,6 +243,32 @@ class OciContainerDriver:
             }
         return {"healthy": True, "checked_pids": [restored_pid], "stopped_confirmed": True}
 
+    def verify_running_dest(
+        self,
+        migration_id: str,
+        mig_dir: Path,
+        restored_pid: int,
+        config: MigrationConfig,
+    ) -> Dict[str, Any]:
+        _ = (migration_id, mig_dir)
+        engine, cid = self._resolve_container(config)
+        info = self._inspect_container(engine, cid)
+        st = info.get("State") or {}
+        status_str = str(st.get("Status", "")).lower()
+        paused = bool(st.get("Paused")) or status_str in ("paused", "created")
+        if paused:
+            return {
+                "healthy": False,
+                "still_stopped": True,
+                "reason": f"Destination OCI container {cid[:12]} is still paused: {st}",
+            }
+        if status_str in ("exited", "dead", "stopped"):
+            return {
+                "healthy": False,
+                "reason": f"Destination OCI container {cid[:12]} is not running: {st}",
+            }
+        return {"healthy": True, "checked_pids": [restored_pid], "container_id": cid}
+
     def resume_dest(
         self,
         migration_id: str,
@@ -246,9 +277,17 @@ class OciContainerDriver:
         target_host: str,
         config: MigrationConfig,
     ) -> Dict[str, Any]:
-        _ = (migration_id, mig_dir, target_host)
+        _ = (migration_id, target_host)
         engine, cid = self._resolve_container(config)
         self.runner([engine, "unpause", cid])
+        state_file = mig_dir / "final" / "restore_state.json"
+        if state_file.exists():
+            try:
+                data = json.loads(state_file.read_text(encoding="utf-8"))
+                data["resumed"] = True
+                state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         return {"resumed_pid": restored_pid, "container_id": cid}
 
     def commit_source(

@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: linux-e2e-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -39,11 +43,14 @@ jobs:
 
       - name: Run 12-scenario stateful REAL_CRIU acceptance suite
         run: |
+          set -euo pipefail
           sudo ./bin/lkmp acceptance --backend REAL_CRIU
           sudo ./bin/lkmp acceptance --backend REAL_CRIU --json > /tmp/lkmp-acceptance-telemetry.json
 
       - name: Run real Linux CRIU 4.x E2E verification harness
-        run: sudo python3 scripts/linux_criu_e2e.py | tee /tmp/lkmp-criu-e2e.log
+        run: |
+          set -euo pipefail
+          sudo python3 scripts/linux_criu_e2e.py | tee /tmp/lkmp-criu-e2e.log
 
       - name: Upload CRIU & NetNS E2E telemetry artifacts
         if: always()
@@ -80,7 +87,9 @@ jobs:
           criu --version
 
       - name: Run real QEMU Live QMP, Multi-Hop & Heterogeneous [QEMU + CRIU] 2PC Gang E2E
-        run: sudo python3 scripts/linux_qemu_e2e.py | tee /tmp/lkmp-qemu-e2e-telemetry.log
+        run: |
+          set -euo pipefail
+          sudo python3 scripts/linux_qemu_e2e.py | tee /tmp/lkmp-qemu-e2e-telemetry.log
 
       - name: Upload QEMU & 2PC Gang E2E telemetry artifacts
         if: always()

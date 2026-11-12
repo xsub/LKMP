@@ -89,11 +89,14 @@ def _hash_file(path: Path) -> str:
         return h.hexdigest()
 
 
+ATTESTED_ARTIFACT_SUFFIXES: Tuple[str, ...] = (".img", ".snap", ".mem", ".tar", ".base")
+
+
 def compute_directory_img_digests(
     images_dir: str | Path,
     prefix_filter: Optional[str] = None,
 ) -> Tuple[List[ImageFileDigest], str]:
-    """Compute `(digests, merkle_root)` for `.img` files in `images_dir`."""
+    """Compute `(digests, merkle_root)` for checkpoint image/archive files in `images_dir`."""
     root = Path(images_dir)
     if not root.exists():
         return [], compute_merkle_root([])
@@ -102,7 +105,7 @@ def compute_directory_img_digests(
         p
         for p in root.iterdir()
         if p.is_file()
-        and p.name.endswith(".img")
+        and p.name.endswith(ATTESTED_ARTIFACT_SUFFIXES)
         and (prefix_filter is None or p.name.startswith(prefix_filter))
     )
     digests: List[ImageFileDigest] = []

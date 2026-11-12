@@ -79,6 +79,15 @@ class WorkloadMigrationDriver(Protocol):
     ) -> Dict[str, Any]:
         ...
 
+    def verify_running_dest(
+        self,
+        migration_id: str,
+        mig_dir: Path,
+        restored_pid: int,
+        config: MigrationConfig,
+    ) -> Dict[str, Any]:
+        ...
+
     def resume_dest(
         self,
         migration_id: str,

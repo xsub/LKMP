@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -84,6 +85,12 @@ class MigrationOrchestrator:
         self._restored_pid: Optional[int] = None
         self._restored_starttime: Optional[int] = None
         self._dest_has_userfaultfd: bool = False
+        self._fenced_canary_active: bool = False
+        self._last_persisted_config_json: Optional[str] = None
+        if self.journal is not None and self.journal.effective_config_dict is not None:
+            self._last_persisted_config_json = json.dumps(
+                self.journal.effective_config_dict, sort_keys=True, separators=(",", ":")
+            )
 
     def _transition(
         self,
@@ -94,11 +101,17 @@ class MigrationOrchestrator:
         self.state = next_state
         self.state_history.append(next_state)
         if self.journal is not None:
-            cfg_dict = (
-                config_to_dict(self.config)
-                if len(self.journal.entries) == 0 and not self.journal.path.exists()
-                else None
-            )
+            current_cfg = config_to_dict(self.config)
+            current_cfg_json = json.dumps(current_cfg, sort_keys=True, separators=(",", ":"))
+            if (
+                self._last_persisted_config_json is None
+                or current_cfg_json != self._last_persisted_config_json
+                or (len(self.journal.entries) == 0 and not self.journal.path.exists())
+            ):
+                cfg_dict = current_cfg
+                self._last_persisted_config_json = current_cfg_json
+            else:
+                cfg_dict = None
             self.journal.append(
                 state=next_state,
                 commit_decision=commit_decision,
@@ -131,6 +144,8 @@ class MigrationOrchestrator:
             meta["subkind"] = prof["subkind"]
         if prof.get("overlay_upperdir") and "overlay_upperdir" not in meta:
             meta["overlay_upperdir"] = prof["overlay_upperdir"]
+        if prof.get("starttime") is not None and "source_starttime" not in meta:
+            meta["source_starttime"] = prof["starttime"]
         self.config.runtime_metadata = meta
 
     def run_preflight(self) -> PreflightReport:
@@ -343,17 +358,26 @@ class MigrationOrchestrator:
         report.same_host_fast_path_available = same_host
         return report
 
-    def execute_prepare_phase(self, keep_stopped_on_prepare: bool = False) -> MigrationResult:
+    def execute_prepare_phase(
+        self,
+        keep_stopped_on_prepare: bool = False,
+        defer_switchover_until_commit: bool = False,
+    ) -> MigrationResult:
         """
-        Execute Phases 1 through 8 (`PREFLIGHT` -> ... -> `VERIFY`), stopping at `VERIFY`
-        while keeping the frozen source process on Host A intact (`--leave-stopped`).
-        When keep_stopped_on_prepare is True (used by 2PC gang migration), Destination B
-        is kept stopped (--leave-stopped) and network-fenced, verified via verify_restored_stopped.
+        Execute Phases 1 through 6/8 while keeping the frozen source process on Host A intact (`--leave-stopped`).
+        - When `keep_stopped_on_prepare=True` (2PC gang migration), stops at `VERIFY` (`PREPARED_STOPPED`)
+          with Destination B stopped (`--leave-stopped`) and network-fenced.
+        - When `defer_switchover_until_commit=True` (default single-workload strict 2PC cutover without
+          `--health-cmd`), verifies stopped readiness at `RESTORE` so `COMMIT_DECIDED` is fsynced to WAL
+          *before* Destination B ever executes an instruction (`claim_ip_and_resume`).
+        - When `--health-cmd` is configured (`defer_switchover_until_commit=False`), resumes Destination B
+          inside a loopback-only network fence (`fenced_canary=True`) to run the health probe prior to commit.
         """
         self._t_start = time.monotonic()
         self._precopy_stats = []
         self._restored_pid = None
         self._restored_starttime = None
+        self._fenced_canary_active = False
         freeze_start: Optional[float] = None
         self._freeze_downtime_ms = 0.0
 
@@ -634,27 +658,86 @@ class MigrationOrchestrator:
                         state_history=list(self.state_history),
                     )
 
-                # Phase 7: Switchover (announce GARP/BGP, unlock network on B, resume process on B)
+                if defer_switchover_until_commit:
+                    # Verify restored process is alive, starttime-matched, and stopped BEFORE commit barrier
+                    stopped_kwargs: Dict[str, object] = {
+                        "restored_pid": self._restored_pid,
+                        "health_check_cmd": None,
+                        "timeout_sec": self.config.health_check_timeout_sec,
+                        "migration_id": self.migration_id,
+                        "allow_stopped": True,
+                    }
+                    if self._restored_starttime is not None:
+                        stopped_kwargs["expected_restored_starttime"] = self._restored_starttime
+                    try:
+                        stopped_chk = self.dest.call("verify_process", **stopped_kwargs)
+                    except TypeError:
+                        stopped_kwargs.pop("allow_stopped", None)
+                        stopped_kwargs.pop("expected_restored_starttime", None)
+                        stopped_chk = self.dest.call("verify_process", **stopped_kwargs)
+                    if not stopped_chk.get("healthy"):
+                        raise RuntimeError(
+                            f"Destination pre-cutover stopped verification failed: {stopped_chk.get('reason')}"
+                        )
+                    return MigrationResult(
+                        migration_id=self.migration_id,
+                        success=True,
+                        final_state=MigrationState.RESTORE,
+                        restored_pid=self._restored_pid,
+                        total_duration_ms=round((time.monotonic() - self._t_start) * 1000.0, 2),
+                        freeze_downtime_ms=round(self._freeze_downtime_ms, 2),
+                        precopy_iterations=list(self._precopy_stats),
+                        rolled_back=False,
+                        state_history=list(self.state_history),
+                    )
+
+                # Phase 7: Fenced Canary Switchover (used when `--health-cmd` requires probing before COMMIT)
+                use_fenced_canary = bool(self.config.health_check_cmd)
                 self._transition(MigrationState.SWITCHOVER, commit_decision="PREPARING")
-                self.dest.call(
-                    "claim_ip_and_resume",
-                    restored_pid=self._restored_pid,
-                    target_host=self.dest.host,
-                    config_dict=cfg_dict,
-                    migration_id=self.migration_id,
-                )
+                if use_fenced_canary:
+                    try:
+                        self.dest.call(
+                            "claim_ip_and_resume",
+                            restored_pid=self._restored_pid,
+                            target_host=self.dest.host,
+                            config_dict=cfg_dict,
+                            migration_id=self.migration_id,
+                            fenced_canary=True,
+                        )
+                        self._fenced_canary_active = True
+                    except TypeError:
+                        self.dest.call(
+                            "claim_ip_and_resume",
+                            restored_pid=self._restored_pid,
+                            target_host=self.dest.host,
+                            config_dict=cfg_dict,
+                            migration_id=self.migration_id,
+                        )
+                else:
+                    self.dest.call(
+                        "claim_ip_and_resume",
+                        restored_pid=self._restored_pid,
+                        target_host=self.dest.host,
+                        config_dict=cfg_dict,
+                        migration_id=self.migration_id,
+                    )
                 self._freeze_downtime_ms = (time.monotonic() - freeze_start) * 1000.0
 
                 # Phase 8: Verify on Destination B (Source A still frozen and alive!)
                 self._transition(MigrationState.VERIFY, commit_decision="PREPARING")
-                verify_res = self.dest.call(
-                    "verify_process",
-                    restored_pid=self._restored_pid,
-                    health_check_cmd=self.config.health_check_cmd,
-                    timeout_sec=self.config.health_check_timeout_sec,
-                    migration_id=self.migration_id,
-                    expected_restored_starttime=self._restored_starttime,
-                )
+                verify_kwargs: Dict[str, object] = {
+                    "restored_pid": self._restored_pid,
+                    "health_check_cmd": self.config.health_check_cmd,
+                    "timeout_sec": self.config.health_check_timeout_sec,
+                    "migration_id": self.migration_id,
+                }
+                if self._restored_starttime is not None:
+                    verify_kwargs["expected_restored_starttime"] = self._restored_starttime
+                try:
+                    verify_res = self.dest.call("verify_process", **verify_kwargs)
+                except TypeError:
+                    verify_kwargs.pop("expected_restored_starttime", None)
+                    verify_res = self.dest.call("verify_process", **verify_kwargs)
                 if not verify_res.get("healthy"):
                     raise RuntimeError(
                         f"Destination verification failed: {verify_res.get('reason')}"
@@ -683,7 +766,7 @@ class MigrationOrchestrator:
         transitioning from a stopped prepare to active execution on Destination B.
         """
         cfg_dict = config_to_dict(self.config)
-        self._transition(MigrationState.SWITCHOVER, commit_decision="COMMITTED")
+        self._transition(MigrationState.SWITCHOVER, commit_decision="COMMIT_DECIDED")
         self.dest.call(
             "claim_ip_and_resume",
             restored_pid=self._restored_pid,
@@ -693,7 +776,7 @@ class MigrationOrchestrator:
         )
         if self._freeze_start_ts is not None and self._freeze_downtime_ms == 0.0:
             self._freeze_downtime_ms = (time.monotonic() - self._freeze_start_ts) * 1000.0
-        self._transition(MigrationState.VERIFY, commit_decision="COMMITTED")
+        self._transition(MigrationState.VERIFY, commit_decision="COMMIT_DECIDED")
         verify_kwargs: Dict[str, object] = {
             "restored_pid": self._restored_pid,
             "health_check_cmd": self.config.health_check_cmd,
@@ -715,17 +798,77 @@ class MigrationOrchestrator:
     def commit(self) -> MigrationResult:
         """
         Execute Phase 9 (`COMMIT`): record durable COMMITTED decision in WAL, terminate the
-        frozen source process on Host A, and wipe checkpoint images.
-        Once `commit_source` succeeds, cleanup errors on Destination B never trigger rollback.
+        frozen source process on Host A (waiting for lazy-pages completion on LAZY/HYBRID),
+        and wipe checkpoint images.
+        Once `COMMIT_DECIDED` / `COMMITTED` is recorded, post-commit errors never trigger rollback.
         """
         cfg_dict = config_to_dict(self.config)
-        self._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
-        self.source.call(
-            "commit_source",
-            migration_id=self.migration_id,
-            config_dict=cfg_dict,
-        )
-        if self.config.strategy not in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID):
+        if self._fenced_canary_active or bool(self.config.health_check_cmd):
+            try:
+                self.dest.call(
+                    "finalize_canary_network",
+                    target_host=self.dest.host,
+                    config_dict=cfg_dict,
+                    migration_id=self.migration_id,
+                )
+                self._fenced_canary_active = False
+            except Exception:
+                pass
+
+        if self.config.strategy in (MigrationStrategy.LAZY, MigrationStrategy.HYBRID):
+            lazy_done = True
+            try:
+                wait_res = self.dest.call(
+                    "wait_lazy_transfer",
+                    migration_id=self.migration_id,
+                    timeout_sec=self.config.lazy_transfer_timeout_sec,
+                )
+                if isinstance(wait_res, dict) and "exited" in wait_res:
+                    lazy_done = bool(wait_res.get("exited"))
+            except Exception:
+                lazy_done = False
+
+            if lazy_done:
+                self._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
+                try:
+                    self.source.call(
+                        "commit_source",
+                        migration_id=self.migration_id,
+                        config_dict=cfg_dict,
+                        lazy_transfer_confirmed_by_dest=True,
+                    )
+                except TypeError:
+                    self.source.call(
+                        "commit_source",
+                        migration_id=self.migration_id,
+                        config_dict=cfg_dict,
+                    )
+                try:
+                    self.dest.call(
+                        "cleanup_dest",
+                        migration_id=self.migration_id,
+                        wipe_images=self.config.wipe_images_on_commit,
+                    )
+                except Exception:
+                    pass
+            else:
+                self._transition(
+                    MigrationState.COMMIT,
+                    commit_decision="COMMITTED",
+                    note="lazy_transfer_pending",
+                )
+                self.source.call(
+                    "commit_source",
+                    migration_id=self.migration_id,
+                    config_dict=cfg_dict,
+                )
+        else:
+            self._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
+            self.source.call(
+                "commit_source",
+                migration_id=self.migration_id,
+                config_dict=cfg_dict,
+            )
             try:
                 self.dest.call(
                     "cleanup_dest",
@@ -828,7 +971,66 @@ class MigrationOrchestrator:
         return result
 
     def execute(self) -> MigrationResult:
-        """Run the complete migration state machine (`execute_prepare_phase` + `commit`)."""
+        """
+        Run the complete migration state machine:
+        - Without `--health-cmd`: strict 2PC stopped-barrier cutover (`COMMIT_DECIDED` is fsynced to WAL
+          and Source A is fenced/committed BEFORE Destination B executes any instruction).
+        - With `--health-cmd`: Destination B probes inside a loopback-only network fence prior to `COMMIT`.
+        """
+        if not self.config.health_check_cmd:
+            prep = self.execute_prepare_phase(defer_switchover_until_commit=True)
+            if not prep.success or prep.final_state != MigrationState.RESTORE:
+                return prep
+            try:
+                self._transition(MigrationState.SWITCHOVER, commit_decision="COMMIT_DECIDED")
+                cfg_dict = config_to_dict(self.config)
+                self.source.call(
+                    "commit_source",
+                    migration_id=self.migration_id,
+                    config_dict=cfg_dict,
+                )
+                self.dest.call(
+                    "claim_ip_and_resume",
+                    restored_pid=self._restored_pid,
+                    target_host=self.dest.host,
+                    config_dict=cfg_dict,
+                    migration_id=self.migration_id,
+                )
+                if self._freeze_start_ts is not None and self._freeze_downtime_ms == 0.0:
+                    self._freeze_downtime_ms = (time.monotonic() - self._freeze_start_ts) * 1000.0
+                self._transition(MigrationState.VERIFY, commit_decision="COMMIT_DECIDED")
+                verify_kwargs: Dict[str, object] = {
+                    "restored_pid": self._restored_pid,
+                    "health_check_cmd": None,
+                    "timeout_sec": self.config.health_check_timeout_sec,
+                    "migration_id": self.migration_id,
+                }
+                if self._restored_starttime is not None:
+                    verify_kwargs["expected_restored_starttime"] = self._restored_starttime
+                try:
+                    verify_res = self.dest.call("verify_process", **verify_kwargs)
+                except TypeError:
+                    verify_kwargs.pop("expected_restored_starttime", None)
+                    verify_res = self.dest.call("verify_process", **verify_kwargs)
+                if not verify_res.get("healthy"):
+                    raise RuntimeError(
+                        f"Destination post-cutover verification failed: {verify_res.get('reason')}"
+                    )
+                return self.commit()
+            except Exception as exc:
+                return MigrationResult(
+                    migration_id=self.migration_id,
+                    success=False,
+                    final_state=MigrationState.ABORTED,
+                    restored_pid=self._restored_pid,
+                    total_duration_ms=round((time.monotonic() - self._t_start) * 1000.0, 2),
+                    freeze_downtime_ms=round(self._freeze_downtime_ms, 2),
+                    precopy_iterations=list(self._precopy_stats),
+                    rolled_back=False,
+                    error_message=f"Post-commit cutover error (reconcile via recover): {exc}",
+                    state_history=list(self.state_history),
+                )
+
         prep = self.execute_prepare_phase()
         if not prep.success or prep.final_state != MigrationState.VERIFY:
             return prep
@@ -840,20 +1042,23 @@ class MigrationOrchestrator:
         journal_path: str | Path,
         source_client: AgentClient,
         dest_client: AgentClient,
+        *,
+        require_persistent_journal: bool = True,
     ) -> MigrationResult:
         """
         Recover an interrupted migration from its durable Write-Ahead Log (`.wal.jsonl`):
         - If this member belongs to a 2PC gang (`gang_id` recorded in WAL or matching sibling
           `<gang_id>.gang.wal.jsonl`), consults the authoritative gang WAL FIRST so a crash
-          between `GangJournal` `COMMITTED` and member WAL `COMMITTED` never rolls back a
+          between `GangJournal` `COMMIT_DECIDED`/`COMMITTED` and member WAL never rolls back a
           committed gang member (fails closed if the referenced gang WAL is missing).
-        - Before executing `commit_source` (killing Source A), verifies Destination B has a
-          live restored process (`verify_process` fails on missing/dead PID).
+        - Uses `effective_config_dict` so runtime profile enrichment and `HYBRID` upgrades survive crash.
+        - Inspects actual Destination B process state: if B is alive and still stopped (`still_stopped=True`),
+          wakes B via `complete_switchover_and_verify()` and verifies B is running before reporting success.
         - Otherwise, deterministically executes `rollback()` so Source A resumes safely.
         """
         j_path = Path(journal_path)
-        journal = MigrationJournal.load(j_path)
-        cfg_dict = journal.initial_config_dict
+        journal = MigrationJournal.load(j_path, require_persistent=require_persistent_journal)
+        cfg_dict = journal.effective_config_dict
         if cfg_dict is None:
             raise ValueError(f"Journal {journal_path} does not contain migration configuration")
 
@@ -873,7 +1078,9 @@ class MigrationOrchestrator:
                     f"Cannot recover gang member {journal.migration_id!r}: authoritative gang WAL "
                     f"is missing at {gang_wal_path} (refusing independent decision)"
                 )
-            gang_journal = MigrationJournal.load(gang_wal_path)
+            gang_journal = MigrationJournal.load(
+                gang_wal_path, require_persistent=require_persistent_journal
+            )
             should_commit = gang_journal.has_committed_decision
 
         config = config_from_dict(cfg_dict)
@@ -884,6 +1091,7 @@ class MigrationOrchestrator:
             migration_id=journal.migration_id,
             journal_dir=j_path.parent,
             gang_id=coupled_gang_id,
+            require_persistent_journal=require_persistent_journal,
         )
         orch._t_start = time.monotonic()
         for entry in reversed(journal.entries):
@@ -910,6 +1118,24 @@ class MigrationOrchestrator:
                 pre_verify = dest_client.call("verify_process", **verify_kwargs)
 
             if not pre_verify.get("healthy"):
+                if pre_verify.get("still_stopped") is True:
+                    try:
+                        orch.source.call(
+                            "commit_source",
+                            migration_id=orch.migration_id,
+                            config_dict=config_to_dict(orch.config),
+                        )
+                        orch.complete_switchover_and_verify()
+                        return orch.commit()
+                    except Exception as exc:
+                        return MigrationResult(
+                            migration_id=orch.migration_id,
+                            success=False,
+                            final_state=MigrationState.ABORTED,
+                            rolled_back=False,
+                            error_message=f"Roll-forward wakeup of stopped destination failed: {exc}",
+                            state_history=list(orch.state_history),
+                        )
                 return MigrationResult(
                     migration_id=orch.migration_id,
                     success=False,
@@ -925,20 +1151,28 @@ class MigrationOrchestrator:
             was_prepared_stopped = any(
                 e.commit_decision == "PREPARED_STOPPED" for e in journal.entries
             )
-            already_switched_over = any(
-                e.state == MigrationState.SWITCHOVER.value and e.commit_decision == "COMMITTED"
+            already_resumed = any(
+                e.state == MigrationState.VERIFY.value
+                and e.commit_decision in ("COMMIT_DECIDED", "COMMITTED")
                 for e in journal.entries
             )
-            if was_prepared_stopped and not already_switched_over:
-                orch._transition(MigrationState.COMMIT, commit_decision="COMMITTED")
-                orch.source.call(
-                    "commit_source",
-                    migration_id=orch.migration_id,
-                    config_dict=config_to_dict(orch.config),
-                )
-                orch.complete_switchover_and_verify()
-                return orch.commit()
-
+            if was_prepared_stopped and not already_resumed:
+                try:
+                    orch.source.call(
+                        "commit_source",
+                        migration_id=orch.migration_id,
+                        config_dict=config_to_dict(orch.config),
+                    )
+                    orch.complete_switchover_and_verify()
+                except Exception as exc:
+                    return MigrationResult(
+                        migration_id=orch.migration_id,
+                        success=False,
+                        final_state=MigrationState.ABORTED,
+                        rolled_back=False,
+                        error_message=f"Roll-forward switchover failed: {exc}",
+                        state_history=list(orch.state_history),
+                    )
             return orch.commit()
 
         # If a prior recovery already completed rollback and recorded ROLLED_BACK, avoid

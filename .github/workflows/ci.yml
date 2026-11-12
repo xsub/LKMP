@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -29,13 +33,21 @@ jobs:
 
       - name: Run Ruff static analysis & Python bytecode check
         run: |
+          set -euo pipefail
           python3 -m pip install --upgrade pip ruff build
           ruff check lkmp/ tests/ scripts/
           python3 -m compileall -q lkmp tests scripts
 
-      - name: Build sdist + wheel & smoke-test installed CLI
+      - name: Build sdist + wheel, verify sdist test suite & smoke-test installed CLI
         run: |
+          set -euo pipefail
           python3 -m build
+          mkdir -p /tmp/lkmp-sdist-check
+          tar -xzf dist/lkmp-*.tar.gz -C /tmp/lkmp-sdist-check
+          (
+            cd /tmp/lkmp-sdist-check/lkmp-*
+            python3 -m unittest discover -s tests -p "test_*.py"
+          )
           python3 -m venv /tmp/lkmp-wheel-venv
           /tmp/lkmp-wheel-venv/bin/pip install dist/*.whl
           /tmp/lkmp-wheel-venv/bin/lkmp --help >/dev/null
@@ -62,11 +74,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Run 133-test unit, driver & two-agent mTLS RPC suite
+      - name: Run full unit, audit reproduction, driver & two-agent mTLS RPC suite
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Run CLI live migration demo, fault injection, PKI & SOTA benchmark
         run: |
+          set -euo pipefail
           ./bin/lkmp demo --strategy auto --rss-mb 256 --dirty-mbps 40 --prometheus
           ./bin/lkmp demo --strategy pre-copy --inject-fault verify --prometheus
           ./bin/lkmp demo --strategy cold --inject-fault corrupt-image

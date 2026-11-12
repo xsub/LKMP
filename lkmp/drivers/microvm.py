@@ -209,8 +209,12 @@ class MicroVmDriver:
                 self._http(api_sock, "PUT", "/api/v1/vm.resume", None)
                 raise RuntimeError(f"Cloud-Hypervisor snapshot failed ({code2}): {body2}")
 
+        src_st = read_proc_starttime(config.pid, self.proc_root)
         state = {
             "driver": WorkloadKind.MICROVM.value,
+            "pid": config.pid,
+            "tree_pids": [config.pid],
+            "starttimes": {str(config.pid): src_st},
             "subkind": subkind,
             "control_socket": api_sock,
             "cmdline": cmdline,
@@ -271,6 +275,7 @@ class MicroVmDriver:
             "starttimes": {str(restored_pid): starttime},
             "workload_ip": config.workload_ip,
             "tcp_established": config.tcp_established,
+            "resumed": False,
         }
         (final_dir / "restore_state.json").write_text(json.dumps(restore_state, indent=2), encoding="utf-8")
         return {"restored_pid": restored_pid, "restored_starttime": starttime}
@@ -282,8 +287,41 @@ class MicroVmDriver:
         restored_pid: int,
         config: MigrationConfig,
     ) -> Dict[str, Any]:
-        _ = (migration_id, mig_dir, config)
+        _ = (migration_id, config)
+        state_file = mig_dir / "final" / "restore_state.json"
+        if state_file.exists():
+            try:
+                data = json.loads(state_file.read_text(encoding="utf-8"))
+                if data.get("resumed") is True:
+                    return {
+                        "healthy": False,
+                        "reason": f"Destination MicroVM PID {restored_pid} is already resumed",
+                    }
+            except Exception:
+                pass
         return {"healthy": True, "checked_pids": [restored_pid], "stopped_confirmed": True}
+
+    def verify_running_dest(
+        self,
+        migration_id: str,
+        mig_dir: Path,
+        restored_pid: int,
+        config: MigrationConfig,
+    ) -> Dict[str, Any]:
+        _ = (migration_id, config)
+        state_file = mig_dir / "final" / "restore_state.json"
+        if state_file.exists():
+            try:
+                data = json.loads(state_file.read_text(encoding="utf-8"))
+                if data.get("resumed") is False:
+                    return {
+                        "healthy": False,
+                        "still_stopped": True,
+                        "reason": f"Destination MicroVM PID {restored_pid} is still paused at 2PC barrier",
+                    }
+            except Exception:
+                pass
+        return {"healthy": True, "checked_pids": [restored_pid]}
 
     def resume_dest(
         self,
@@ -297,10 +335,11 @@ class MicroVmDriver:
         subkind, _src_sock, _cmd = self._resolve_microvm(config)
         state_file = mig_dir / "final" / "restore_state.json"
         dest_sock = ""
+        state_data: Dict[str, Any] = {}
         if state_file.exists():
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            dest_sock = str(data.get("dest_control_socket") or "")
-            subkind = str(data.get("subkind") or subkind)
+            state_data = json.loads(state_file.read_text(encoding="utf-8"))
+            dest_sock = str(state_data.get("dest_control_socket") or "")
+            subkind = str(state_data.get("subkind") or subkind)
 
         if subkind == "firecracker":
             code, body = self._http(dest_sock, "PATCH", "/vm", {"state": "Resumed"})
@@ -308,6 +347,12 @@ class MicroVmDriver:
             code, body = self._http(dest_sock, "PUT", "/api/v1/vm.resume", None)
         if code >= 300:
             raise RuntimeError(f"MicroVM resume failed ({code}): {body}")
+        if state_file.exists():
+            try:
+                state_data["resumed"] = True
+                state_file.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         return {"resumed_pid": restored_pid}
 
     def commit_source(
@@ -316,11 +361,29 @@ class MicroVmDriver:
         mig_dir: Path,
         config: MigrationConfig,
     ) -> Dict[str, Any]:
-        _ = (migration_id, mig_dir)
-        try:
-            os.kill(config.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        _ = migration_id
+        src_state_file = mig_dir / "source_state.json"
+        exp_st: Optional[int] = None
+        if src_state_file.exists():
+            try:
+                data = json.loads(src_state_file.read_text(encoding="utf-8"))
+                exp_st = (data.get("starttimes") or {}).get(str(config.pid))
+            except Exception:
+                pass
+        if exp_st is None and (config.runtime_metadata or {}).get("source_starttime") is not None:
+            exp_st = int(config.runtime_metadata["source_starttime"])
+
+        pid_reused = False
+        if exp_st is not None:
+            curr_st = read_proc_starttime(config.pid, self.proc_root)
+            if curr_st is not None and curr_st != exp_st:
+                pid_reused = True
+
+        if not pid_reused:
+            try:
+                os.kill(config.pid, signal.SIGKILL)
+            except OSError:
+                pass
         return {"committed": True, "driver": WorkloadKind.MICROVM.value}
 
     def rollback_dest(

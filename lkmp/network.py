@@ -459,6 +459,7 @@ class NetworkMobilityManager:
         self,
         workload_ip: Optional[str],
         migration_id: Optional[str] = None,
+        allow_loopback: bool = False,
     ) -> List[List[str]]:
         """
         Install an isolated, idempotent nftables drop rule for `workload_ip` so the kernel
@@ -472,13 +473,15 @@ class NetworkMobilityManager:
         addr = ipaddress.ip_address(bare_ip)
         addr_family = "ip6" if addr.version == 6 else "ip"
         table = self.table_name_for(workload_ip, migration_id)
+        in_lo = 'iifname != "lo" ' if allow_loopback else ""
+        out_lo = 'oifname != "lo" ' if allow_loopback else ""
         batch = (
             f"add table inet {table}; "
             f"flush table inet {table}; "
             f"add chain inet {table} input {{ type filter hook input priority -100; policy accept; }}; "
             f"add chain inet {table} output {{ type filter hook output priority -100; policy accept; }}; "
-            f"add rule inet {table} input {addr_family} daddr {bare_ip} drop; "
-            f"add rule inet {table} output {addr_family} saddr {bare_ip} drop;"
+            f"add rule inet {table} input {in_lo}{addr_family} daddr {bare_ip} drop; "
+            f"add rule inet {table} output {out_lo}{addr_family} saddr {bare_ip} drop;"
         )
         cmd = ["nft", batch]
         try:

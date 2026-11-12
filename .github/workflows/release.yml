@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build-and-release:
     name: Build Signed Artifacts & Publish Release
@@ -24,10 +28,17 @@ jobs:
 
       - name: Lint, test & build Python distribution packages
         run: |
+          set -euo pipefail
           python3 -m pip install --upgrade pip ruff build
           ruff check lkmp/ tests/ scripts/
           python3 -m unittest discover -s tests -p "test_*.py"
           python3 -m build
+          mkdir -p /tmp/lkmp-release-sdist-check
+          tar -xzf dist/lkmp-*.tar.gz -C /tmp/lkmp-release-sdist-check
+          (
+            cd /tmp/lkmp-release-sdist-check/lkmp-*
+            python3 -m unittest discover -s tests -p "test_*.py"
+          )
           (cd dist && sha256sum * > SHA256SUMS.txt)
           cat dist/SHA256SUMS.txt
 

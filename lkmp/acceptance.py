@@ -2054,11 +2054,16 @@ def run_acceptance_scenario(
                     orig_commit_source = harness.service_a.commit_source
                     transient_failure_injected = [True]
 
-                    def failing_commit_source(migration_id: str, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+                    def failing_commit_source(
+                        migration_id: str,
+                        config_dict: Dict[str, Any],
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> Dict[str, Any]:
                         if "m2" in migration_id and transient_failure_injected[0]:
                             transient_failure_injected[0] = False
                             raise RuntimeError("Injected transient RPC failure during Phase 2 commit_source on Member 2")
-                        return orig_commit_source(migration_id, config_dict)
+                        return orig_commit_source(migration_id, config_dict, *args, **kwargs)
 
                     harness.service_a.commit_source = failing_commit_source
 
@@ -2140,17 +2145,10 @@ def run_acceptance_scenario(
                     wal_file = wal_dir / f"{orch.migration_id}.wal.jsonl"
                     del orch
 
-                    # Recover from journal: brand-new controller recovers and terminates Source A via commit_source
+                    # Recover from journal: brand-new controller reconciles stopped Destination B,
+                    # terminates Source A via commit_source, wakes Destination B via claim_ip_and_resume,
+                    # and verifies Destination B is actively running!
                     mig_result = MigrationOrchestrator.recover_from_journal(wal_file, client_a, client_b)
-
-                    # Resume Destination B idempotently (completing claim_ip_and_resume)
-                    client_b.call(
-                        "claim_ip_and_resume",
-                        restored_pid=restored_pid,
-                        target_host=client_b.host,
-                        config_dict=config_to_dict(cfg),
-                        migration_id="mig-restart-11",
-                    )
 
                 elif injected_fault == "SAME_HOST_COW":
                     # Scenario 12: Same-Host Two-VM CoW Snapshot Fast Path via production orchestrator
@@ -2296,13 +2294,20 @@ def run_acceptance_scenario(
             limitations = (
                 "Proves multi-process tree stop/resume/kill, child pipe liveness, fsynced file offset continuity, "
                 "and single-writer fencing over a persistent AF_INET TCP socket via POSIX fork; kernel TCP_REPAIR "
-                "and userfaultfd page faults require Linux with CAP_SYS_ADMIN and real CRIU."
+                "and real CRIU userfaultfd lazy-pages page faulting require Linux with CAP_SYS_ADMIN and scripts/linux_criu_e2e.py."
             )
         else:
+            lazy_note = (
+                " Note: acceptance harness exercises CRIU --tcp-established over netns; full agent-to-agent "
+                "userfaultfd lazy-pages demand paging is validated end-to-end by scripts/linux_criu_e2e.py Scenario 5."
+                if strategy == MigrationStrategy.LAZY
+                else ""
+            )
             limitations = (
                 "Proves kernel TCP_REPAIR (criu --tcp-established over AF_INET SOCK_STREAM across isolated L2-bridged "
                 "network namespaces with tcp-stream-*.img), simultaneous stopped source + restored destination readiness, "
                 "in-place SIGCONT rollback of the original source task, and soft-dirty memory tracking under Linux CAP_SYS_ADMIN."
+                + lazy_note
             )
 
         guarantee_notes = (

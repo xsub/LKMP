@@ -537,7 +537,7 @@ class TestQmpClientAndQemu2PCDriver(unittest.TestCase):
                     pid_alive_checker=lambda _p: True,
                 )
 
-                # 1. Full 2PC QEMU Commit
+                # 1. Full 2PC QEMU Commit (explicit plaintext when tls.enabled=False)
                 cfg = MigrationConfig(
                     pid=5001,
                     source_addr="10.0.0.1:9440",
@@ -545,6 +545,7 @@ class TestQmpClientAndQemu2PCDriver(unittest.TestCase):
                     strategy=MigrationStrategy.PRE_COPY,
                     unsafe_bare=True,
                     journal_dir=str(root / "journals"),
+                    tls=TlsConfig(enabled=False),
                 )
                 orch = MigrationOrchestrator(
                     cfg,
@@ -577,6 +578,7 @@ class TestQmpClientAndQemu2PCDriver(unittest.TestCase):
                     unsafe_bare=True,
                     journal_dir=str(root / "journals"),
                     health_check_cmd="false",
+                    tls=TlsConfig(enabled=False),
                 )
                 svc_b_fail = AgentService(
                     work_dir=str(root / "work_b2"),
@@ -665,7 +667,6 @@ class TestOciAndMicroVm2PCDrivers(unittest.TestCase):
                 proc_root=str(proc_a),
                 oci_driver=oci_a,
                 net_manager=NetworkMobilityManager(runner=noop_runner),
-                fs_manager=FilesystemSyncManager(runner=noop_runner),
                 capabilities_override=caps,
                 pid_alive_checker=lambda _p: True,
             )
@@ -674,7 +675,6 @@ class TestOciAndMicroVm2PCDrivers(unittest.TestCase):
                 proc_root=str(proc_b),
                 oci_driver=oci_b,
                 net_manager=NetworkMobilityManager(runner=noop_runner),
-                fs_manager=FilesystemSyncManager(runner=noop_runner),
                 capabilities_override=caps,
                 pid_alive_checker=lambda _p: True,
             )
@@ -782,7 +782,6 @@ class TestOciAndMicroVm2PCDrivers(unittest.TestCase):
                 proc_root=str(proc_a),
                 microvm_driver=mvm_a,
                 net_manager=NetworkMobilityManager(runner=noop_runner),
-                fs_manager=FilesystemSyncManager(runner=noop_runner),
                 capabilities_override=caps,
                 pid_alive_checker=lambda _p: True,
             )
@@ -791,7 +790,6 @@ class TestOciAndMicroVm2PCDrivers(unittest.TestCase):
                 proc_root=str(proc_b),
                 microvm_driver=mvm_b,
                 net_manager=NetworkMobilityManager(runner=noop_runner),
-                fs_manager=FilesystemSyncManager(runner=noop_runner),
                 capabilities_override=caps,
                 pid_alive_checker=lambda _p: True,
             )

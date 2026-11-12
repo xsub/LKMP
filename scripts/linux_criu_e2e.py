@@ -12,6 +12,7 @@ Executes real CRIU operations on Linux hosts (e.g., Ubuntu 24.04 in CI):
    - Scenario A (REAL_CRIU COLD): criu dump --leave-stopped, .img verification, kill source, criu restore --restore-detached.
    - Scenario B (REAL_CRIU PRE_COPY): criu page-server --daemon, criu pre-dump, criu dump --page-server, verify pages-*.img.
    - Scenario C (REAL_CRIU LAZY): supervised background criu dump --lazy-pages, criu lazy-pages via Popen, criu restore --lazy-pages.
+   - Scenario D (AGENT_ORCHESTRATOR LAZY): real agent-to-agent mTLS 2PC MigrationOrchestrator(strategy=LAZY) with 4 MiB mmap userfaultfd verification and durable source tombstone validation.
 5. Emits structured Markdown table & JSON summary without failing the run if kernel restricts specific features.
 """
 
@@ -21,6 +22,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import mmap
 import os
 import platform
 import select
@@ -34,6 +36,21 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from lkmp.agent import AgentClient  # noqa: E402
+from lkmp.config import (  # noqa: E402
+    FilesystemMode,
+    IpMobilityMode,
+    MigrationConfig,
+    MigrationStrategy,
+    TlsConfig,
+)
+from lkmp.orchestrator import MigrationOrchestrator  # noqa: E402
+from lkmp.pki import generate_mtls_pki  # noqa: E402
 
 
 DEFAULT_PRNG_SEED: int = 0xCAFEBABE12345678
@@ -165,6 +182,84 @@ def _run_workload_child(child_idx: int, p2c_r: int, c2p_w: int) -> None:
             break
 
 
+def run_lazy_mmap_worker(work_dir: Path) -> None:
+    """Daemonized stateful worker holding a 4 MiB anonymous mmap buffer for LAZY userfaultfd E2E."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    os.chdir("/")
+    devnull = os.open("/dev/null", os.O_RDWR)
+    for target_fd in (0, 1, 2):
+        try:
+            os.dup2(devnull, target_fd)
+        except OSError:
+            pass
+    try:
+        os.closerange(3, 1024)
+    except OSError:
+        pass
+
+    pid = os.getpid()
+    (work_dir / "worker.pid").write_text(f"{pid}\n", encoding="utf-8")
+
+    # Populate 4 MiB (1024 x 4 KiB pages) of deterministic high-entropy anonymous RAM
+    mmap_size = 4 * 1024 * 1024
+    mem = mmap.mmap(-1, mmap_size)
+    offset = 0
+    for page_idx in range(mmap_size // 4096):
+        seed_block = hashlib.sha256(f"lkmp-lazy-page-{page_idx}".encode("utf-8")).digest() * 128
+        mem[offset : offset + 4096] = seed_block
+        offset += 4096
+    expected_sha = hashlib.sha256(mem[:]).hexdigest()
+    (work_dir / "expected_mmap.sha256").write_text(f"{expected_sha}\n", encoding="utf-8")
+
+    log_path = work_dir / "state.log"
+    fd = os.open(str(log_path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+
+    running = True
+
+    def _stop(_sig: int, _frame: Any) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    counter = 0
+    prng = DEFAULT_PRNG_SEED
+    trigger_path = work_dir / "verify_mmap.trigger"
+    verified_path = work_dir / "verified_mmap.json"
+    (work_dir / "ready.txt").write_text(f"READY {pid}\n", encoding="utf-8")
+
+    try:
+        while running:
+            counter += 1
+            prng = step_xorshift64star(prng)
+            line = f"{counter} {prng:016x} pid={os.getpid()}\n".encode("utf-8")
+            os.write(fd, line)
+            os.fsync(fd)
+            if trigger_path.exists() and not verified_path.exists():
+                actual_sha = hashlib.sha256(mem[:]).hexdigest()
+                tmp_v = work_dir / ".verified_mmap.json.tmp"
+                tmp_v.write_text(
+                    json.dumps({"pid": os.getpid(), "sha256": actual_sha, "counter": counter}),
+                    encoding="utf-8",
+                )
+                os.replace(tmp_v, verified_path)
+            time.sleep(0.05)
+    finally:
+        try:
+            mem.close()
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        os._exit(0)
+
+
 # -----------------------------------------------------------------------------
 # Command Execution & Logging Helpers
 # -----------------------------------------------------------------------------
@@ -266,7 +361,12 @@ def cleanup_stale_criu_processes() -> None:
             continue
         try:
             cmdline = (proc_entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
-            if ("criu page-server" in cmdline or "criu lazy-pages" in cmdline or "--run-workload" in cmdline):
+            if (
+                "criu page-server" in cmdline
+                or "criu lazy-pages" in cmdline
+                or "--run-workload" in cmdline
+                or "--run-lazy-worker" in cmdline
+            ):
                 os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
@@ -353,6 +453,153 @@ def kill_process_tree(root_pid: int, workload_dir: Optional[Path] = None) -> Non
         except ChildProcessError:
             pass
     time.sleep(0.1)
+
+
+def _verify_prng_log(log_path: Path) -> Tuple[bool, int, str]:
+    """Verify monotonic counter and unbroken xorshift64* PRNG sequence across cutover."""
+    if not log_path.exists():
+        return False, 0, "state.log missing"
+    lines = [ln.strip() for ln in log_path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+    if not lines:
+        return False, 0, "state.log empty"
+    expected_counter = 0
+    prng = DEFAULT_PRNG_SEED
+    for idx, ln in enumerate(lines):
+        parts = ln.split()
+        if len(parts) < 2:
+            return False, idx, f"Malformed record at line {idx + 1}: {ln!r}"
+        expected_counter += 1
+        prng = step_xorshift64star(prng)
+        cnt = int(parts[0])
+        got_hex = parts[1].lower()
+        exp_hex = f"{prng:016x}"
+        if cnt != expected_counter or got_hex != exp_hex:
+            return (
+                False,
+                idx,
+                f"Sequence break at line {idx + 1}: got=({cnt}, {got_hex}), expected=({expected_counter}, {exp_hex})",
+            )
+    return True, len(lines), "OK"
+
+
+class IsolatedCriuHostAgent:
+    """Runs an `lkmp agent` daemon inside an isolated PID + Mount namespace (`unshare --pid --fork --mount-proc`)."""
+
+    def __init__(self, name: str, base_dir: Path, tls: TlsConfig) -> None:
+        self.name = name
+        self.host_dir = base_dir / name
+        self.work_dir = self.host_dir / "work"
+        self.log_file = self.host_dir / "agent.log"
+        self.host_dir.mkdir(parents=True, exist_ok=True)
+        self.port = get_free_port()
+        self.address = f"127.0.0.1:{self.port}"
+        self.tls = tls
+        self.proc: Optional[subprocess.Popen] = None
+        self.ns_init_host_pid: Optional[int] = None
+
+    def start(self) -> None:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        cmd = [
+            "unshare",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "--mount",
+            "--",
+            sys.executable,
+            "-m",
+            "lkmp.cli",
+            "agent",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.port),
+            "--work-dir",
+            str(self.work_dir),
+            "--tls-ca",
+            str(self.tls.ca_cert),
+            "--tls-cert",
+            str(self.tls.cert_file),
+            "--tls-key",
+            str(self.tls.key_file),
+        ]
+        log_fh = open(self.log_file, "w", encoding="utf-8")
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=log_fh,
+                stderr=log_fh,
+                env=env,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                break
+            children_file = Path(f"/proc/{self.proc.pid}/task/{self.proc.pid}/children")
+            if children_file.exists():
+                raw = children_file.read_text(encoding="utf-8").strip().split()
+                if raw:
+                    self.ns_init_host_pid = int(raw[0])
+            try:
+                with AgentClient(self.address, tls=self.tls, timeout_sec=2.0) as cli:
+                    hc = cli.call("health_check")
+                    if hc.get("status") == "ok" and self.ns_init_host_pid is not None:
+                        return
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+        excerpt = self.log_file.read_text(encoding="utf-8", errors="ignore")[-800:] if self.log_file.exists() else ""
+        raise RuntimeError(f"Agent {self.name} failed to start on {self.address}: {excerpt}")
+
+    def ns_exec_daemon(self, cmd: List[str]) -> subprocess.CompletedProcess:
+        assert self.ns_init_host_pid is not None
+        full = [
+            "nsenter",
+            "-t",
+            str(self.ns_init_host_pid),
+            "--pid",
+            "--mount",
+            "--",
+            *cmd,
+        ]
+        return subprocess.run(full, check=True, text=True, capture_output=True)
+
+    def is_ns_pid_alive(self, ns_pid: int) -> bool:
+        assert self.ns_init_host_pid is not None
+        res = subprocess.run(
+            [
+                "nsenter",
+                "-t",
+                str(self.ns_init_host_pid),
+                "--pid",
+                "--mount",
+                "--",
+                "sh",
+                "-c",
+                f"test -d /proc/{int(ns_pid)} && ! grep -q '^State:.*Z' /proc/{int(ns_pid)}/status",
+            ],
+            capture_output=True,
+        )
+        return res.returncode == 0
+
+    def stop(self) -> None:
+        if self.ns_init_host_pid is not None:
+            try:
+                os.kill(self.ns_init_host_pid, signal.SIGKILL)
+            except OSError:
+                pass
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=3.0)
+            except Exception:
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -1016,6 +1263,196 @@ class LinuxCriuE2ERunner:
 
         return report
 
+    def run_scenario_d_agent_orchestrator_lazy(self) -> ScenarioReport:
+        """
+        Scenario D (Agent-to-Agent 2PC LAZY Migration):
+        Spawns two isolated `lkmp agent` daemons (`Host A` & `Host B`) with mTLS PKI, launches a
+        daemonized worker holding a 4 MiB anonymous `mmap` buffer inside `Host A`, executes
+        `MigrationOrchestrator(strategy=LAZY, wipe_images_on_commit=True).execute()`, forces on-demand
+        userfaultfd page faults across all 1024 pages on `Host B`, and verifies SHA-256 memory integrity,
+        PRNG continuity, source reaping, and durable source tombstone persistence.
+        """
+        report = ScenarioReport(
+            name="Scenario D: Agent-to-Agent mTLS 2PC LAZY Migration (MigrationOrchestrator + userfaultfd)",
+            status="PASS",
+            details="Full two-agent mTLS MigrationOrchestrator(strategy=LAZY) cutover + 4 MiB mmap SHA-256 verification",
+        )
+
+        if not self.is_linux or not self.criu_available:
+            report.status = "SKIPPED"
+            report.details = "Host is not Linux or criu binary is not found in PATH"
+            return report
+
+        uffd_chk = run_cmd([self.criu_bin, "check", "--extra"])
+        report.commands.append(uffd_chk)
+        if "uffd-noncoop" in uffd_chk.stderr and "FAIL" in uffd_chk.stderr:
+            report.status = "SKIPPED"
+            report.details = "Kernel lacks uffd-noncoop userfaultfd support"
+            report.error_log = uffd_chk.stderr
+            return report
+
+        scenario_dir = self.base_dir / "scenario_d"
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        pki = generate_mtls_pki(
+            out_dir=scenario_dir / "pki",
+            hosts=("127.0.0.1", "localhost"),
+            validity_days=1,
+            overwrite=True,
+        )
+        tls = TlsConfig(
+            enabled=True,
+            ca_cert=str(pki.ca_cert),
+            cert_file=str(pki.node_cert),
+            key_file=str(pki.node_key),
+        )
+
+        host_a = IsolatedCriuHostAgent("host_a", scenario_dir, tls)
+        host_b = IsolatedCriuHostAgent("host_b", scenario_dir, tls)
+        worker_dir = scenario_dir / "lazy_worker"
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        journal_dir = scenario_dir / "journals"
+        journal_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            host_a.start()
+            host_b.start()
+
+            host_a.ns_exec_daemon(
+                [sys.executable, str(Path(__file__).resolve()), "--run-lazy-worker", str(worker_dir)]
+            )
+
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if (worker_dir / "ready.txt").exists() and (worker_dir / "expected_mmap.sha256").exists():
+                    break
+                time.sleep(0.05)
+            else:
+                report.status = "FAIL"
+                report.details = "Lazy worker failed to initialize inside Host A namespace"
+                return report
+
+            src_pid = int((worker_dir / "worker.pid").read_text(encoding="utf-8").strip())
+            expected_sha = (worker_dir / "expected_mmap.sha256").read_text(encoding="utf-8").strip()
+
+            # Allow worker to emit at least 5 pre-migration records
+            time.sleep(0.35)
+
+            lazy_port = get_free_port()
+            mig_id = "e2e-lazy-2pc"
+            cfg = MigrationConfig(
+                pid=src_pid,
+                source_addr=host_a.address,
+                dest_addr=host_b.address,
+                strategy=MigrationStrategy.LAZY,
+                fs_mode=FilesystemMode.SHARED,
+                writable_paths=[str(worker_dir)],
+                ip_mobility=IpMobilityMode.NONE,
+                tcp_established=False,
+                unsafe_bare=True,
+                lazy_pages_port=lazy_port,
+                lazy_transfer_timeout_sec=20.0,
+                same_host_cow=False,
+                prefer_tmpfs_work_dir=False,
+                wipe_images_on_commit=True,
+                journal_dir=str(journal_dir),
+                tls=tls,
+            )
+
+            with AgentClient(host_a.address, tls=tls, timeout_sec=30.0) as src_cli, AgentClient(
+                host_b.address, tls=tls, timeout_sec=30.0
+            ) as dst_cli:
+                orch = MigrationOrchestrator(
+                    cfg,
+                    src_cli,
+                    dst_cli,
+                    migration_id=mig_id,
+                    require_persistent_journal=False,
+                )
+                res = orch.execute()
+
+            if not res.success or res.restored_pid is None:
+                err_msg = (res.error_message or "").lower()
+                log_tail = ""
+                for candidate_log in (
+                    host_a.log_file,
+                    host_b.log_file,
+                    host_b.work_dir / mig_id / "final" / "lazy-pages.log",
+                    host_a.work_dir / mig_id / "final" / "lazy-dump.log",
+                ):
+                    if candidate_log.exists():
+                        log_tail += f"\n--- {candidate_log.name} ---\n" + candidate_log.read_text(
+                            encoding="utf-8", errors="ignore"
+                        )[-500:]
+                combined_err = (err_msg + " " + log_tail.lower())
+                if ("userfaultfd" in combined_err or "uffd" in combined_err) and (
+                    "operation not permitted" in combined_err
+                    or "permission denied" in combined_err
+                    or "function not implemented" in combined_err
+                ):
+                    report.status = "SKIPPED"
+                    report.details = "Kernel restricted userfaultfd syscall in runner environment"
+                    report.error_log = (res.error_message or "") + log_tail
+                    return report
+                report.status = "FAIL"
+                report.details = f"MigrationOrchestrator(LAZY) failed: {res.error_message}"
+                report.error_log = log_tail
+                return report
+
+            # Trigger reading all 4 MiB (1024 pages) on Destination Host B
+            (worker_dir / "verify_mmap.trigger").write_text("1\n", encoding="utf-8")
+            verified_path = worker_dir / "verified_mmap.json"
+            v_deadline = time.monotonic() + 8.0
+            while time.monotonic() < v_deadline and not verified_path.exists():
+                time.sleep(0.05)
+
+            if not verified_path.exists():
+                report.status = "FAIL"
+                report.details = "Restored LAZY worker on Host B did not complete 4 MiB mmap verification"
+                return report
+
+            verified_payload = json.loads(verified_path.read_text(encoding="utf-8"))
+            if verified_payload.get("sha256") != expected_sha:
+                report.status = "FAIL"
+                report.details = (
+                    f"4 MiB mmap SHA-256 mismatch after LAZY migration: "
+                    f"got {verified_payload.get('sha256')}, expected {expected_sha}"
+                )
+                return report
+
+            if host_a.is_ns_pid_alive(src_pid):
+                report.status = "FAIL"
+                report.details = f"Source PID {src_pid} still alive on Host A after LAZY commit"
+                return report
+            if not host_b.is_ns_pid_alive(int(res.restored_pid)):
+                report.status = "FAIL"
+                report.details = f"Restored PID {res.restored_pid} not alive on Host B"
+                return report
+
+            tombstone = host_a.work_dir / ".tombstones" / f"{mig_id}.source.json"
+            if not tombstone.exists():
+                report.status = "FAIL"
+                report.details = "Durable source tombstone missing after wipe_images_on_commit=True"
+                return report
+
+            ok_seq, total_records, seq_msg = _verify_prng_log(worker_dir / "state.log")
+            if not ok_seq:
+                report.status = "FAIL"
+                report.details = f"PRNG state.log sequence error: {seq_msg}"
+                return report
+
+            report.artifacts_verified.extend(
+                [
+                    f"MigrationOrchestrator(LAZY) committed (B PID {res.restored_pid}, freeze={res.freeze_downtime_ms} ms)",
+                    f"4 MiB (1024 pages) mmap SHA-256 verified ({expected_sha[:16]}...)",
+                    f"Unbroken xorshift64* sequence ({total_records} records) & durable source tombstone verified",
+                ]
+            )
+        finally:
+            host_a.stop()
+            host_b.stop()
+
+        return report
+
     def run_all(self) -> Dict[str, Any]:
         """Execute full suite and compile summary reports."""
         if self.is_linux:
@@ -1026,6 +1463,7 @@ class LinuxCriuE2ERunner:
         self.reports["scenario_a"] = self.run_scenario_a_cold()
         self.reports["scenario_b"] = self.run_scenario_b_pre_copy()
         self.reports["scenario_c"] = self.run_scenario_c_lazy()
+        self.reports["scenario_d"] = self.run_scenario_d_agent_orchestrator_lazy()
 
         return self.compile_results()
 
@@ -1107,6 +1545,10 @@ def main() -> int:
         help="Internal flag: run the multi-process stateful workload in the specified directory",
     )
     parser.add_argument(
+        "--run-lazy-worker",
+        help="Internal flag: run the daemonized 4 MiB mmap lazy worker in the specified directory",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output JSON summary only",
@@ -1115,6 +1557,9 @@ def main() -> int:
 
     if args.run_workload:
         run_workload_root(Path(args.run_workload))
+        return 0
+    if args.run_lazy_worker:
+        run_lazy_mmap_worker(Path(args.run_lazy_worker))
         return 0
 
     runner = LinuxCriuE2ERunner()

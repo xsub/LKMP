@@ -132,6 +132,7 @@ class MigrationConfig:
     work_dir: str = "/var/lib/lkmp/migrations"
     page_server_port: int = 27000
     lazy_pages_port: int = 27001
+    lazy_transfer_timeout_sec: float = 30.0
     ghost_limit_bytes: int = 64 * 1024 * 1024  # 64 MiB
     ext_unix_sk: bool = False
     external_mounts: List[str] = field(default_factory=list)

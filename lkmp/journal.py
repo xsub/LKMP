@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -233,10 +234,34 @@ class MigrationJournal:
             entry.checksum = _compute_entry_checksum(raw_dict)
             raw_dict["checksum"] = entry.checksum
             line = (json.dumps(raw_dict) + "\n").encode("utf-8")
-            fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT, 0o600)
+            start_offset = 0
             try:
-                os.write(fd, line)
+                start_offset = os.lseek(fd, 0, os.SEEK_END)
+                total_len = len(line)
+                offset = 0
+                while offset < total_len:
+                    written = os.write(fd, line[offset:])
+                    if written <= 0:
+                        raise OSError(
+                            errno.EIO,
+                            f"Short/stalled WAL write ({offset}/{total_len} bytes written)",
+                        )
+                    offset += written
+                actual_end = os.fstat(fd).st_size
+                if actual_end < start_offset + total_len:
+                    raise OSError(
+                        errno.EIO,
+                        f"Incomplete WAL write on disk (size={actual_end}, expected={start_offset + total_len})",
+                    )
                 os.fsync(fd)
+            except BaseException:
+                try:
+                    os.ftruncate(fd, start_offset)
+                    os.fsync(fd)
+                except OSError:
+                    pass
+                raise
             finally:
                 os.close(fd)
             if created_new:
@@ -385,7 +410,7 @@ class MigrationJournal:
 
     @property
     def expected_member_configs(self) -> Optional[List[Dict[str, Any]]]:
-        for e in self.entries:
+        for e in reversed(self.entries):
             if e.member_configs:
                 return list(e.member_configs)
         return None
@@ -396,8 +421,16 @@ class MigrationJournal:
 
     @property
     def has_committed_decision(self) -> bool:
-        """Return True if the WAL recorded an irrevocable COMMITTED decision."""
-        return any(e.commit_decision == "COMMITTED" for e in self.entries)
+        """Return True if the WAL recorded an irrevocable COMMIT_DECIDED or COMMITTED decision."""
+        return any(e.commit_decision in ("COMMIT_DECIDED", "COMMITTED") for e in self.entries)
+
+    @property
+    def has_confirmed_commit(self) -> bool:
+        """Return True if destination execution and commit completion were durably confirmed."""
+        return any(
+            e.commit_decision == "COMMITTED" and e.state == MigrationState.COMMIT.value
+            for e in self.entries
+        )
 
     @property
     def has_rolled_back_decision(self) -> bool:
@@ -407,6 +440,14 @@ class MigrationJournal:
     @property
     def initial_config_dict(self) -> Optional[Dict[str, Any]]:
         for e in self.entries:
+            if e.config_dict is not None:
+                return e.config_dict
+        return None
+
+    @property
+    def effective_config_dict(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent persisted execution plan (`config_dict`) in the WAL."""
+        for e in reversed(self.entries):
             if e.config_dict is not None:
                 return e.config_dict
         return None

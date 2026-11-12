@@ -47,6 +47,7 @@ from lkmp.config import (  # noqa: E402
 from lkmp.drivers.qemu_qmp import build_migratable_qemu_command, qmp_call  # noqa: E402
 from lkmp.gang import GangMigrationCoordinator  # noqa: E402
 from lkmp.orchestrator import MigrationOrchestrator  # noqa: E402
+from lkmp.pki import generate_mtls_pki as _generate_pki_bundle  # noqa: E402
 
 DEFAULT_PRNG_SEED = 0xCAFEBABE12345678
 
@@ -118,82 +119,18 @@ def get_free_port() -> int:
 
 
 def generate_mtls_pki(pki_dir: Path) -> TlsConfig:
-    """Generate ephemeral X.509 CA and localhost mTLS certificate/key pair using `openssl`."""
-    pki_dir.mkdir(parents=True, exist_ok=True)
-    ca_key = pki_dir / "ca.key"
-    ca_crt = pki_dir / "ca.crt"
-    node_key = pki_dir / "node.key"
-    node_csr = pki_dir / "node.csr"
-    node_crt = pki_dir / "node.crt"
-    ext_cfg = pki_dir / "ext.cnf"
-    ext_cfg.write_text(
-        "subjectAltName = IP:127.0.0.1,DNS:localhost\nextendedKeyUsage = serverAuth,clientAuth\n",
-        encoding="utf-8",
-    )
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            str(ca_key),
-            "-out",
-            str(ca_crt),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=lkmp-e2e-ca",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            str(node_key),
-            "-out",
-            str(node_csr),
-            "-subj",
-            "/CN=localhost",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [
-            "openssl",
-            "x509",
-            "-req",
-            "-in",
-            str(node_csr),
-            "-CA",
-            str(ca_crt),
-            "-CAkey",
-            str(ca_key),
-            "-CAcreateserial",
-            "-out",
-            str(node_crt),
-            "-days",
-            "1",
-            "-extfile",
-            str(ext_cfg),
-        ],
-        check=True,
-        capture_output=True,
+    """Generate GnuTLS + OpenSSL X.509 v3 CA and localhost mTLS certificate/key pair."""
+    bundle = _generate_pki_bundle(
+        out_dir=pki_dir,
+        hosts=("127.0.0.1", "localhost"),
+        validity_days=1,
+        overwrite=True,
     )
     return TlsConfig(
         enabled=True,
-        ca_cert=str(ca_crt),
-        cert_file=str(node_crt),
-        key_file=str(node_key),
+        ca_cert=str(bundle.ca_cert),
+        cert_file=str(bundle.node_cert),
+        key_file=str(bundle.node_key),
     )
 
 
@@ -511,10 +448,14 @@ def run_suite() -> Dict[str, Any]:
                 cleanup_globs.append(dest_qmp_b)
                 st_b = qmp_call(dest_qmp_b, "query-status", timeout_sec=3.0)
                 assert st_b.get("running") is True and st_b.get("status") == "running", f"Bad QMP status on B: {st_b}"
+                mig_params_b = qmp_call(dest_qmp_b, "query-migrate-parameters", timeout_sec=3.0)
+                assert mig_params_b.get("tls-creds") == "lkmp_tls0", (
+                    f"Expected QEMU data-plane mTLS tls-creds='lkmp_tls0', got {mig_params_b}"
+                )
 
                 results.append(
                     E2EScenarioResult(
-                        name="Scenario 1: Real QEMU Live QMP 2PC Migration (Host A -> Host B)",
+                        name="Scenario 1: Real QEMU Live QMP 2PC Migration over mTLS (Host A -> Host B)",
                         passed=True,
                         duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
                         metrics={
@@ -523,6 +464,7 @@ def run_suite() -> Dict[str, Any]:
                             "freeze_downtime_ms": res1.freeze_downtime_ms,
                             "total_duration_ms": res1.total_duration_ms,
                             "mtls_connections_opened_per_agent": cli_a.connections_opened,
+                            "qemu_data_plane_tls_creds": mig_params_b.get("tls-creds"),
                             "dest_qmp_status": st_b,
                         },
                     )

@@ -1,0 +1,10 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include MANIFEST.in
+graft bin
+graft scripts
+graft tests
+graft deploy
+graft docs/assets
+global-exclude __pycache__ *.py[cod] .DS_Store

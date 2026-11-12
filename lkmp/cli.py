@@ -850,7 +850,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             f"(expected full gang {expected_member_ids})"
                         )
                     mj = MigrationJournal.load(mf)
-                    cfg_raw = mj.initial_config_dict or (
+                    cfg_raw = mj.effective_config_dict or (
                         expected_configs[idx] if idx < len(expected_configs) else None
                     )
                 if cfg_raw:
