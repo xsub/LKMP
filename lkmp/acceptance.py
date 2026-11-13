@@ -352,6 +352,8 @@ class DeterministicWorkloadService:
         ready_r, ready_w = os.pipe()
         self.state_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.eff_pid_path.write_text("0\n", encoding="utf-8")
+        if sys.platform == "darwin":
+            os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 
         root_pid = os.fork()
         if root_pid == 0:
@@ -792,13 +794,15 @@ class DeterministicWorkloadService:
                 os.write(self._ctrl_p2c_w, b"STOP\n")
             except OSError:
                 pass
-        if self.root_pid is not None:
+        if self.root_pid is not None and self.root_pid > 0:
             try:
                 os.kill(self.root_pid, signal.SIGKILL)
                 os.waitpid(self.root_pid, 0)
             except OSError:
                 pass
         for cp in self.children_pids:
+            if cp <= 0:
+                continue
             try:
                 os.kill(cp, signal.SIGKILL)
                 os.waitpid(cp, 0)
