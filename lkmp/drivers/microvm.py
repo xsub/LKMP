@@ -78,10 +78,17 @@ class MicroVmDriver:
         proc_root: str = "/proc",
         http_caller: Optional[Callable[[str, str, str, Optional[Dict[str, Any]]], Tuple[int, str]]] = None,
         runner: Optional[CommandRunner] = None,
+        signal_sender: Optional[Callable[[int, int], None]] = None,
     ) -> None:
         self.proc_root = proc_root
         self._http = http_caller or self._default_http
         self.runner = runner or _default_runner
+        if signal_sender is not None:
+            self._send_signal: Callable[[int, int], None] = signal_sender
+        elif self.proc_root == "/proc":
+            self._send_signal = os.kill
+        else:
+            self._send_signal = lambda _pid, _sig: None
 
     @staticmethod
     def _default_http(
@@ -381,7 +388,7 @@ class MicroVmDriver:
 
         if not pid_reused:
             try:
-                os.kill(config.pid, signal.SIGKILL)
+                self._send_signal(config.pid, signal.SIGKILL)
             except OSError:
                 pass
         return {"committed": True, "driver": WorkloadKind.MICROVM.value}
@@ -396,7 +403,7 @@ class MicroVmDriver:
         _ = (migration_id, mig_dir, config)
         if restored_pid is not None:
             try:
-                os.kill(int(restored_pid), signal.SIGKILL)
+                self._send_signal(int(restored_pid), signal.SIGKILL)
             except OSError:
                 pass
         return {"rolled_back_dest": True, "errors": []}

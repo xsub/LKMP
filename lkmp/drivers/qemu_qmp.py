@@ -288,10 +288,17 @@ class QemuQmpDriver:
         proc_root: str = "/proc",
         qmp_caller: Optional[Callable[[str, str, Optional[Dict[str, Any]]], Any]] = None,
         spawner: Optional[Callable[[List[str]], subprocess.CompletedProcess]] = None,
+        signal_sender: Optional[Callable[[int, int], None]] = None,
     ) -> None:
         self.proc_root = proc_root
         self._qmp_call = qmp_caller or self._default_qmp_call
         self._spawn = spawner or self._default_spawn
+        if signal_sender is not None:
+            self._send_signal: Callable[[int, int], None] = signal_sender
+        elif self.proc_root == "/proc":
+            self._send_signal = os.kill
+        else:
+            self._send_signal = lambda _pid, _sig: None
         self._started_migrations: set[str] = set()
 
     @staticmethod
@@ -539,7 +546,7 @@ class QemuQmpDriver:
             except Exception:
                 pass
             try:
-                os.kill(standby_pid, signal.SIGKILL)
+                self._send_signal(standby_pid, signal.SIGKILL)
             except OSError:
                 pass
             self._cleanup_tls_dirs(mig_dir)
@@ -900,10 +907,10 @@ class QemuQmpDriver:
                 pass
         if not pid_reused:
             try:
-                os.kill(config.pid, signal.SIGKILL)
+                self._send_signal(config.pid, signal.SIGKILL)
             except OSError:
                 pass
-            if self.proc_root == "/proc" and getattr(os.kill, "__module__", "") == "posix":
+            if self.proc_root == "/proc" and self._send_signal is os.kill:
                 stat_path = Path(f"/proc/{config.pid}/stat")
                 deadline = time.monotonic() + 1.0
                 while time.monotonic() < deadline:
@@ -959,7 +966,7 @@ class QemuQmpDriver:
             curr_st = read_proc_starttime(int(target_pid), self.proc_root)
             if exp_st is None or curr_st is None or curr_st == exp_st:
                 try:
-                    os.kill(int(target_pid), signal.SIGKILL)
+                    self._send_signal(int(target_pid), signal.SIGKILL)
                 except OSError:
                     pass
         if dest_sock.exists():

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import errno
+import functools
 import json
 import os
 import secrets
@@ -89,6 +90,23 @@ IDEMPOTENT_READ_METHODS = frozenset(
     }
 )
 
+@functools.lru_cache(maxsize=4)
+def _probe_qemu_version(qpath: str) -> str:
+    try:
+        qres = subprocess.run(
+            [qpath, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if qres.stdout:
+            return qres.stdout.splitlines()[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
 # Safe HostCapabilities from_dict wrapper accepting extra fields (criu_check_extra_ok, etc.)
 _orig_hc_from_dict = HostCapabilities.from_dict
 
@@ -159,10 +177,21 @@ class AgentService:
         self.fs = fs_manager or FilesystemSyncManager()
         self.envelope = envelope_manager or EnvelopeManager()
         self.attestor = attestor or CheckpointAttestor()
-        self.qemu_driver = qemu_driver or QemuQmpDriver(proc_root=self.proc_root)
+        if signal_sender is not None:
+            self._send_signal: Callable[[int, int], None] = signal_sender
+        elif self.proc_root == "/proc":
+            self._send_signal = os.kill
+        else:
+            self._send_signal = lambda _pid, _sig: None
+        self.qemu_driver = qemu_driver or QemuQmpDriver(
+            proc_root=self.proc_root,
+            signal_sender=self._send_signal,
+        )
         self.oci_driver = oci_driver or OciContainerDriver(proc_root=self.proc_root)
-        self.microvm_driver = microvm_driver or MicroVmDriver(proc_root=self.proc_root)
-        self._send_signal = signal_sender or os.kill
+        self.microvm_driver = microvm_driver or MicroVmDriver(
+            proc_root=self.proc_root,
+            signal_sender=self._send_signal,
+        )
         self._check_pid_alive = pid_alive_checker or self._default_pid_alive
         self._tcp_repair_handler = tcp_repair_handler
         self._instance_id = secrets.token_hex(16)
@@ -281,6 +310,8 @@ class AgentService:
         proc_entry = Path(self.proc_root) / str(pid)
         if proc_entry.exists():
             return True
+        if self.proc_root != "/proc":
+            return False
         try:
             os.kill(pid, 0)
             return True
@@ -483,18 +514,9 @@ class AgentService:
             qpath = shutil.which(qbin)
             if qpath:
                 caps.qemu_available = True
-                try:
-                    qres = subprocess.run(
-                        [qpath, "--version"],
-                        capture_output=True,
-                        text=True,
-                        timeout=2.0,
-                        check=False,
-                    )
-                    if qres.stdout:
-                        caps.qemu_version = qres.stdout.splitlines()[0].strip()
-                except Exception:
-                    pass
+                qver = _probe_qemu_version(qpath)
+                if qver:
+                    caps.qemu_version = qver
                 break
 
         caps.podman_available = bool(shutil.which("podman"))
