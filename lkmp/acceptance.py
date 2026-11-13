@@ -415,17 +415,17 @@ class DeterministicWorkloadService:
 
     def _run_root_process(self, ctrl_r: Optional[int], ctrl_w: Optional[int], ready_w: int) -> None:
         """Body of the root service process running in its own OS process."""
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        devnull_fd = os.open(os.devnull, os.O_RDWR)
+        for std_fd in (0, 1, 2):
+            if devnull_fd != std_fd:
+                os.dup2(devnull_fd, std_fd)
+        if devnull_fd > 2:
+            os.close(devnull_fd)
         if self.use_real_criu:
-            try:
-                os.setsid()
-            except OSError:
-                pass
-            devnull_fd = os.open(os.devnull, os.O_RDWR)
-            for std_fd in (0, 1, 2):
-                if devnull_fd != std_fd:
-                    os.dup2(devnull_fd, std_fd)
-            if devnull_fd > 2:
-                os.close(devnull_fd)
             keep_fds = {0, 1, 2, ready_w}
             if self.stream_sock is not None:
                 keep_fds.add(self.stream_sock.fileno())

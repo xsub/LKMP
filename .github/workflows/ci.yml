@@ -82,10 +82,44 @@ jobs:
           OBJC_DISABLE_INITIALIZE_FORK_SAFETY: "YES"
         run: |
           set -euo pipefail
-          for tf in tests/test_*.py; do
-            echo "=== Running ${tf} ==="
-            python3 -u -m unittest "${tf}" -v
-          done
+          python3 -u - <<'PY'
+          import glob, os, signal, subprocess, sys, time
+          failed = False
+          for tf in sorted(glob.glob("tests/test_*.py")):
+              t0 = time.monotonic()
+              print(f"=== Running {tf} ===", flush=True)
+              proc = subprocess.Popen(
+                  [sys.executable, "-X", "faulthandler", "-u", "-m", "unittest", tf, "-v"],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  start_new_session=True,
+              )
+              try:
+                  out, _ = proc.communicate(timeout=45)
+                  sys.stdout.write(out)
+                  sys.stdout.flush()
+                  print(f"--- {tf} finished in {time.monotonic() - t0:.2f}s (rc={proc.returncode}) ---", flush=True)
+                  if proc.returncode != 0:
+                      failed = True
+              except subprocess.TimeoutExpired:
+                  print(f"!!! TIMEOUT (45s) in {tf} — dumping faulthandler traceback !!!", flush=True)
+                  try:
+                      os.killpg(proc.pid, signal.SIGABRT)
+                      time.sleep(1.0)
+                  except OSError:
+                      pass
+                  try:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  except OSError:
+                      pass
+                  out, _ = proc.communicate(timeout=5)
+                  sys.stdout.write(out)
+                  sys.stdout.flush()
+                  failed = True
+          if failed:
+              sys.exit(1)
+          PY
 
       - name: Run CLI live migration demo, fault injection, PKI & SOTA benchmark
         run: |
