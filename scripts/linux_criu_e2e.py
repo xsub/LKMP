@@ -185,6 +185,18 @@ def _run_workload_child(child_idx: int, p2c_r: int, c2p_w: int) -> None:
 def run_lazy_mmap_worker(work_dir: Path) -> None:
     """Daemonized stateful worker holding a 4 MiB anonymous mmap buffer for LAZY userfaultfd E2E."""
     work_dir.mkdir(parents=True, exist_ok=True)
+    # Place the CRIU worker in a high namespace PID band (>= 4001) so helper processes on
+    # Destination Host B never collide with CRIU's target PID during restore.
+    try:
+        Path("/proc/sys/kernel/ns_last_pid").write_text("4000\n", encoding="utf-8")
+    except OSError:
+        for _ in range(400):
+            cpid = os.fork()
+            if cpid == 0:
+                os._exit(0)
+            os.waitpid(cpid, 0)
+            if cpid >= 400:
+                break
     if os.fork() > 0:
         os._exit(0)
     os.setsid()

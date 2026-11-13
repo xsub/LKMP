@@ -22,6 +22,7 @@ jobs:
   lint-and-package:
     name: Lint, Bytecode & Wheel Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -56,6 +57,7 @@ jobs:
   unit-matrix:
     name: Unit & 2PC RPC Matrix (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

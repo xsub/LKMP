@@ -63,6 +63,18 @@ def step_xorshift64star(state: int) -> int:
 def run_stateful_criu_worker(work_dir: Path) -> None:
     """Minimal daemonized stateful worker with deterministic xorshift64* counter for CRIU."""
     work_dir.mkdir(parents=True, exist_ok=True)
+    # Place the CRIU worker in a high namespace PID band (>= 4001) so parallel QEMU/helper
+    # spawns on Destination Host B (PIDs ~50-200) never collide with CRIU's target PID.
+    try:
+        Path("/proc/sys/kernel/ns_last_pid").write_text("4000\n", encoding="utf-8")
+    except OSError:
+        for _ in range(400):
+            cpid = os.fork()
+            if cpid == 0:
+                os._exit(0)
+            os.waitpid(cpid, 0)
+            if cpid >= 400:
+                break
     if os.fork() > 0:
         os._exit(0)
     os.setsid()
